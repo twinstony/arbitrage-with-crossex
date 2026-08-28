@@ -38,6 +38,7 @@ import {
   fixedAprOnCapital,
   marginParts,
   toRows,
+  venueKey,
   type MarginParts,
   type WebOpportunitiesResult,
 } from './display';
@@ -218,17 +219,38 @@ function pairLines(row: RankedPair, notionalUsd: number): string[] {
   return lines;
 }
 
-/** The Telegram summary: Top-N pairs ranked exactly like the web panel, HTML. */
+/** The rollover key of a pair: underlying + both legs' venues, case-normalized.
+ * A live Strategy with the SAME key can hand its perp legs straight to this
+ * pair at maturity — the zero-perp-fee rollover. */
+function rolloverKey(underlying: string, shortVenue: string, longVenue: string): string {
+  return `${underlying}:${venueKey(shortVenue)}:${venueKey(longVenue)}`;
+}
+
+/** The Telegram summary: Top-N pairs ranked exactly like the web panel, HTML.
+ * Pairs whose venue pair + direction match an OPEN strategy get the ♻️ badge:
+ * their perp legs are already in place, so this is a zero-perp-fee rollover. */
 export function formatTopSummary(
   ranked: RankedPair[],
-  opts: { notionalUsd: number; now: Date; totalGroups: number; viable: number },
+  opts: {
+    notionalUsd: number;
+    now: Date;
+    totalGroups: number;
+    viable: number;
+    rolloverKeys?: ReadonlySet<string>;
+  },
 ): string {
   const lines: string[] = [
     `🎯 <b>Boros 套利机会 Top ${ranked.length}</b> · 名义 ${notionalShort(opts.notionalUsd)}`,
     `扫描 ${opts.totalGroups} 组 · 可交易 ${opts.viable} · ${stamp(opts.now)}`,
   ];
   ranked.forEach((row, i) => {
-    lines.push('', `${i + 1}. ${pairLines(row, opts.notionalUsd).join('\n   ')}`);
+    const badge =
+      opts.rolloverKeys?.has(
+        rolloverKey(row.group.underlying, row.pair.shortLeg.venue, row.pair.longLeg.venue),
+      ) === true
+        ? ' ♻️ 可续期'
+        : '';
+    lines.push('', `${i + 1}. ${pairLines(row, opts.notionalUsd).join('\n   ')}${badge}`);
   });
   return lines.join('\n');
 }
@@ -499,23 +521,43 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
     if (ranked.length === 0) {
       error(`[notify] no viable pairs (${result.groups.length} groups) — telegram summary skipped`);
     } else {
+      // The positions read comes FIRST: its fully-hedged strategies decide
+      // which pairs earn the ♻️ rollover badge. Its own failure costs only
+      // the section + the badges — the opportunities part still goes.
+      let positions: Awaited<ReturnType<NonNullable<ScannerDeps['scanStrategy']>>> | null = null;
+      let rolloverKeys: ReadonlySet<string> | undefined;
+      if (deps.scanStrategy) {
+        try {
+          positions = await deps.scanStrategy();
+          if (positions) {
+            rolloverKeys = new Set(
+              positions.strategy.strategies
+                // Only FULLY hedged strategies may lend their perp legs: a
+                // partial book's floating streams are already spoken for.
+                .filter((st) => st.hedgeChecks?.fullyHedged)
+                .map((st) => {
+                  const short = st.legs.find((l) => l.kind === 'boros' && l.side === 'SHORT');
+                  const long = st.legs.find((l) => l.kind === 'boros' && l.side === 'LONG');
+                  return short && long
+                    ? rolloverKey(st.base, short.venue, long.venue)
+                    : null;
+                })
+                .filter((k): k is string => k !== null),
+            );
+          }
+        } catch (err) {
+          error('[notify] positions summary failed — section skipped', err);
+        }
+      }
       let text = formatTopSummary(ranked, {
         notionalUsd: config.notionalUsd,
         now,
         totalGroups: result.groups.length,
         viable: countViable(result),
+        rolloverKeys,
       });
-      // The positions section rides the SAME message (one pulse). Its own
-      // failure costs only the section — the opportunities part still goes.
-      if (deps.scanStrategy) {
-        try {
-          const positions = await deps.scanStrategy();
-          if (positions) {
-            text += `\n\n──────────────\n\n${formatPositionsSection(positions.strategy, positions.margin ?? undefined)}`;
-          }
-        } catch (err) {
-          error('[notify] positions summary failed — section skipped', err);
-        }
+      if (positions) {
+        text += `\n\n──────────────\n\n${formatPositionsSection(positions.strategy, positions.margin ?? undefined)}`;
       }
       const ok = await (deps.sendTelegram ?? ((t) => sendTelegramMessage(config.telegram!, t)))(text);
       if (!ok) error('[notify] telegram send failed');

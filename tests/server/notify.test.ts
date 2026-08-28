@@ -297,6 +297,28 @@ describe('formatTopSummary', () => {
     expect(text).not.toContain('(');
   });
 
+  it('badges pairs whose venue pair + direction match an open strategy (♻️ rollover)', () => {
+    // Open strategy: SHORT HYPERLIQUID / LONG OKX. A pair on the SAME venue
+    // pair + direction is the zero-perp-fee rollover; anything else is not.
+    const matching = makeGroup([0.2], {
+      underlying: 'BTC',
+    });
+    matching.pairs[0].shortLeg.venue = 'Hyperliquid';
+    matching.pairs[0].longLeg.venue = 'OKX';
+    const other = makeGroup([0.1]); // BINANCE/BYBIT — no match
+    const text = formatTopSummary(rankPairs(makeResult([matching, other]), 5), {
+      notionalUsd: 10_000,
+      now: new Date(),
+      totalGroups: 2,
+      viable: 2,
+      rolloverKeys: new Set(['BTC:HYPERLIQUID:OKX']),
+    });
+    const matchingBlock = text.split('\n\n').find((b) => b.includes('Hyperliquid ｜ LONG · OKX')) ?? '';
+    expect(matchingBlock).toContain('♻️ 可续期');
+    const otherBlock = text.split('\n\n').find((b) => b.includes('SHORT · BINANCE')) ?? '';
+    expect(otherBlock).not.toContain('♻️');
+  });
+
   it('escapes HTML-significant characters in upstream venue strings', () => {
     const g = makeGroup([0.35]);
     g.pairs[0].shortLeg.venue = 'A<B>&C';
