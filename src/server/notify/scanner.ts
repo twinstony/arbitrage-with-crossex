@@ -311,6 +311,9 @@ export interface StrategySummary {
     lockedAprOnCapital: number;
     expectedPnlToMaturityUsd: number | null;
     elapsedSeconds: number | null;
+    /** The spread-lock clock's start — the hero Fixed APY annualizes over the
+     * FULL trade life (start → maturity), exactly like StrategyCard. */
+    clockStartSec: number | null;
   }>;
   totals: {
     capitalUsd: number;
@@ -318,6 +321,15 @@ export interface StrategySummary {
     expectedPnlToMaturityUsd: number;
     strategyCount: number;
   };
+}
+
+/** Structural subset of GET /api/account — the CrossEx margin health the
+ * web header strip renders as the IM/MM donuts. */
+export interface MarginLite {
+  marginBalance: number;
+  initialMargin: number;
+  maintenanceMargin: number;
+  availableMargin: number;
 }
 
 /** Boros platformName → the display name the web cards use. */
@@ -340,8 +352,16 @@ function hedgeMarker(s: StrategySummary['strategies'][number]): string {
   return ' ⛔ unhedged';
 }
 
-/** The 💼 section appended under the opportunities. Pure; exported for tests. */
-export function formatPositionsSection(s: StrategySummary): string {
+/** The 💼 section appended under the opportunities. Pure; exported for tests.
+ *
+ * The hero APR is the web card's Fixed APY: expectedPnlToMaturityUsd
+ * (already net of every cost the panel's default flags charge) annualized on
+ * capital over the FULL trade life, start → maturity — NOT lockedAprOnCapital,
+ * which is the spread-based reading and reads higher. */
+export function formatPositionsSection(
+  s: StrategySummary,
+  margin?: MarginLite,
+): string {
   const signedUsd = (n: number): string => (n >= 0 ? `+${usd0(n)}` : usd0(n));
   if (s.strategies.length === 0) {
     return '<b>💼 Boros 持仓</b>\n当前无 Boros 持仓';
@@ -351,15 +371,36 @@ export function formatPositionsSection(s: StrategySummary): string {
     `资金 ~${usd0(s.totals.capitalUsd)} ｜ PnL now ${signedUsd(s.totals.realizedPnlUsd)}` +
       ` ｜ 到期预期 ${signedUsd(s.totals.expectedPnlToMaturityUsd)}`,
   ];
+  if (margin && margin.marginBalance > 0) {
+    const initial = Math.max(0, margin.initialMargin);
+    const maintenance = Math.max(0, margin.maintenanceMargin);
+    const available = Math.max(0, margin.marginBalance - initial);
+    lines.push(
+      `保证金 IM ${(initial / margin.marginBalance * 100).toFixed(0)}% ｜ MM ${(maintenance / margin.marginBalance * 100).toFixed(0)}%` +
+        `（可用 ${usd0(available)} / 余额 ${usd0(margin.marginBalance)} · 维持 ${usd0(maintenance)}）`,
+    );
+  }
   s.strategies.forEach((st, i) => {
     const days = Math.max(1, Math.round(st.secondsToMaturity / 86_400));
     const boros = st.legs.filter((l) => l.kind === 'boros');
     const short = boros.find((l) => l.side === 'SHORT');
     const long = boros.find((l) => l.side === 'LONG');
+    // StrategyCard's fixedAprOnCapital: expected PnL by maturity on capital,
+    // annualized over the full trade life. Defaults flags ('roll'/'include')
+    // adjust nothing, so the server's expectedPnlToMaturityUsd IS expectedUsd.
+    const lifeSeconds = st.clockStartSec === null ? null : st.maturity - st.clockStartSec;
+    const fixedApr =
+      lifeSeconds !== null && lifeSeconds > 0 && st.capitalUsd > 0 && st.expectedPnlToMaturityUsd !== null
+        ? st.expectedPnlToMaturityUsd / (st.capitalUsd * (lifeSeconds / 31_536_000))
+        : null;
     lines.push(
       '',
       `${i + 1}. ${esc(st.base)} · ${maturityLabel(st.maturity)} 到期（${days} 天）${hedgeMarker(st)}`,
-      `   🟢 ${(st.lockedAprOnCapital * 100).toFixed(2)}% APR（锁定 · 资金口径）`,
+      `   ${
+        fixedApr === null
+          ? '⚪ Fixed APY —（时钟或资金未知）'
+          : `${fixedApr >= 0 ? '🟢' : '🔴'} Fixed APY ${(fixedApr * 100).toFixed(2)}%`
+      }`,
     );
     if (short && long && short.entryApr !== undefined && long.entryApr !== undefined) {
       lines.push(
@@ -389,7 +430,10 @@ export interface ScannerDeps {
   /** The operator's Boros strategies — the same pipeline /api/strategy serves
    * (wired in server/index.ts as a self-call with the install's API token).
    * Absent (no BOROS_ROOT_ADDRESS) → the 💼 section is omitted entirely. */
-  scanStrategy?: () => Promise<StrategySummary | null>;
+  scanStrategy?: () => Promise<{
+    strategy: StrategySummary;
+    margin?: MarginLite | null;
+  } | null>;
   /** Overridable senders (tests); default to the real channels. */
   sendTelegram?: (text: string) => Promise<boolean>;
   sendWebhook?: (details: string, coin: string) => Promise<boolean>;
@@ -443,9 +487,9 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
       // failure costs only the section — the opportunities part still goes.
       if (deps.scanStrategy) {
         try {
-          const strategy = await deps.scanStrategy();
-          if (strategy) {
-            text += `\n\n──────────────\n\n${formatPositionsSection(strategy)}`;
+          const positions = await deps.scanStrategy();
+          if (positions) {
+            text += `\n\n──────────────\n\n${formatPositionsSection(positions.strategy, positions.margin ?? undefined)}`;
           }
         } catch (err) {
           error('[notify] positions summary failed — section skipped', err);

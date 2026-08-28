@@ -27,6 +27,7 @@ import {
   readNotifyConfig,
   scanPass,
   startOpportunityScanner,
+  type MarginLite,
   type StrategySummary,
 } from '../../src/server/notify/scanner';
 import { readTelegramConfig } from '../../src/server/notify/telegram';
@@ -349,6 +350,7 @@ function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {})
         lockedAprOnCapital: 0.3123,
         expectedPnlToMaturityUsd: 109.39,
         elapsedSeconds: 2 * 86_400,
+        clockStartSec: 1793318400 - 65 * 86_400,
         ...over,
       },
     ],
@@ -366,7 +368,9 @@ describe('formatPositionsSection', () => {
     const text = formatPositionsSection(makeStrategy());
     expect(text).toContain('<b>💼 Boros 持仓汇总</b>（1 个策略）');
     expect(text).toContain('资金 ~$2,708');
-    expect(text).toContain('31.23% APR（锁定 · 资金口径）');
+    // Hero = StrategyCard's Fixed APY: 109.39 / (2708.28 × 65d/365d)
+    expect(text).toContain('Fixed APY 22.68%');
+    expect(text).not.toContain('31.23%'); // the spread-basis reading must NOT be the hero
     expect(text).toContain('SHORT · Hyperliquid 8.48% ｜ LONG · OKX 5.82%');
     expect(text).toContain('锁定价差 2.66% ｜ 名义 ~$31,833/腿');
     expect(text).toContain('perp $2,117 + Boros $591');
@@ -380,6 +384,18 @@ describe('formatPositionsSection', () => {
     expect(
       formatPositionsSection(makeStrategy({ secondsToMaturity: 0, hedge: 'hedged' })),
     ).toContain('🕐 matured');
+  });
+
+  it('renders the CrossEx margin health line (IM/MM of balance)', () => {
+    const margin: MarginLite = {
+      marginBalance: 3431.77,
+      initialMargin: 2185.49,
+      maintenanceMargin: 877.83,
+      availableMargin: 1246.28,
+    };
+    const text = formatPositionsSection(makeStrategy(), margin);
+    expect(text).toContain('IM 64% ｜ MM 26%');
+    expect(text).toContain('可用 $1,246 / 余额 $3,432 · 维持 $878'); // available derived: balance − initial
   });
 
   it('says so explicitly when nothing is open', () => {
@@ -471,7 +487,7 @@ describe('scanPass', () => {
       {
         config: config({ webhook: null }),
         scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
-        scanStrategy: vi.fn().mockResolvedValue(makeStrategy()),
+        scanStrategy: vi.fn().mockResolvedValue({ strategy: makeStrategy(), margin: null }),
         sendTelegram,
       },
       new Set(),

@@ -235,16 +235,32 @@ app
       const positionsAddress = process.env.BOROS_ROOT_ADDRESS?.trim();
       const scanStrategy =
         positionsAddress && /^0x[0-9a-fA-F]{40}$/.test(positionsAddress) && appDeps.authToken
-          ? () =>
-              request(`http://${host}:${port}/api/strategy/${positionsAddress.toLowerCase()}`, {
-                headers: { 'x-arb-token': appDeps.authToken! },
-                dispatcher: new Agent(),
-                signal: AbortSignal.timeout(30_000),
-              }).then(async (res): Promise<import('./notify/scanner').StrategySummary | null> => {
-                if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
-                const body = (await res.body.json()) as { data?: import('./notify/scanner').StrategySummary };
-                return body.data ?? null;
-              })
+          ? async (): Promise<{
+              strategy: import('./notify/scanner').StrategySummary;
+              margin?: import('./notify/scanner').MarginLite | null;
+            } | null> => {
+              // A DIRECT dispatcher: these self-calls must not ride the
+              // outbound proxy that Boros needs.
+              const dispatcher = new Agent();
+              const call = <T,>(path: string): Promise<T> =>
+                request(`http://${host}:${port}${path}`, {
+                  headers: { 'x-arb-token': appDeps.authToken! },
+                  dispatcher,
+                  signal: AbortSignal.timeout(30_000),
+                }).then(async (res) => {
+                  if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
+                  return ((await res.body.json()) as { data?: T }).data as T;
+                });
+              // Margin is cosmetic next to the strategies: its own failure
+              // drops only the health line, never the section.
+              const [strategy, margin] = await Promise.all([
+                call<import('./notify/scanner').StrategySummary>(
+                  `/api/strategy/${positionsAddress.toLowerCase()}`,
+                ),
+                call<import('./notify/scanner').MarginLite>('/api/account').catch(() => null),
+              ]);
+              return strategy ? { strategy, margin } : null;
+            }
           : undefined;
       startOpportunityScanner({
         config: notifyConfig,
