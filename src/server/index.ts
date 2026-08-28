@@ -8,7 +8,7 @@ import 'dotenv/config';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+import { Agent, EnvHttpProxyAgent, request, setGlobalDispatcher } from 'undici';
 import fastifyStatic from '@fastify/static';
 import { fetchBorosMarkets, resolveBorosFetch, setClientTagContext } from '../core/boros/client';
 import { makeClientsIfConfigured, requireClients, type Clients } from '../core/clients';
@@ -227,6 +227,25 @@ app
     // channel — the feature costs nothing unless it is switched on.
     const notifyConfig = readNotifyConfig();
     if (notifyConfig) {
+      // The 💼 positions section re-reads the operator's strategies through the
+      // SAME endpoint the web Positions cards use — a self-call with the
+      // install's API token, addressed to the bound host (never loopback: HOST
+      // may have moved the bind off it). A DIRECT dispatcher: this call must
+      // not ride the outbound proxy that Boros needs.
+      const positionsAddress = process.env.BOROS_ROOT_ADDRESS?.trim();
+      const scanStrategy =
+        positionsAddress && /^0x[0-9a-fA-F]{40}$/.test(positionsAddress) && appDeps.authToken
+          ? () =>
+              request(`http://${host}:${port}/api/strategy/${positionsAddress.toLowerCase()}`, {
+                headers: { 'x-arb-token': appDeps.authToken! },
+                dispatcher: new Agent(),
+                signal: AbortSignal.timeout(30_000),
+              }).then(async (res): Promise<import('./notify/scanner').StrategySummary | null> => {
+                if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
+                const body = (await res.body.json()) as { data?: import('./notify/scanner').StrategySummary };
+                return body.data ?? null;
+              })
+          : undefined;
       startOpportunityScanner({
         config: notifyConfig,
         scan: async () =>
@@ -242,6 +261,7 @@ app
               fresh: false,
             })
           ).result,
+        scanStrategy,
       });
       console.log(
         `opportunity notifications enabled: Telegram ${notifyConfig.telegram ? 'on' : 'off'}, ` +

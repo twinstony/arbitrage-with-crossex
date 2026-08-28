@@ -20,12 +20,14 @@ import {
   countViable,
   dedupeCrossings,
   formatAlertDetails,
+  formatPositionsSection,
   formatTopSummary,
   pairKey,
   rankPairs,
   readNotifyConfig,
   scanPass,
   startOpportunityScanner,
+  type StrategySummary,
 } from '../../src/server/notify/scanner';
 import { readTelegramConfig } from '../../src/server/notify/telegram';
 
@@ -324,6 +326,70 @@ describe('formatAlertDetails', () => {
   });
 });
 
+// ---- positions section ----
+
+function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {}): StrategySummary {
+  return {
+    strategies: [
+      {
+        strategyId: 'BTC@123',
+        base: 'BTC',
+        maturity: 1793318400,
+        secondsToMaturity: 63 * 86_400,
+        hedge: 'hedged',
+        notionalMismatchUsd: 0,
+        legs: [
+          { kind: 'boros', side: 'SHORT', venue: 'HYPERLIQUID', notionalUsd: 31_833, entryApr: 0.0848 },
+          { kind: 'boros', side: 'LONG', venue: 'OKX', notionalUsd: 31_833, entryApr: 0.0582 },
+        ],
+        capitalUsd: 2708.28,
+        capitalSplit: { perpUsd: 2117.11, borosUsd: 591.17 },
+        realizedPnlUsd: -23.34,
+        spread: 0.0266,
+        lockedAprOnCapital: 0.3123,
+        expectedPnlToMaturityUsd: 109.39,
+        elapsedSeconds: 2 * 86_400,
+        ...over,
+      },
+    ],
+    totals: {
+      capitalUsd: 2708.28,
+      realizedPnlUsd: -23.34,
+      expectedPnlToMaturityUsd: 109.39,
+      strategyCount: 1,
+    },
+  };
+}
+
+describe('formatPositionsSection', () => {
+  it('renders the card fields: locked APR, entry legs, split, both PnLs, totals', () => {
+    const text = formatPositionsSection(makeStrategy());
+    expect(text).toContain('<b>💼 Boros 持仓汇总</b>（1 个策略）');
+    expect(text).toContain('资金 ~$2,708');
+    expect(text).toContain('31.23% APR（锁定 · 资金口径）');
+    expect(text).toContain('SHORT · Hyperliquid 8.48% ｜ LONG · OKX 5.82%');
+    expect(text).toContain('锁定价差 2.66% ｜ 名义 ~$31,833/腿');
+    expect(text).toContain('perp $2,117 + Boros $591');
+    expect(text).toContain('PnL now -$23 ｜ 到期预期 +$109');
+    expect(text).not.toContain('⛔'); // hedged → no marker
+  });
+
+  it('marks the risk state the way the web HedgeChip does', () => {
+    expect(formatPositionsSection(makeStrategy({ hedge: 'unhedged' }))).toContain('⛔ unhedged');
+    expect(formatPositionsSection(makeStrategy({ hedge: 'partial' }))).toContain('⚠️ partial hedge');
+    expect(
+      formatPositionsSection(makeStrategy({ secondsToMaturity: 0, hedge: 'hedged' })),
+    ).toContain('🕐 matured');
+  });
+
+  it('says so explicitly when nothing is open', () => {
+    const empty = makeStrategy();
+    empty.strategies = [];
+    empty.totals.strategyCount = 0;
+    expect(formatPositionsSection(empty)).toContain('当前无 Boros 持仓');
+  });
+});
+
 describe('scanPass', () => {
   const config = (over: Partial<Parameters<typeof scanPass>[0]['config']> = {}) => ({
     telegram: { botToken: 't', chatId: 'c', dispatcher: null },
@@ -397,6 +463,53 @@ describe('scanPass', () => {
       new Set(),
     );
     expect(sendTelegram).not.toHaveBeenCalled();
+  });
+
+  it('appends the positions section to the SAME message when scanStrategy is wired', async () => {
+    const sendTelegram = vi.fn().mockResolvedValue(true);
+    await scanPass(
+      {
+        config: config({ webhook: null }),
+        scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
+        scanStrategy: vi.fn().mockResolvedValue(makeStrategy()),
+        sendTelegram,
+      },
+      new Set(),
+    );
+    const text = sendTelegram.mock.calls[0][0] as string;
+    expect(text).toContain('🎯');
+    expect(text).toContain('──────────────');
+    expect(text).toContain('💼 Boros 持仓汇总');
+  });
+
+  it('a failed positions read costs only the section — the opportunities still go', async () => {
+    const sendTelegram = vi.fn().mockResolvedValue(true);
+    await scanPass(
+      {
+        config: config({ webhook: null }),
+        scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
+        scanStrategy: vi.fn().mockRejectedValue(new Error('strategy route down')),
+        sendTelegram,
+        error: vi.fn(),
+      },
+      new Set(),
+    );
+    const text = sendTelegram.mock.calls[0][0] as string;
+    expect(text).toContain('🎯');
+    expect(text).not.toContain('💼');
+  });
+
+  it('omits the positions section entirely when no address is wired', async () => {
+    const sendTelegram = vi.fn().mockResolvedValue(true);
+    await scanPass(
+      {
+        config: config({ webhook: null }),
+        scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
+        sendTelegram,
+      },
+      new Set(),
+    );
+    expect(sendTelegram.mock.calls[0][0] as string).not.toContain('💼');
   });
 
   it('a failed send never throws and does not block the other channel', async () => {

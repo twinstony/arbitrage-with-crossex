@@ -282,12 +282,114 @@ export function formatAlertDetails(
   return lines.join('\n');
 }
 
+// ---- positions section (Boros strategies) ----
+
+/** Structural subset of GET /api/strategy/:address — only what the message
+ * renders. Built by the scanner's own call to its own API, so the numbers are
+ * the web Positions cards' to the digit. */
+export interface StrategyLegLite {
+  kind: string;
+  side: string;
+  venue: string;
+  notionalUsd: number;
+  entryApr?: number;
+}
+
+export interface StrategySummary {
+  strategies: Array<{
+    strategyId: string;
+    base: string;
+    maturity: number;
+    secondsToMaturity: number;
+    hedge: string;
+    notionalMismatchUsd: number;
+    legs: StrategyLegLite[];
+    capitalUsd: number;
+    capitalSplit: { perpUsd: number; borosUsd: number };
+    realizedPnlUsd: number;
+    spread: number;
+    lockedAprOnCapital: number;
+    expectedPnlToMaturityUsd: number | null;
+    elapsedSeconds: number | null;
+  }>;
+  totals: {
+    capitalUsd: number;
+    realizedPnlUsd: number;
+    expectedPnlToMaturityUsd: number;
+    strategyCount: number;
+  };
+}
+
+/** Boros platformName → the display name the web cards use. */
+const VENUE_DISPLAY: Record<string, string> = {
+  HYPERLIQUID: 'Hyperliquid',
+  BINANCE: 'Binance',
+  BYBIT: 'Bybit',
+  GATE: 'Gate',
+  OKX: 'OKX',
+  KRAKEN: 'Kraken',
+};
+const venueDisplay = (venue: string): string => VENUE_DISPLAY[venue.trim().toUpperCase()] ?? venue;
+
+/** The HedgeChip, as text: the risk marker rides the hero line. Mirrors
+ * StrategyCard's HedgeChip order — matured wins, then hedge state. */
+function hedgeMarker(s: StrategySummary['strategies'][number]): string {
+  if (s.maturity > 0 && s.secondsToMaturity === 0) return ' 🕐 matured';
+  if (s.hedge === 'hedged') return '';
+  if (s.hedge === 'partial') return ' ⚠️ partial hedge';
+  return ' ⛔ unhedged';
+}
+
+/** The 💼 section appended under the opportunities. Pure; exported for tests. */
+export function formatPositionsSection(s: StrategySummary): string {
+  const signedUsd = (n: number): string => (n >= 0 ? `+${usd0(n)}` : usd0(n));
+  if (s.strategies.length === 0) {
+    return '<b>💼 Boros 持仓</b>\n当前无 Boros 持仓';
+  }
+  const lines: string[] = [
+    `<b>💼 Boros 持仓汇总</b>（${s.totals.strategyCount} 个策略）`,
+    `资金 ~${usd0(s.totals.capitalUsd)} ｜ PnL now ${signedUsd(s.totals.realizedPnlUsd)}` +
+      ` ｜ 到期预期 ${signedUsd(s.totals.expectedPnlToMaturityUsd)}`,
+  ];
+  s.strategies.forEach((st, i) => {
+    const days = Math.max(1, Math.round(st.secondsToMaturity / 86_400));
+    const boros = st.legs.filter((l) => l.kind === 'boros');
+    const short = boros.find((l) => l.side === 'SHORT');
+    const long = boros.find((l) => l.side === 'LONG');
+    lines.push(
+      '',
+      `${i + 1}. ${esc(st.base)} · ${maturityLabel(st.maturity)} 到期（${days} 天）${hedgeMarker(st)}`,
+      `   🟢 ${(st.lockedAprOnCapital * 100).toFixed(2)}% APR（锁定 · 资金口径）`,
+    );
+    if (short && long && short.entryApr !== undefined && long.entryApr !== undefined) {
+      lines.push(
+        `   SHORT · ${esc(venueDisplay(short.venue))} ${(short.entryApr * 100).toFixed(2)}%` +
+          ` ｜ LONG · ${esc(venueDisplay(long.venue))} ${(long.entryApr * 100).toFixed(2)}%`,
+        `   锁定价差 ${(st.spread * 100).toFixed(2)}% ｜ 名义 ~${usd0(short.notionalUsd)}/腿`,
+      );
+    }
+    lines.push(
+      `   资金 ~${usd0(st.capitalUsd)}（perp ${usd0(st.capitalSplit.perpUsd)} + Boros ${usd0(st.capitalSplit.borosUsd)}）`,
+      `   PnL now ${signedUsd(st.realizedPnlUsd)}` +
+        (st.expectedPnlToMaturityUsd === null
+          ? ''
+          : ` ｜ 到期预期 ${signedUsd(st.expectedPnlToMaturityUsd)}`) +
+        (st.elapsedSeconds === null ? '' : ` ｜ 已运行 ${(st.elapsedSeconds / 86_400).toFixed(1)} 天`),
+    );
+  });
+  return lines.join('\n');
+}
+
 // ---- the runtime loop ----
 
 export interface ScannerDeps {
   config: NotifyConfig;
   /** One full scan — the same pipeline /api/opportunities serves. */
   scan: () => Promise<OpportunitiesResult>;
+  /** The operator's Boros strategies — the same pipeline /api/strategy serves
+   * (wired in server/index.ts as a self-call with the install's API token).
+   * Absent (no BOROS_ROOT_ADDRESS) → the 💼 section is omitted entirely. */
+  scanStrategy?: () => Promise<StrategySummary | null>;
   /** Overridable senders (tests); default to the real channels. */
   sendTelegram?: (text: string) => Promise<boolean>;
   sendWebhook?: (details: string, coin: string) => Promise<boolean>;
@@ -331,12 +433,24 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
     if (ranked.length === 0) {
       error(`[notify] no viable pairs (${result.groups.length} groups) — telegram summary skipped`);
     } else {
-      const text = formatTopSummary(ranked, {
+      let text = formatTopSummary(ranked, {
         notionalUsd: config.notionalUsd,
         now,
         totalGroups: result.groups.length,
         viable: countViable(result),
       });
+      // The positions section rides the SAME message (one pulse). Its own
+      // failure costs only the section — the opportunities part still goes.
+      if (deps.scanStrategy) {
+        try {
+          const strategy = await deps.scanStrategy();
+          if (strategy) {
+            text += `\n\n──────────────\n\n${formatPositionsSection(strategy)}`;
+          }
+        } catch (err) {
+          error('[notify] positions summary failed — section skipped', err);
+        }
+      }
       const ok = await (deps.sendTelegram ?? ((t) => sendTelegramMessage(config.telegram!, t)))(text);
       if (!ok) error('[notify] telegram send failed');
       else log(`[notify] telegram summary sent (${ranked.length} of ${countViable(result)} viable pairs)`);
