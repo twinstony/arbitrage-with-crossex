@@ -81,7 +81,7 @@ import type { LegRef } from './partitionStore';
 import { buildSharePayload } from './sharePayload';
 import { SharePositionModal } from './SharePositionModal';
 import type { SharePayloadV1 } from '../lib/shareCodec';
-import { applyCostFlags, legTokenSize, SECONDS_IN_YEAR, type CostFlags } from './strategyMath';
+import { applyCostFlags, fixedAprOnCapital as fixedAprOnCapitalOf, legTokenSize, type CostFlags } from './strategyMath';
 import { crossexVenueFor } from '../lib/boros';
 
 /**
@@ -328,11 +328,11 @@ export function StrategyCard({
   // the opportunity scanner uses (estProfit / (capital × yearsToMaturity)); the
   // difference for a live position is that the clock runs from when it opened.
   // Null when the clock or capital is unknowable (matches "PNL by maturity").
+  // The helper lives in strategyMath (shared with the server's TG formatter)
+  // so the card and the message produce the IDENTICAL number from the same
+  // inputs.
   const lifeSeconds = s.clockStartSec === null ? null : s.maturity - s.clockStartSec;
-  const fixedAprOnCapital =
-    lifeSeconds !== null && lifeSeconds > 0 && s.capitalUsd > 0 && expectedUsd !== null
-      ? expectedUsd / (s.capitalUsd * (lifeSeconds / SECONDS_IN_YEAR))
-      : null;
+  const fixedAprOnCapital = fixedAprOnCapitalOf(expectedUsd, s.capitalUsd, s.clockStartSec, s.maturity);
 
   // One venue leg can now belong to several strategies, so the executions a
   // user un-ticked are remembered per STRATEGY rather than per maturity. The

@@ -107,7 +107,10 @@ export function applyCostFlags(opts: {
   const entryAddBackUsd = entryAddBackFeesUsd + entryAddBackSlippageUsd;
   // The parts must decompose the aggregates exactly, or the numbers and the
   // waterfalls quietly disagree. Same doctrine as ProfitBars' drift guard.
-  if (import.meta.env.DEV && parts.length > 0) {
+  // Vite statically defines import.meta.env; Node (server-side import) does
+  // not — the guard must read it defensively so both runtimes are safe.
+  const isDev = (import.meta as { env?: { DEV?: boolean } }).env?.DEV ?? false;
+  if (isDev && parts.length > 0) {
     const summed = parts.reduce((a, p) => a + p.usd, 0);
     const aggregate = opts.perpEntryFeesUsd + (opts.perpEntrySlippageUsd ?? 0);
     if (Math.abs(summed - aggregate) > 0.01) {
@@ -166,4 +169,22 @@ export function legTokenSize(l: {
       : null;
   }
   return { qty: l.notionalToken, symbol: l.base };
+}
+
+/** The StrategyCard hero: expected PnL by maturity as a return on the capital
+ * posted, annualized over the FULL trade life (clock start → maturity). The
+ * card computes this inline from the cost-flag-adjusted numbers; this helper
+ * is the same formula, exported so the server's notification formatter can
+ * produce the identical number instead of a hand-copy. Null when the clock or
+ * capital is unknowable — exactly when the card hides the stat. */
+export function fixedAprOnCapital(
+  expectedUsd: number | null,
+  capitalUsd: number,
+  clockStartSec: number | null,
+  maturitySec: number,
+): number | null {
+  const lifeSeconds = clockStartSec === null ? null : maturitySec - clockStartSec;
+  return lifeSeconds !== null && lifeSeconds > 0 && capitalUsd > 0 && expectedUsd !== null
+    ? expectedUsd / (capitalUsd * (lifeSeconds / SECONDS_IN_YEAR))
+    : null;
 }

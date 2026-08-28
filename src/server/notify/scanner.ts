@@ -30,6 +30,17 @@
  * tests; startOpportunityScanner is the only stateful piece.
  */
 import type { OpportunityGroup, OpportunityPair, OpportunitiesResult } from '../../core/boros/opportunities';
+import {
+  fmtNotionalShort,
+  fmtPct,
+  fmtTokenQty,
+  fmtUsd,
+  fixedAprOnCapital,
+  marginParts,
+  toRows,
+  type MarginParts,
+  type WebOpportunitiesResult,
+} from './display';
 import { readFwAlertConfig, sendFwAlert, type FwAlertConfig } from './fwalert';
 import { readTelegramConfig, sendTelegramMessage, type TelegramConfig } from './telegram';
 
@@ -93,14 +104,6 @@ export interface RankedPair {
   apr: number;
 }
 
-/** Mirrors web/src/panels/opportunityFilters.ts `byValueDesc`: desc, nulls last. */
-const byValueDesc = (a: number | null, b: number | null): number => {
-  if (a === b) return 0;
-  if (a === null) return 1;
-  if (b === null) return -1;
-  return b - a;
-};
-
 /**
  * Every viable pair across every group, best first — the panel's `toRows`
  * without the UI-only hysteresis band (that exists to stop cards flickering
@@ -112,23 +115,7 @@ const byValueDesc = (a: number | null, b: number | null): number => {
  * executing.
  */
 export function rankPairs(result: OpportunitiesResult, topN: number): RankedPair[] {
-  const rows: RankedPair[] = [];
-  for (const group of result.groups) {
-    for (const pair of group.pairs) {
-      const apr = pair.netFixedAprOnCapital;
-      if (apr === null || !Number.isFinite(apr) || apr < 0) continue;
-      rows.push({ group, pair, apr });
-    }
-  }
-  return rows
-    .sort(
-      (x, y) =>
-        y.apr - x.apr ||
-        byValueDesc(x.pair.netFixedApr, y.pair.netFixedApr) ||
-        byValueDesc(x.pair.execSpreadApr, y.pair.execSpreadApr) ||
-        y.pair.grossSpreadApr - x.pair.grossSpreadApr,
-    )
-    .slice(0, topN);
+  return toRows((result as unknown as WebOpportunitiesResult).groups).slice(0, topN) as unknown as RankedPair[];
 }
 
 /** All viable pairs (untruncated) — the header's "可交易 N" count. */
@@ -178,28 +165,10 @@ export function dedupeCrossings(
 
 // ---- formatting (pure; exported for tests) ----
 
-/** fmtUsd(n, 0): "$1,103" / "-$3" — web/src/lib/fmt.ts's thousands rule. */
-const usd0 = (n: number): string =>
-  `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-
-/** fmtNotionalShort: "$10k", "$14.7k", "$1.5M" — trailing ".0" dropped. */
-const notionalShort = (n: number): string => {
-  const sign = n < 0 ? '-' : '';
-  const abs = Math.abs(n);
-  if (abs >= 1e6) return `${sign}$${+(abs / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
-  if (abs >= 1e3) return `${sign}$${+(abs / 1e3).toFixed(abs >= 1e5 ? 0 : 1)}k`;
-  return `${sign}$${Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-};
-
-/** fmtTokenQty: "0.126 BTC", "4.02 ETH", "1.2k HYPE" — web's tier rules. */
-const tokenQty = (q: number, symbol: string): string => {
-  const abs = Math.abs(q);
-  if (abs > 0 && abs < 1e-6) return `<0.000001 ${symbol}`;
-  if (abs >= 1e3) return `${(q / 1e3).toFixed(1)}k ${symbol}`;
-  if (abs >= 100) return `${q.toFixed(1)} ${symbol}`;
-  if (abs >= 1) return `${q.toFixed(2)} ${symbol}`;
-  return `${q.toPrecision(3)} ${symbol}`;
-};
+// Number formatting IS the web's fmt.ts (fmtUsd / fmtNotionalShort /
+// fmtTokenQty / fmtPct) — imported through display.ts, never re-implemented.
+const usd0 = (n: number): string => fmtUsd(n, 0);
+const notionalShort = (n: number): string => fmtNotionalShort(n);
 
 const esc = (s: string): string =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -219,7 +188,7 @@ function notionalLine(group: OpportunityGroup, notionalUsd: number): string {
   if (isUsdCollateral || group.collateralPriceUsd === null || group.collateralPriceUsd <= 0) {
     return base;
   }
-  return `${base} (${tokenQty(notionalUsd / group.collateralPriceUsd, group.collateral)})`;
+  return `${base} (${fmtTokenQty(notionalUsd / group.collateralPriceUsd, group.collateral)})`;
 }
 
 /** The five stat lines one pair renders as — shared by both channels. */
@@ -372,12 +341,11 @@ export function formatPositionsSection(
       ` ｜ 到期预期 ${signedUsd(s.totals.expectedPnlToMaturityUsd)}`,
   ];
   if (margin && margin.marginBalance > 0) {
-    const initial = Math.max(0, margin.initialMargin);
-    const maintenance = Math.max(0, margin.maintenanceMargin);
-    const available = Math.max(0, margin.marginBalance - initial);
+    // The web donut's own math (MarginDonut → marginParts), imported verbatim.
+    const p: MarginParts = marginParts(margin as never);
     lines.push(
-      `保证金 IM ${(initial / margin.marginBalance * 100).toFixed(0)}% ｜ MM ${(maintenance / margin.marginBalance * 100).toFixed(0)}%` +
-        `（可用 ${usd0(available)} / 余额 ${usd0(margin.marginBalance)} · 维持 ${usd0(maintenance)}）`,
+      `保证金 IM ${fmtPct(p.imPct, 0)} ｜ MM ${fmtPct(p.mmPct, 0)}` +
+        `（可用 ${usd0(p.available)} / 余额 ${usd0(p.balance)} · 维持 ${usd0(p.maintenance)}）`,
     );
   }
   s.strategies.forEach((st, i) => {
@@ -385,14 +353,15 @@ export function formatPositionsSection(
     const boros = st.legs.filter((l) => l.kind === 'boros');
     const short = boros.find((l) => l.side === 'SHORT');
     const long = boros.find((l) => l.side === 'LONG');
-    // StrategyCard's fixedAprOnCapital: expected PnL by maturity on capital,
-    // annualized over the full trade life. Defaults flags ('roll'/'include')
-    // adjust nothing, so the server's expectedPnlToMaturityUsd IS expectedUsd.
-    const lifeSeconds = st.clockStartSec === null ? null : st.maturity - st.clockStartSec;
-    const fixedApr =
-      lifeSeconds !== null && lifeSeconds > 0 && st.capitalUsd > 0 && st.expectedPnlToMaturityUsd !== null
-        ? st.expectedPnlToMaturityUsd / (st.capitalUsd * (lifeSeconds / 31_536_000))
-        : null;
+    // StrategyCard's hero, from the SHARED strategyMath helper. The panel's
+    // default cost flags ('roll'/'include') adjust nothing, so the server's
+    // expectedPnlToMaturityUsd IS the expectedUsd the card feeds in.
+    const fixedApr = fixedAprOnCapital(
+      st.expectedPnlToMaturityUsd,
+      st.capitalUsd,
+      st.clockStartSec,
+      st.maturity,
+    );
     lines.push(
       '',
       `${i + 1}. ${esc(st.base)} · ${maturityLabel(st.maturity)} 到期（${days} 天）${hedgeMarker(st)}`,
