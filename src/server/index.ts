@@ -4,9 +4,11 @@
  * SQLite ledger, and runs the reconcile loop. The public marketing site and the
  * shared-position page live in a separate repo (arbitrage-landing) and share no
  * code with this one. */
+import 'dotenv/config';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
 import fastifyStatic from '@fastify/static';
 import { fetchBorosMarkets, resolveBorosFetch, setClientTagContext } from '../core/boros/client';
 import { makeClientsIfConfigured, requireClients, type Clients } from '../core/clients';
@@ -20,14 +22,29 @@ import { makeBorosApiOrderClient } from '../core/boros/borosApi';
 import type { BorosOrderClient } from '../core/boros/orders';
 import { TtlCache, TTL } from './cache';
 import { readOrCreateApiToken } from './authToken';
+import { panelExitMode, readNotifyConfig, startOpportunityScanner } from './notify/scanner';
+import { scanOpportunities } from './routes/opportunities';
 import { tokenizedIndexHtml } from './spa';
 import { restrictToOwner } from './secretFile';
 import { readInstallInfo, readLocalVersion } from './version';
 
+// Outbound fetch traffic (Boros, the fwalert webhook, the update check) rides
+// the HTTP(S)_PROXY env when one is set — direct egress simply fails on some
+// installs (api.boros.finance is unreachable without the local proxy here).
+// EnvHttpProxyAgent honours NO_PROXY, so loopback stays direct; the Gate SDK
+// (axios) never touches undici and keeps its own direct path, and Telegram
+// overrides the dispatcher per-request with TG_PROXY. Loaded AFTER dotenv so
+// the proxy vars can live in the same .env as everything else.
+if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
+  setGlobalDispatcher(new EnvHttpProxyAgent());
+}
+
 const port = Number(process.env.PORT ?? 6688);
-// Loopback only, always: this server exposes a credentialed trading API and
-// must never be reachable off the machine that runs it.
-const host = '127.0.0.1';
+// Loopback by default: this server exposes a credentialed trading API. HOST
+// opts into LAN exposure (e.g. HOST=10.0.0.138) — the served HTML embeds the
+// API token, so ANYONE who can open the page from that network can trade with
+// the configured keys. Only point HOST at a network you trust.
+const host = process.env.HOST?.trim() || '127.0.0.1';
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 // Overridable so installed deployments can keep user data outside the app dir
 // (which updates wipe). Defaults preserve the repo-rooted dev layout.
@@ -204,6 +221,35 @@ app
     // server died just gets its next tick. Started after listen so a port
     // conflict (second instance) can never run venue mutations first.
     if (loopDeps && engine) engine.wake = startLoop(loopDeps).wake;
+    // The opportunity scanner: same pipeline the /api/opportunities route
+    // serves, pushed to Telegram (every scan) and the fwalert webhook
+    // (threshold crossings). Absent on any install that configured neither
+    // channel — the feature costs nothing unless it is switched on.
+    const notifyConfig = readNotifyConfig();
+    if (notifyConfig) {
+      startOpportunityScanner({
+        config: notifyConfig,
+        scan: async () =>
+          (
+            await scanOpportunities(appDeps, {
+              notionalUsd: notifyConfig.notionalUsd,
+              borosEntry: 'market',
+              entryMode: 'both-market',
+              // The web panel's default: without it the scanner's numbers
+              // silently diverge from the cards the operator compares them
+              // against (exit costs are the difference).
+              exitMode: panelExitMode(),
+              fresh: false,
+            })
+          ).result,
+      });
+      console.log(
+        `opportunity notifications enabled: Telegram ${notifyConfig.telegram ? 'on' : 'off'}, ` +
+          `webhook ${notifyConfig.webhook ? 'on' : 'off'}, ` +
+          `threshold ${(notifyConfig.threshold * 100).toFixed(1)}% APR on capital, ` +
+          `every ${Math.round(notifyConfig.intervalMs / 1000)}s`,
+      );
+    }
     const shown = host === '127.0.0.1' ? 'localhost' : host;
     console.log(`arb-tools server listening on http://${shown}:${port}`);
   })

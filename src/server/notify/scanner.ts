@@ -1,0 +1,387 @@
+/**
+ * The background opportunity scanner: a setTimeout-chained pass (same style as
+ * engine/loop.ts — never setInterval, overlap impossible by construction) that
+ * re-prices every Boros arb group through the SAME pipeline the
+ * /api/opportunities route serves, then pushes the results out of band.
+ *
+ * THE WEB PANEL IS THE RANKING SOURCE OF TRUTH. The Telegram summary mirrors
+ * web/src/panels/opportunityFilters.ts `toRows`: one row per viable PAIR (a
+ * group with three markets offers three venue combinations), viable meaning a
+ * finite, non-negative netFixedAprOnCapital, ranked by the same comparator
+ * chain — capital APR desc, then notional APR, then exec spread, then gross
+ * spread. The scanner must also be CALLED with the panel's default params
+ * (`exitMode: 'roll'` — see the wiring in server/index.ts) or its numbers
+ * silently diverge from the cards the operator compares them against.
+ *
+ *   - Telegram: a Top-N pair summary, EVERY pass (the operator asked for the
+ *     full pulse, duplicates included).
+ *   - fwalert webhook: only threshold crossings — a pair whose
+ *     netFixedAprOnCapital rose to ≥ the configured threshold for the FIRST
+ *     time (in-memory dedup; re-armed when it falls back below; a restart
+ *     re-alerts currently-crossed pairs, which is the documented cost of not
+ *     persisting dedup state).
+ *
+ * A failed or empty scan is SILENT on both channels — the notifications exist
+ * to carry the positive signal "there is a worthwhile opportunity"; routing
+ * infrastructure failures into them would drown that signal. Failures land in
+ * the server log only.
+ *
+ * The crossing detection and both message formatters are pure and exported for
+ * tests; startOpportunityScanner is the only stateful piece.
+ */
+import type { OpportunityGroup, OpportunityPair, OpportunitiesResult } from '../../core/boros/opportunities';
+import { readFwAlertConfig, sendFwAlert, type FwAlertConfig } from './fwalert';
+import { readTelegramConfig, sendTelegramMessage, type TelegramConfig } from './telegram';
+
+export interface NotifyConfig {
+  telegram: TelegramConfig | null;
+  webhook: FwAlertConfig | null;
+  /** Alert threshold as a decimal fraction (0.30 = 30%) on capital APR. */
+  threshold: number;
+  /** Scan cadence, ms. */
+  intervalMs: number;
+  /** The notional every scan prices at, USD. */
+  notionalUsd: number;
+}
+
+/** Clamps so a typo can neither spin the scanner into a loop nor disable it. */
+const MIN_INTERVAL_MS = 30_000;
+const MIN_NOTIONAL_USD = 1_000;
+const MAX_NOTIONAL_USD = 100_000_000;
+const DEFAULT_THRESHOLD = 0.3;
+const DEFAULT_INTERVAL_MS = 300_000;
+const DEFAULT_NOTIONAL_USD = 10_000;
+/** The web panel's exitMode default — see the module comment. */
+const PANEL_EXIT_MODE = 'roll' as const;
+
+/**
+ * Read the scanner config. Null when NEITHER channel is configured — the
+ * scanner then never runs, so an install that only watches the web UI pays
+ * nothing for this feature.
+ */
+export function readNotifyConfig(env: NodeJS.ProcessEnv = process.env): NotifyConfig | null {
+  const telegram = readTelegramConfig(env);
+  const webhook = readFwAlertConfig(env);
+  if (!telegram && !webhook) return null;
+  const pct = Number(env.APR_ALERT_THRESHOLD_PCT);
+  // Input is a percent (30 = 30%); internally everything is a fraction.
+  const threshold = Number.isFinite(pct) && pct > 0 ? pct / 100 : DEFAULT_THRESHOLD;
+  const sec = Number(env.APR_SCAN_INTERVAL_SECONDS);
+  const intervalMs = Math.max(
+    MIN_INTERVAL_MS,
+    Number.isFinite(sec) && sec > 0 ? sec * 1000 : DEFAULT_INTERVAL_MS,
+  );
+  const n = Number(env.APR_SCAN_NOTIONAL_USD);
+  const notionalUsd =
+    Number.isFinite(n) && n >= MIN_NOTIONAL_USD && n <= MAX_NOTIONAL_USD ? n : DEFAULT_NOTIONAL_USD;
+  return { telegram, webhook, threshold, intervalMs, notionalUsd };
+}
+
+/** The exitMode the scanner must price with so its numbers ARE the cards'. */
+export const panelExitMode = (): 'roll' => PANEL_EXIT_MODE;
+
+/** Stable per-pair identity — the same key the web panel's rows use. */
+export function pairKey(group: OpportunityGroup, pair: OpportunityPair): string {
+  return `${group.tokenId}:${group.maturity}:${pair.shortLeg.marketId}:${pair.longLeg.marketId}`;
+}
+
+/** One ranked row — the TG twin of the web panel's OpportunityRow. */
+export interface RankedPair {
+  group: OpportunityGroup;
+  pair: OpportunityPair;
+  /** netFixedAprOnCapital — finite and ≥ 0 by construction. */
+  apr: number;
+}
+
+/** Mirrors web/src/panels/opportunityFilters.ts `byValueDesc`: desc, nulls last. */
+const byValueDesc = (a: number | null, b: number | null): number => {
+  if (a === b) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return b - a;
+};
+
+/**
+ * Every viable pair across every group, best first — the panel's `toRows`
+ * without the UI-only hysteresis band (that exists to stop cards flickering
+ * under the reader's cursor; a push message has no such concern).
+ *
+ * Viable means the pair prices a real, non-negative net APR on capital: the
+ * server still serves pairs whose inputs degraded to null and ones whose costs
+ * swallow the whole spread, and neither belongs in a list of things worth
+ * executing.
+ */
+export function rankPairs(result: OpportunitiesResult, topN: number): RankedPair[] {
+  const rows: RankedPair[] = [];
+  for (const group of result.groups) {
+    for (const pair of group.pairs) {
+      const apr = pair.netFixedAprOnCapital;
+      if (apr === null || !Number.isFinite(apr) || apr < 0) continue;
+      rows.push({ group, pair, apr });
+    }
+  }
+  return rows
+    .sort(
+      (x, y) =>
+        y.apr - x.apr ||
+        byValueDesc(x.pair.netFixedApr, y.pair.netFixedApr) ||
+        byValueDesc(x.pair.execSpreadApr, y.pair.execSpreadApr) ||
+        y.pair.grossSpreadApr - x.pair.grossSpreadApr,
+    )
+    .slice(0, topN);
+}
+
+/** All viable pairs (untruncated) — the header's "可交易 N" count. */
+export function countViable(result: OpportunitiesResult): number {
+  let n = 0;
+  for (const group of result.groups) {
+    for (const pair of group.pairs) {
+      const apr = pair.netFixedAprOnCapital;
+      if (apr !== null && Number.isFinite(apr) && apr >= 0) n += 1;
+    }
+  }
+  return n;
+}
+
+/**
+ * Pure crossing detector over PAIRS: which pairs newly crossed the threshold,
+ * and the next dedup state. A pair above threshold never seen before is
+ * notified and remembered; one back below threshold is re-armed (forgotten) —
+ * a pair pricing a negative APR therefore re-arms too, exactly like the web
+ * list dropping it. A pair with no capital APR (null) is invisible: only a
+ * PRICED pair can alert.
+ */
+export function dedupeCrossings(
+  alerted: ReadonlySet<string>,
+  result: OpportunitiesResult,
+  threshold: number,
+): { notify: RankedPair[]; state: Set<string> } {
+  const state = new Set(alerted);
+  const notify: RankedPair[] = [];
+  for (const group of result.groups) {
+    for (const pair of group.pairs) {
+      const apr = pair.netFixedAprOnCapital;
+      if (apr === null || !Number.isFinite(apr)) continue;
+      const key = pairKey(group, pair);
+      if (apr >= threshold) {
+        if (!state.has(key)) {
+          state.add(key);
+          notify.push({ group, pair, apr });
+        }
+      } else {
+        state.delete(key); // re-arm
+      }
+    }
+  }
+  return { notify, state };
+}
+
+// ---- formatting (pure; exported for tests) ----
+
+/** fmtUsd(n, 0): "$1,103" / "-$3" — web/src/lib/fmt.ts's thousands rule. */
+const usd0 = (n: number): string =>
+  `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
+/** fmtNotionalShort: "$10k", "$14.7k", "$1.5M" — trailing ".0" dropped. */
+const notionalShort = (n: number): string => {
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return `${sign}$${+(abs / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
+  if (abs >= 1e3) return `${sign}$${+(abs / 1e3).toFixed(abs >= 1e5 ? 0 : 1)}k`;
+  return `${sign}$${Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+};
+
+/** fmtTokenQty: "0.126 BTC", "4.02 ETH", "1.2k HYPE" — web's tier rules. */
+const tokenQty = (q: number, symbol: string): string => {
+  const abs = Math.abs(q);
+  if (abs > 0 && abs < 1e-6) return `<0.000001 ${symbol}`;
+  if (abs >= 1e3) return `${(q / 1e3).toFixed(1)}k ${symbol}`;
+  if (abs >= 100) return `${q.toFixed(1)} ${symbol}`;
+  if (abs >= 1) return `${q.toFixed(2)} ${symbol}`;
+  return `${q.toPrecision(3)} ${symbol}`;
+};
+
+const esc = (s: string): string =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const pad = (n: number): string => String(n).padStart(2, '0');
+const maturityLabel = (maturitySec: number): string => {
+  const d = new Date(maturitySec * 1000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+};
+const stamp = (now: Date): string =>
+  `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
+  `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+/** The notional bracket: non-USD collateral sizes in the token — "$10k (0.126 BTC)". */
+function notionalLine(group: OpportunityGroup, notionalUsd: number): string {
+  const base = notionalShort(notionalUsd);
+  const isUsdCollateral = group.collateral === 'USDT' || group.collateral === 'USDC';
+  if (isUsdCollateral || group.collateralPriceUsd === null || group.collateralPriceUsd <= 0) {
+    return base;
+  }
+  return `${base} (${tokenQty(notionalUsd / group.collateralPriceUsd, group.collateral)})`;
+}
+
+/** The five stat lines one pair renders as — shared by both channels. */
+function pairLines(row: RankedPair, notionalUsd: number): string[] {
+  const { group, pair, apr } = row;
+  const days = Math.max(1, Math.round(group.secondsToMaturity / 86_400));
+  const dot = apr >= 0 ? '🟢' : '🔴';
+  const lines = [
+    `${esc(group.underlying)} · ${maturityLabel(group.maturity)} 到期（${days} 天）`,
+    `${dot} ${(apr * 100).toFixed(2)}% APR`,
+    `SHORT · ${esc(pair.shortLeg.venue)} ｜ LONG · ${esc(pair.longLeg.venue)}`,
+  ];
+  const profit =
+    pair.estProfitUsd === null ? '—' : usd0(pair.estProfitUsd);
+  lines.push(
+    `资金 ~${usd0(pair.capitalUsd ?? 0)} ｜ 预计收益 ${profit} ｜ 名义 ${notionalLine(group, notionalUsd)}`,
+  );
+  let extra =
+    pair.netFixedApr === null
+      ? '名义年化 —'
+      : `名义年化 ${(pair.netFixedApr * 100).toFixed(2)}%`;
+  if (pair.execSpreadApr !== null && pair.shortLeg.execApr !== null && pair.longLeg.execApr !== null) {
+    extra += ` ｜ 锁定价差 ${(pair.execSpreadApr * 100).toFixed(2)}%` +
+      `（空 ${(pair.shortLeg.execApr * 100).toFixed(2)}% ／ 多 ${(pair.longLeg.execApr * 100).toFixed(2)}%）`;
+  }
+  lines.push(extra);
+  return lines;
+}
+
+/** The Telegram summary: Top-N pairs ranked exactly like the web panel, HTML. */
+export function formatTopSummary(
+  ranked: RankedPair[],
+  opts: { notionalUsd: number; now: Date; totalGroups: number; viable: number },
+): string {
+  const lines: string[] = [
+    `🎯 <b>Boros 套利机会 Top ${ranked.length}</b> · 名义 ${notionalShort(opts.notionalUsd)}`,
+    `扫描 ${opts.totalGroups} 组 · 可交易 ${opts.viable} · ${stamp(opts.now)}`,
+  ];
+  ranked.forEach((row, i) => {
+    lines.push('', `${i + 1}. ${pairLines(row, opts.notionalUsd).join('\n   ')}`);
+  });
+  return lines.join('\n');
+}
+
+/** The fwalert alert body: every effective fact lives in this one field. */
+export function formatAlertDetails(
+  row: RankedPair,
+  opts: { threshold: number; notionalUsd: number; now: Date },
+): string {
+  const { group, pair } = row;
+  const lines = [
+    `【Boros 套利机会告警】`,
+    ...pairLines(row, opts.notionalUsd).map((l) => l),
+    `阈值: ${(opts.threshold * 100).toFixed(2)}% APR on capital`,
+    `触发时间: ${stamp(opts.now)}`,
+  ];
+  if (pair.reasons.length > 0) {
+    lines.push(`备注: ${pair.reasons.join(' ')}`);
+  }
+  return lines.join('\n');
+}
+
+// ---- the runtime loop ----
+
+export interface ScannerDeps {
+  config: NotifyConfig;
+  /** One full scan — the same pipeline /api/opportunities serves. */
+  scan: () => Promise<OpportunitiesResult>;
+  /** Overridable senders (tests); default to the real channels. */
+  sendTelegram?: (text: string) => Promise<boolean>;
+  sendWebhook?: (details: string, coin: string) => Promise<boolean>;
+  log?: (msg: string) => void;
+  error?: (msg: string, err?: unknown) => void;
+}
+
+/**
+ * One scanner pass. Exported so tests drive rounds without timers; the caller
+ * owns the dedup state (the startOpportunityScanner chain keeps one).
+ */
+export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise<void> {
+  const { config } = deps;
+  const log = deps.log ?? console.log;
+  const error =
+    deps.error ??
+    ((msg, err) => console.error(err ? `${msg}: ${(err as Error).message}` : msg));
+  let result: OpportunitiesResult;
+  try {
+    result = await deps.scan();
+  } catch (err) {
+    error(`[notify] scan failed — notifications skipped this round`, err);
+    return;
+  }
+  if (result.groups.length === 0) {
+    // An empty market view is either a real empty board or a degraded scan;
+    // both would be noise on the notification channels.
+    error(
+      `[notify] scan returned no groups (${result.warnings.length} warnings) — skipping notifications`,
+    );
+    return;
+  }
+  const now = new Date();
+  if (config.telegram) {
+    const ranked = rankPairs(result, 5);
+    // A summary with no PRICED pair is noise, not information: a cold-boot
+    // scan (Gate rules, leverage and the venues' books still warming up) can
+    // yield groups but no capital APR. Sending "Top 0" teaches the operator
+    // to ignore the channel; staying silent until the pipeline prices
+    // something does not lose anything — the next pass is intervalMs away.
+    if (ranked.length === 0) {
+      error(`[notify] no viable pairs (${result.groups.length} groups) — telegram summary skipped`);
+    } else {
+      const text = formatTopSummary(ranked, {
+        notionalUsd: config.notionalUsd,
+        now,
+        totalGroups: result.groups.length,
+        viable: countViable(result),
+      });
+      const ok = await (deps.sendTelegram ?? ((t) => sendTelegramMessage(config.telegram!, t)))(text);
+      if (!ok) error('[notify] telegram send failed');
+      else log(`[notify] telegram summary sent (${ranked.length} of ${countViable(result)} viable pairs)`);
+    }
+  }
+  if (config.webhook) {
+    const { notify, state } = dedupeCrossings(alerted, result, config.threshold);
+    state.forEach((k) => alerted.add(k));
+    for (const k of [...alerted]) if (!state.has(k)) alerted.delete(k);
+    const send = deps.sendWebhook ?? ((d, c) => sendFwAlert(config.webhook!, d, c));
+    for (const row of notify) {
+      const details = formatAlertDetails(row, {
+        threshold: config.threshold,
+        notionalUsd: config.notionalUsd,
+        now,
+      });
+      const coin = `${row.group.underlying}-${maturityLabel(row.group.maturity)}`;
+      const ok = await send(details, coin);
+      if (!ok) error(`[notify] webhook send failed for ${pairKey(row.group, row.pair)}`);
+      else log(`[notify] threshold alert sent for ${pairKey(row.group, row.pair)}`);
+    }
+  }
+}
+
+/**
+ * The production chain: first pass fires immediately (so a configured install
+ * proves its channels at boot), then every intervalMs. Returns a stopper for
+ * tests; the server never stops it.
+ */
+export function startOpportunityScanner(deps: ScannerDeps): { stop: () => void } {
+  const alerted = new Set<string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+  const schedule = (ms: number): void => {
+    timer = setTimeout(() => {
+      void scanPass(deps, alerted).finally(() => {
+        if (!stopped) schedule(deps.config.intervalMs);
+      });
+    }, ms);
+  };
+  schedule(0);
+  return {
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
+}

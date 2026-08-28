@@ -9,10 +9,16 @@
  * it must never 503 behind credentials. Every other input (Boros books, perp
  * books, fee rows, risk-limit leverage caps) degrades per item to null, which
  * the math turns into a plain-language reason rather than a missing opportunity.
+ *
+ * The pricing pipeline itself lives in scanOpportunities, exported so the
+ * background opportunity scanner (server/notify/scanner.ts) serves the EXACT
+ * same numbers the route serves — one pipeline, two consumers. The route stays
+ * a thin query-parse + envelope layer.
  */
 import type { CrossExApi, Symbol as RuleSymbol } from 'gate-api';
 import type { FastifyInstance } from 'fastify';
 import { publicCrossEx } from '../../core/clients';
+import type { Clients } from '../../core/clients';
 import {
   fetchBorosMarkets,
   fetchBorosOrderBook,
@@ -28,6 +34,7 @@ import {
   type BorosEntryMode,
   type EntryMode,
   type ExitMode,
+  type OpportunitiesResult,
 } from '../../core/boros/opportunities';
 import { normalizeVenue } from '../../core/boros/returns';
 import { fetchVenueBook, type NormalizedBook } from '../../core/estimate/books';
@@ -42,6 +49,7 @@ import { classifyGateError, CoreError } from '../../core/errors';
 import { parseSymbol } from '../../core/numbers';
 import { getLeverageMax } from '../../core/orders';
 import type { AppDeps } from '../app';
+import type { TtlCache } from '../cache';
 import { TTL } from '../cache';
 
 const DEFAULT_NOTIONAL_USD = 10_000;
@@ -116,7 +124,7 @@ function resolveHedgeSymbols(rules: RuleSymbol[]): Map<string, string> {
  * `/crossex/rule/risk_limits` need no credentials, so the market view serves the
  * real universe and the real leverage caps with or without keys.
  */
-function ruleClient(deps: AppDeps): CrossExApi {
+function ruleClient(deps: ScanDeps): CrossExApi {
   try {
     return deps.getClients().crossEx;
   } catch {
@@ -141,7 +149,7 @@ function ruleClient(deps: AppDeps): CrossExApi {
  * re-tune a size that was never the problem.
  */
 async function loadLeverageMax(
-  deps: AppDeps,
+  deps: ScanDeps,
   symbols: string[],
   fresh: boolean,
   out: Map<string, number>,
@@ -172,185 +180,213 @@ async function loadLeverageMax(
   return `Couldn't load the CrossEx risk limits right now (${category}) — without a max leverage per venue no opportunity can model the capital it consumes, so none can be ranked. This isn't about your notional; the caps return on the next refresh.`;
 }
 
-export function opportunitiesRoutes(deps: AppDeps) {
+/** The deps the scan pipeline actually needs — a subset of AppDeps, so the
+ * background scanner can call it without owning the whole app context. */
+export interface ScanDeps {
+  cache: TtlCache;
+  getClients: () => Clients;
+  /** Test seam for the Boros backend client (defaults to global fetch). */
+  borosFetch?: FetchLike;
+}
+
+export interface ScanParams {
+  notionalUsd: number;
+  borosEntry: BorosEntryMode;
+  entryMode: EntryMode;
+  exitMode: ExitMode;
+  feeTier?: CrossexFeeTier;
+  /** fresh=1 also busts the keys shared with /api/strategy, /api/symbols,
+   * /api/leverage and /api/fees — deliberate: a manual refresh here means
+   * "re-read upstream". */
+  fresh: boolean;
+}
+
+/**
+ * One full scan of every Boros arb group, exactly what GET /api/opportunities
+ * serves. `stale` reports whether the Boros markets read had to fall back to
+ * the cache (transport metadata the route surfaces, the scanner ignores).
+ */
+export async function scanOpportunities(
+  deps: ScanDeps,
+  params: ScanParams,
+): Promise<{ result: OpportunitiesResult; stale: boolean }> {
   const fetchImpl: FetchLike = resolveBorosFetch(deps.borosFetch);
-  // Ops knob: force the Boros taker-fee rate in the cost model. Resolved once
-  // here — the opportunity math is a pure module and never reads the environment.
+  // Ops knob: force the Boros taker-fee rate in the cost model. Resolved per
+  // scan — the opportunity math is a pure module and never reads the environment.
   const envTakerFee = Number(process.env.BOROS_TAKER_FEE_OVERRIDE);
   const takerFeeOverride = Number.isFinite(envTakerFee) ? envTakerFee : undefined;
+  const { notionalUsd, borosEntry, entryMode, exitMode, feeTier, fresh } = params;
 
+  const { value: markets, stale } = await deps.cache.get(
+    'boros:markets',
+    TTL.boros,
+    () => fetchBorosMarkets(fetchImpl),
+    { fresh },
+  );
+
+  // The CrossEx universe decides which Boros market can carry a perp leg.
+  // Losing it (no keys, rate limit, outage) leaves the Boros spreads intact,
+  // so it warns instead of failing — and without symbols the fee schedule
+  // has nothing to price, so it isn't fetched either.
+  // The symbol universe and the risk-limit table are public, so they load
+  // with or without credentials — the market view's listings and leverage
+  // caps are always the real ones.
+  const warnings: string[] = [];
+  let symbolsByVenueBase = new Map<string, string>();
+  let rulesAvailable = false;
+  let feeRows: VenueFeeRow[] | null = null;
+  try {
+    const { value } = await deps.cache.get(
+      'rules:all',
+      TTL.static,
+      async () => (await ruleClient(deps).listCrossexRuleSymbols()).body,
+      { fresh },
+    );
+    symbolsByVenueBase = resolveHedgeSymbols(value);
+    rulesAvailable = true;
+  } catch (err) {
+    const { category } = classifyGateError(err);
+    warnings.push(
+      `Couldn't load the CrossEx symbol list right now (${category}) — pricing the perp legs from the venues' public books instead; listings and leverage return on the next refresh.`,
+    );
+  }
+
+  // Fees are the ONE genuinely per-account input (/crossex/fee is auth-only).
+  // An explicit tier is a deliberate what-if and always wins; otherwise read
+  // the account's schedule and fall back to VIP 0 when there is no account.
+  let assumedTier: CrossexFeeTier | undefined;
+  if (feeTier !== undefined) {
+    feeRows = feeRowsForTier(feeTier);
+    assumedTier = feeTier;
+  } else {
+    try {
+      const { value } = await deps.cache.get(
+        'fees',
+        TTL.static,
+        async () => (await deps.getClients().crossEx.getCrossexFee()).body,
+        { fresh },
+      );
+      feeRows = value as VenueFeeRow[];
+    } catch {
+      feeRows = feeRowsForTier('vip0');
+      assumedTier = 'vip0';
+    }
+  }
+  if (assumedTier !== undefined) {
+    warnings.push(
+      `Perp fees assume the ${feeTierLabel(assumedTier)} Gate CrossEx schedule — everything else here is live. Your real rates follow your Gate VIP tier; connect Gate keys to price from them.`,
+    );
+  }
+
+  // Fetch plan straight off the grouping the math will redo — the two can't
+  // disagree about membership. Under `mark` no Boros book is consulted at
+  // all: the entry rate is each market's markApr.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const bookMarketIds: number[] = [];
+  const perpSymbols = new Set<string>();
+  // `VENUE:BASE` keys with no live symbol — when the symbol universe itself
+  // is unavailable (unconfigured/down), their PUBLIC books still price the
+  // slippage; the core looks them up under this same fallback key.
+  const fallbackBooks = new Set<string>();
+  for (const plan of groupBorosMarkets(markets, nowSec)) {
+    for (const market of plan.markets) {
+      const crossexVenue = BOROS_VENUE_TO_CROSSEX[normalizeVenue(market.venue)];
+      if (!crossexVenue) continue;
+      bookMarketIds.push(market.marketId);
+      const base = market.base.toUpperCase();
+      const symbol = symbolsByVenueBase.get(`${crossexVenue}:${base}`);
+      if (symbol) perpSymbols.add(symbol);
+      else if (!rulesAvailable) fallbackBooks.add(`${crossexVenue}:${base}`);
+    }
+  }
+
+  const borosBooks = new Map<number, BorosOrderBook | null>();
+  const venueBooks = new Map<string, NormalizedBook | null>();
+  const leverageMaxBySymbol = new Map<string, number>();
+  await Promise.all([
+    ...(borosEntry === 'market' ? bookMarketIds : []).map(async (marketId) => {
+      try {
+        const { value } = await deps.cache.get(
+          `boros:book:${marketId}`,
+          TTL.borosBook,
+          () => fetchBorosOrderBook(fetchImpl, marketId),
+          { fresh },
+        );
+        borosBooks.set(marketId, value);
+      } catch {
+        borosBooks.set(marketId, null);
+      }
+    }),
+    // NOT the `books:` key — that one caches a BookTouch for /api/books/:symbol.
+    ...[...perpSymbols].map(async (symbol) => {
+      const { value } = await deps.cache.get(
+        `fullbook:${symbol}`,
+        TTL.book,
+        () => {
+          const { exchange, base, quote } = parseSymbol(symbol);
+          return fetchVenueBook(exchange, base, quote);
+        },
+        { fresh },
+      );
+      venueBooks.set(symbol, value);
+    }),
+    // Fallback keys carry a colon, symbols carry underscores — the cache
+    // namespace can't collide with the symbol-keyed entries above.
+    ...[...fallbackBooks].map(async (key) => {
+      const { value } = await deps.cache.get(
+        `fullbook:${key}`,
+        TTL.book,
+        () => {
+          const [venue, base] = key.split(':');
+          return fetchVenueBook(venue, base, fallbackQuote(venue));
+        },
+        { fresh },
+      );
+      venueBooks.set(key, value);
+    }),
+    loadLeverageMax(deps, [...perpSymbols], fresh, leverageMaxBySymbol).then((warning) => {
+      if (warning !== null) warnings.push(warning);
+    }),
+  ]);
+
+  const result = buildOpportunities(
+    {
+      markets,
+      collateralPricesUsd: resolveCollateralPricesUsd(markets),
+      borosBooks,
+      venueBooks,
+      symbolsByVenueBase,
+      leverageMaxBySymbol,
+      feeRows,
+      nowSec,
+    },
+    { notionalUsd, borosEntry, entryMode, exitMode, takerFeeOverride },
+  );
+  return {
+    result: { ...result, warnings: [...new Set([...warnings, ...result.warnings])] },
+    stale,
+  };
+}
+
+export function opportunitiesRoutes(deps: AppDeps) {
   return async function plugin(app: FastifyInstance): Promise<void> {
     app.get('/opportunities', async (req, reply) => {
       const query = req.query as OpportunitiesQuery;
-      const notionalUsd = parseNotionalUsd(query.notionalUsd);
-      const borosEntry = parseMode<BorosEntryMode>(
-        query.borosEntry,
-        ['mark', 'market'],
-        'market',
-        'borosEntry',
-      );
-      const entryMode = parseMode<EntryMode>(
-        query.entryMode,
-        ['both-market', 'maker-hedge'],
-        'both-market',
-        'entryMode',
-      );
-      const exitMode = parseMode<ExitMode>(query.exitMode, ['close', 'roll'], 'close', 'exitMode');
-      const feeTier: CrossexFeeTier | undefined = parseFeeTier(query.feeTier);
-      // fresh=1 also busts the keys shared with /api/strategy, /api/symbols,
-      // /api/leverage and /api/fees — deliberate: a manual refresh here means
-      // "re-read upstream".
-      const fresh = query.fresh === '1';
-
-      const { value: markets, stale } = await deps.cache.get(
-        'boros:markets',
-        TTL.boros,
-        () => fetchBorosMarkets(fetchImpl),
-        { fresh },
-      );
-
-      // The CrossEx universe decides which Boros market can carry a perp leg.
-      // Losing it (no keys, rate limit, outage) leaves the Boros spreads intact,
-      // so it warns instead of failing — and without symbols the fee schedule
-      // has nothing to price, so it isn't fetched either.
-      // The symbol universe and the risk-limit table are public, so they load
-      // with or without credentials — the market view's listings and leverage
-      // caps are always the real ones.
-      const warnings: string[] = [];
-      let symbolsByVenueBase = new Map<string, string>();
-      let rulesAvailable = false;
-      let feeRows: VenueFeeRow[] | null = null;
-      try {
-        const { value } = await deps.cache.get(
-          'rules:all',
-          TTL.static,
-          async () => (await ruleClient(deps).listCrossexRuleSymbols()).body,
-          { fresh },
-        );
-        symbolsByVenueBase = resolveHedgeSymbols(value);
-        rulesAvailable = true;
-      } catch (err) {
-        const { category } = classifyGateError(err);
-        warnings.push(
-          `Couldn't load the CrossEx symbol list right now (${category}) — pricing the perp legs from the venues' public books instead; listings and leverage return on the next refresh.`,
-        );
-      }
-
-      // Fees are the ONE genuinely per-account input (/crossex/fee is auth-only).
-      // An explicit tier is a deliberate what-if and always wins; otherwise read
-      // the account's schedule and fall back to VIP 0 when there is no account.
-      let assumedTier: CrossexFeeTier | undefined;
-      if (feeTier !== undefined) {
-        feeRows = feeRowsForTier(feeTier);
-        assumedTier = feeTier;
-      } else {
-        try {
-          const { value } = await deps.cache.get(
-            'fees',
-            TTL.static,
-            async () => (await deps.getClients().crossEx.getCrossexFee()).body,
-            { fresh },
-          );
-          feeRows = value as VenueFeeRow[];
-        } catch {
-          feeRows = feeRowsForTier('vip0');
-          assumedTier = 'vip0';
-        }
-      }
-      if (assumedTier !== undefined) {
-        warnings.push(
-          `Perp fees assume the ${feeTierLabel(assumedTier)} Gate CrossEx schedule — everything else here is live. Your real rates follow your Gate VIP tier; connect Gate keys to price from them.`,
-        );
-      }
-
-      // Fetch plan straight off the grouping the math will redo — the two can't
-      // disagree about membership. Under `mark` no Boros book is consulted at
-      // all: the entry rate is each market's markApr.
-      const nowSec = Math.floor(Date.now() / 1000);
-      const bookMarketIds: number[] = [];
-      const perpSymbols = new Set<string>();
-      // `VENUE:BASE` keys with no live symbol — when the symbol universe itself
-      // is unavailable (unconfigured/down), their PUBLIC books still price the
-      // slippage; the core looks them up under this same fallback key.
-      const fallbackBooks = new Set<string>();
-      for (const plan of groupBorosMarkets(markets, nowSec)) {
-        for (const market of plan.markets) {
-          const crossexVenue = BOROS_VENUE_TO_CROSSEX[normalizeVenue(market.venue)];
-          if (!crossexVenue) continue;
-          bookMarketIds.push(market.marketId);
-          const base = market.base.toUpperCase();
-          const symbol = symbolsByVenueBase.get(`${crossexVenue}:${base}`);
-          if (symbol) perpSymbols.add(symbol);
-          else if (!rulesAvailable) fallbackBooks.add(`${crossexVenue}:${base}`);
-        }
-      }
-
-      const borosBooks = new Map<number, BorosOrderBook | null>();
-      const venueBooks = new Map<string, NormalizedBook | null>();
-      const leverageMaxBySymbol = new Map<string, number>();
-      await Promise.all([
-        ...(borosEntry === 'market' ? bookMarketIds : []).map(async (marketId) => {
-          try {
-            const { value } = await deps.cache.get(
-              `boros:book:${marketId}`,
-              TTL.borosBook,
-              () => fetchBorosOrderBook(fetchImpl, marketId),
-              { fresh },
-            );
-            borosBooks.set(marketId, value);
-          } catch {
-            borosBooks.set(marketId, null);
-          }
-        }),
-        // NOT the `books:` key — that one caches a BookTouch for /api/books/:symbol.
-        ...[...perpSymbols].map(async (symbol) => {
-          const { value } = await deps.cache.get(
-            `fullbook:${symbol}`,
-            TTL.book,
-            () => {
-              const { exchange, base, quote } = parseSymbol(symbol);
-              return fetchVenueBook(exchange, base, quote);
-            },
-            { fresh },
-          );
-          venueBooks.set(symbol, value);
-        }),
-        // Fallback keys carry a colon, symbols carry underscores — the cache
-        // namespace can't collide with the symbol-keyed entries above.
-        ...[...fallbackBooks].map(async (key) => {
-          const { value } = await deps.cache.get(
-            `fullbook:${key}`,
-            TTL.book,
-            () => {
-              const [venue, base] = key.split(':');
-              return fetchVenueBook(venue, base, fallbackQuote(venue));
-            },
-            { fresh },
-          );
-          venueBooks.set(key, value);
-        }),
-        loadLeverageMax(deps, [...perpSymbols], fresh, leverageMaxBySymbol).then((warning) => {
-          if (warning !== null) warnings.push(warning);
-        }),
-      ]);
-
-      const result = buildOpportunities(
-        {
-          markets,
-          collateralPricesUsd: resolveCollateralPricesUsd(markets),
-          borosBooks,
-          venueBooks,
-          symbolsByVenueBase,
-          leverageMaxBySymbol,
-          feeRows,
-          nowSec,
-        },
-        { notionalUsd, borosEntry, entryMode, exitMode, takerFeeOverride },
-      );
-      return reply.ok(
-        { ...result, warnings: [...new Set([...warnings, ...result.warnings])] },
-        { stale },
-      );
+      const params: ScanParams = {
+        notionalUsd: parseNotionalUsd(query.notionalUsd),
+        borosEntry: parseMode<BorosEntryMode>(query.borosEntry, ['mark', 'market'], 'market', 'borosEntry'),
+        entryMode: parseMode<EntryMode>(
+          query.entryMode,
+          ['both-market', 'maker-hedge'],
+          'both-market',
+          'entryMode',
+        ),
+        exitMode: parseMode<ExitMode>(query.exitMode, ['close', 'roll'], 'close', 'exitMode'),
+        feeTier: parseFeeTier(query.feeTier),
+        fresh: query.fresh === '1',
+      };
+      const { result, stale } = await scanOpportunities(deps, params);
+      return reply.ok(result, { stale });
     });
   };
 }

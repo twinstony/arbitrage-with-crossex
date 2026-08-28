@@ -54,6 +54,46 @@ describe('host/origin guard', () => {
     expect(res.statusCode).toBe(200);
   });
 
+  // HOST opts the bind address into the trust set (LAN exposure, see
+  // server/index.ts): the address joins Host AND Origin literally, while
+  // foreign names stay rejected — and it must not leak into a default build.
+  describe('HOST opt-in', () => {
+    afterEach(async () => {
+      delete process.env.HOST;
+      await app?.close();
+      app = undefined as unknown as FastifyInstance;
+    });
+
+    it('trusts the configured LAN address for Host and Origin', async () => {
+      process.env.HOST = '10.0.0.138';
+      app = makeTestApp();
+      const res = await app.inject({
+        method: 'GET',
+        url: URL,
+        headers: { ...HOST, host: '10.0.0.138:6688', origin: 'http://10.0.0.138:6688' },
+      });
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('still rejects a foreign Host when HOST is set', async () => {
+      process.env.HOST = '10.0.0.138';
+      app = makeTestApp();
+      const res = await app.inject({ method: 'GET', url: URL, headers: { host: 'evil.com' } });
+      expect(res.statusCode).toBe(403);
+    });
+
+    it('stays localhost-only when HOST is unset', async () => {
+      delete process.env.HOST;
+      app = makeTestApp();
+      const res = await app.inject({
+        method: 'GET',
+        url: URL,
+        headers: { host: '10.0.0.138:6688' },
+      });
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
   // A framed page is same-origin with /api, so the Host/Origin guard above lets
   // its requests straight through — anti-framing headers are the only thing
   // standing between a browsed website and a one-click Convert/Stop.

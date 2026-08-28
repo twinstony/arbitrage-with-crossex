@@ -125,8 +125,19 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // Any localhost port is trusted (the Vite dev server proxies from its own port);
   // DNS-rebinding/CSRF attackers can reach 127.0.0.1 but can't forge a localhost
   // Host/Origin. No CORS headers are ever emitted.
-  const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1)(:\d+)?$/;
-  const LOCAL_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+  //
+  // HOST (the bind address the entry point opts into, e.g. 10.0.0.138) joins the
+  // trust set LITERALLY and exact-escaped — never a wildcard — so the API only
+  // answers a Host header naming the one address the server actually binds. A
+  // browser on the LAN visiting http://10.0.0.138:6688 sends exactly that Host,
+  // and its same-origin fetches carry exactly that Origin; a rebinding attack
+  // can still only ride localhost. Binding 0.0.0.0 deliberately does NOT widen
+  // this: the guard then fails closed to localhost-only, and the operator must
+  // name the real address.
+  const lanHost = (process.env.HOST ?? '').trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lanHostAlt = lanHost ? `|${lanHost}` : '';
+  const LOCAL_HOST_RE = new RegExp(`^(localhost|127\\.0\\.0\\.1${lanHostAlt})(:\\d+)?$`);
+  const LOCAL_ORIGIN_RE = new RegExp(`^https?://(localhost|127\\.0\\.0\\.1${lanHostAlt})(:\\d+)?$`);
 
   // Fail closed on a missing wire-up: an optional field that silently
   // disables authentication is exactly the regression this catches.
