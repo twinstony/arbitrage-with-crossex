@@ -542,7 +542,7 @@ describe('scanPass', () => {
         },
         new Set(),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true); // settled — the opportunities pulse went out
     expect(sendWebhook).toHaveBeenCalledTimes(1);
   });
 
@@ -564,6 +564,36 @@ describe('scanPass', () => {
 });
 
 describe('startOpportunityScanner', () => {
+  it('retries a degraded scan early, at most 5 times, then falls back', async () => {
+    vi.useFakeTimers();
+    try {
+      const scan = vi.fn().mockResolvedValue(makeResult([makeGroup([])])); // groups, NOTHING priced
+      const scanner = startOpportunityScanner({
+        config: {
+          telegram: null,
+          webhook: { url: 'u' },
+          threshold: 0.3,
+          intervalMs: 300_000,
+          notionalUsd: 10_000,
+        },
+        scan,
+        error: vi.fn(),
+      });
+      await vi.advanceTimersByTimeAsync(30_000); // boot grace → pass 1 (degraded)
+      expect(scan).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000 * 4); // early retries 2..5
+      expect(scan).toHaveBeenCalledTimes(5);
+      // Retry budget burned → the 6th pass waits the regular 300s cadence.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(scan).toHaveBeenCalledTimes(5);
+      scanner.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('startOpportunityScanner — chain', () => {
   it('fires the first pass after the boot grace, keeps the chain, stops cleanly', async () => {
     vi.useFakeTimers();
     try {

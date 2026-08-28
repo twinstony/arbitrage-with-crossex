@@ -410,11 +410,24 @@ export interface ScannerDeps {
   error?: (msg: string, err?: unknown) => void;
 }
 
+/** How soon a DEGRADED pass is retried (see scanPass's return), and how many
+ * early retries one degradation may burn before the chain falls back to the
+ * regular cadence — a dead upstream must not be polled at 60s forever. */
+const DEGRADED_RETRY_MS = 60_000;
+const MAX_DEGRADED_RETRIES = 5;
+
 /**
  * One scanner pass. Exported so tests drive rounds without timers; the caller
  * owns the dedup state (the startOpportunityScanner chain keeps one).
+ *
+ * Returns whether the pass "settled": true means the next pass should run on
+ * the regular cadence — either the pulse went out, or the market genuinely
+ * prices nothing viable (a real state, not a bug). False means the scan was
+ * DEGRADED (failed, empty, or every pair unpriced — the cold-boot burst),
+ * which is worth retrying SOON: waiting the full interval to learn the boot
+ * warm-up finished stretches the first pulse to ten minutes for nothing.
  */
-export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise<void> {
+export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise<boolean> {
   const { config } = deps;
   const log = deps.log ?? console.log;
   const error =
@@ -425,7 +438,7 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
     result = await deps.scan();
   } catch (err) {
     error(`[notify] scan failed — notifications skipped this round`, err);
-    return;
+    return false;
   }
   if (result.groups.length === 0) {
     // An empty market view is either a real empty board or a degraded scan;
@@ -433,7 +446,21 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
     error(
       `[notify] scan returned no groups (${result.warnings.length} warnings) — skipping notifications`,
     );
-    return;
+    return false;
+  }
+  // Degraded vs real: if NO pair priced a capital APR anywhere, the inputs
+  // (leverage caps, books) didn't arrive — the cold-boot burst — and a retry
+  // will almost certainly price. If pairs priced but none is viable, the
+  // market genuinely offers nothing worth executing; that is a message-silent
+  // but SETTLED state, not an error to chase.
+  const priced = result.groups.reduce(
+    (n, g) =>
+      n + g.pairs.filter((p) => p.netFixedAprOnCapital !== null && Number.isFinite(p.netFixedAprOnCapital)).length,
+    0,
+  );
+  if (priced === 0) {
+    error(`[notify] scan priced 0 of ${result.groups.length} groups — degraded, retrying early`);
+    return false;
   }
   const now = new Date();
   if (config.telegram) {
@@ -486,6 +513,7 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
       else log(`[notify] threshold alert sent for ${pairKey(row.group, row.pair)}`);
     }
   }
+  return true;
 }
 
 /**
@@ -502,11 +530,21 @@ export function startOpportunityScanner(deps: ScannerDeps): { stop: () => void }
   const alerted = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let degradedRetries = 0;
   const schedule = (ms: number): void => {
     timer = setTimeout(() => {
-      void scanPass(deps, alerted).finally(() => {
-        if (!stopped) schedule(deps.config.intervalMs);
-      });
+      void scanPass(deps, alerted)
+        .then((settled) => {
+          if (settled) {
+            degradedRetries = 0;
+            return deps.config.intervalMs;
+          }
+          degradedRetries += 1;
+          return degradedRetries >= MAX_DEGRADED_RETRIES ? deps.config.intervalMs : DEGRADED_RETRY_MS;
+        })
+        .then((delay) => {
+          if (!stopped) schedule(delay);
+        });
     }, ms);
   };
   schedule(BOOT_FIRST_DELAY_MS);
