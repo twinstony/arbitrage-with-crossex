@@ -283,7 +283,14 @@ export interface StrategySummary {
     /** The spread-lock clock's start — the hero Fixed APY annualizes over the
      * FULL trade life (start → maturity), exactly like StrategyCard. */
     clockStartSec: number | null;
+    /** The sizing gate. When false the web card HIDES the headline numbers
+     * (a full-life projection on half the notional reads as a great trade);
+     * the message must hide them too. */
+    hedgeChecks: { fullyHedged: boolean };
   }>;
+  /** Degrade reasons from the strategy route ("Couldn't load Gate positions…").
+   * Rendered verbatim — they say exactly why the numbers below look odd. */
+  warnings?: string[];
   totals: {
     capitalUsd: number;
     realizedPnlUsd: number;
@@ -340,6 +347,9 @@ export function formatPositionsSection(
     `资金 ~${usd0(s.totals.capitalUsd)} ｜ PnL now ${signedUsd(s.totals.realizedPnlUsd)}` +
       ` ｜ 到期预期 ${signedUsd(s.totals.expectedPnlToMaturityUsd)}`,
   ];
+  for (const w of s.warnings ?? []) {
+    lines.push(`⚠️ ${esc(w)}`);
+  }
   if (margin && margin.marginBalance > 0) {
     // The web donut's own math (MarginDonut → marginParts), imported verbatim.
     const p: MarginParts = marginParts(margin as never);
@@ -353,22 +363,22 @@ export function formatPositionsSection(
     const boros = st.legs.filter((l) => l.kind === 'boros');
     const short = boros.find((l) => l.side === 'SHORT');
     const long = boros.find((l) => l.side === 'LONG');
-    // StrategyCard's hero, from the SHARED strategyMath helper. The panel's
-    // default cost flags ('roll'/'include') adjust nothing, so the server's
-    // expectedPnlToMaturityUsd IS the expectedUsd the card feeds in.
-    const fixedApr = fixedAprOnCapital(
-      st.expectedPnlToMaturityUsd,
-      st.capitalUsd,
-      st.clockStartSec,
-      st.maturity,
-    );
+    // THE SIZING GATE, mirroring StrategyCard: until the position is fully
+    // hedged the headline numbers (Fixed APY / PnL at maturity / Capital) are
+    // confidently wrong — a full-life projection on half the notional reads as
+    // a great trade — so the web card hides them and shows the hedge cue
+    // instead. PnL now stays: real cash + MtM whatever the book's shape.
+    const fullyHedged = st.hedgeChecks?.fullyHedged ?? false;
+    const fixedApr = fullyHedged
+      ? fixedAprOnCapital(st.expectedPnlToMaturityUsd, st.capitalUsd, st.clockStartSec, st.maturity)
+      : null;
     lines.push(
       '',
       `${i + 1}. ${esc(st.base)} · ${maturityLabel(st.maturity)} 到期（${days} 天）${hedgeMarker(st)}`,
       `   ${
         fixedApr === null
-          ? '⚪ Fixed APY —（时钟或资金未知）'
-          : `${fixedApr >= 0 ? '🟢' : '🔴'} Fixed APY ${(fixedApr * 100).toFixed(2)}%`
+          ? `⚪ Fixed APY —（${fullyHedged ? '时钟或资金未知' : '对冲不完整，数字已隐藏'}）`
+          : `${fixedApr >= 0 ? '🟢' : '🔴'} Fixed APY ${fmtPct(fixedApr)}`
       }`,
     );
     if (short && long && short.entryApr !== undefined && long.entryApr !== undefined) {
@@ -378,12 +388,16 @@ export function formatPositionsSection(
         `   锁定价差 ${(st.spread * 100).toFixed(2)}% ｜ 名义 ~${usd0(short.notionalUsd)}/腿`,
       );
     }
+    if (fullyHedged) {
+      lines.push(
+        `   资金 ~${usd0(st.capitalUsd)}（perp ${usd0(st.capitalSplit.perpUsd)} + Boros ${usd0(st.capitalSplit.borosUsd)}）`,
+      );
+    }
     lines.push(
-      `   资金 ~${usd0(st.capitalUsd)}（perp ${usd0(st.capitalSplit.perpUsd)} + Boros ${usd0(st.capitalSplit.borosUsd)}）`,
       `   PnL now ${signedUsd(st.realizedPnlUsd)}` +
-        (st.expectedPnlToMaturityUsd === null
-          ? ''
-          : ` ｜ 到期预期 ${signedUsd(st.expectedPnlToMaturityUsd)}`) +
+        (fullyHedged && st.expectedPnlToMaturityUsd !== null
+          ? ` ｜ 到期预期 ${signedUsd(st.expectedPnlToMaturityUsd)}`
+          : '') +
         (st.elapsedSeconds === null ? '' : ` ｜ 已运行 ${(st.elapsedSeconds / 86_400).toFixed(1)} 天`),
     );
   });

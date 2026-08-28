@@ -351,6 +351,7 @@ function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {})
         expectedPnlToMaturityUsd: 109.39,
         elapsedSeconds: 2 * 86_400,
         clockStartSec: 1793318400 - 65 * 86_400,
+        hedgeChecks: { fullyHedged: true },
         ...over,
       },
     ],
@@ -360,6 +361,7 @@ function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {})
       expectedPnlToMaturityUsd: 109.39,
       strategyCount: 1,
     },
+    warnings: [],
   };
 }
 
@@ -396,6 +398,41 @@ describe('formatPositionsSection', () => {
     const text = formatPositionsSection(makeStrategy(), margin);
     expect(text).toContain('IM 64% ｜ MM 26%');
     expect(text).toContain('可用 $1,246 / 余额 $3,432 · 维持 $878'); // available derived: balance − initial
+  });
+
+  it('gates the headline numbers when the strategy is NOT fully hedged — the web card hides them, so must the message', () => {
+    // The live symptom: a transient Gate failure degraded the payload to
+    // Boros-only (capital collapsed to $590, perp legs gone) and the message
+    // cheerfully rendered "Fixed APY 126.92%" — a full-life projection on a
+    // broken capital base. The web card hides Fixed APY / PnL at maturity /
+    // Capital until fullyHedged; the message must do the same and carry the
+    // payload's warning verbatim.
+    const degraded = makeStrategy({
+      hedge: 'partial',
+      hedgeChecks: { fullyHedged: false },
+      capitalUsd: 590,
+      capitalSplit: { perpUsd: 0, borosUsd: 590 },
+      legs: [{ kind: 'boros', side: 'SHORT', venue: 'HYPERLIQUID', notionalUsd: 31_758, entryApr: 0.0848 },
+             { kind: 'boros', side: 'LONG', venue: 'OKX', notionalUsd: 31_758, entryApr: 0.0582 }],
+    });
+    degraded.warnings = [
+      "Couldn't load Gate positions right now (network) — showing the Boros legs only; the perp overlay will return on the next refresh.",
+    ];
+    // The totals row is the server's aggregate — degraded too in the real
+    // payload — so make the fixture honest about it.
+    degraded.totals = {
+      capitalUsd: 590,
+      realizedPnlUsd: -10,
+      expectedPnlToMaturityUsd: 132,
+      strategyCount: 1,
+    };
+    const text = formatPositionsSection(degraded);
+    expect(text).toContain('⚠️ partial hedge');
+    expect(text).not.toMatch(/Fixed APY \d/); // no number on the hero
+    expect(text).toContain('对冲不完整');
+    expect(text).toContain('PnL now -$23 ｜ 已运行'); // PnL now STAYS; 到期预期 (gated) is gone
+    expect(text).not.toContain('（perp $0 + Boros $590）'); // the gated Capital line
+    expect(text).toContain("Couldn't load Gate positions"); // the why, verbatim
   });
 
   it('says so explicitly when nothing is open', () => {
