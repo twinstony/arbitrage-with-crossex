@@ -520,10 +520,15 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
 }
 
 /**
- * The production chain: first pass fires immediately (so a configured install
- * proves its channels at boot), then every intervalMs. Returns a stopper for
- * tests; the server never stops it.
+ * The production chain: the first pass waits out a short boot grace — the
+ * first moments after listen are a cold burst (Gate rules, leverage, every
+ * venue book fetched at once) that regularly yields zero PRICED pairs, and
+ * the skip rule would then eat the boot pulse. 30s in, the same scan prices
+ * fine. Then every intervalMs. Returns a stopper for tests; the server never
+ * stops it.
  */
+const BOOT_FIRST_DELAY_MS = 30_000;
+
 export function startOpportunityScanner(deps: ScannerDeps): { stop: () => void } {
   const alerted = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -535,7 +540,7 @@ export function startOpportunityScanner(deps: ScannerDeps): { stop: () => void }
       });
     }, ms);
   };
-  schedule(0);
+  schedule(BOOT_FIRST_DELAY_MS);
   return {
     stop: () => {
       stopped = true;

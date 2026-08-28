@@ -564,7 +564,7 @@ describe('scanPass', () => {
 });
 
 describe('startOpportunityScanner', () => {
-  it('fires an immediate first pass, keeps the chain, and stops cleanly', async () => {
+  it('fires the first pass after the boot grace, keeps the chain, stops cleanly', async () => {
     vi.useFakeTimers();
     try {
       const sendWebhook = vi.fn().mockResolvedValue(true);
@@ -580,7 +580,9 @@ describe('startOpportunityScanner', () => {
         scan,
         sendWebhook,
       });
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(scan).not.toHaveBeenCalled(); // boot grace
+      await vi.advanceTimersByTimeAsync(1);
       expect(scan).toHaveBeenCalledTimes(1);
       expect(sendWebhook).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(10);
