@@ -362,6 +362,7 @@ function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {})
       strategyCount: 1,
     },
     warnings: [],
+    borosZones: [{ tokenId: 1, marginRatio: 0.5873 }],
   };
 }
 

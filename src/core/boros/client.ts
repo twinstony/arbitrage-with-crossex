@@ -170,6 +170,12 @@ export interface BorosMarginGroup {
   isCross: boolean;
   netBalance: string;
   initialMargin?: string;
+  /** The venue's own waterline: maintMargin / netBalance, computed BY Boros.
+   * Its complement (1 − marginRatio) is the cushion the Boros app labels the
+   * zone's health — 0 is the liquidation line. Present on live payloads for
+   * groups holding positions; optional here so a legacy/empty group degrades
+   * to "unknown" instead of a guess. */
+  marginRatio?: number;
   marketPositions: BorosMarketPosition[];
 }
 

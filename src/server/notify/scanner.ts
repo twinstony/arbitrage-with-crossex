@@ -291,6 +291,10 @@ export interface StrategySummary {
   /** Degrade reasons from the strategy route ("Couldn't load Gate positions…").
    * Rendered verbatim — they say exactly why the numbers below look odd. */
   warnings?: string[];
+  /** Boros-side margin waterline per collateral zone holding positions:
+   * the venue's own marginRatio (maintMargin / netBalance, computed BY Boros).
+   * The cushion the Boros app labels health is 1 − ratio; 0 is liquidation. */
+  borosZones?: Array<{ tokenId: number; marginRatio: number }>;
   totals: {
     capitalUsd: number;
     realizedPnlUsd: number;
@@ -357,6 +361,14 @@ export function formatPositionsSection(
       `保证金 IM ${fmtPct(p.imPct, 0)} ｜ MM ${fmtPct(p.mmPct, 0)}` +
         `（可用 ${usd0(p.available)} / 余额 ${usd0(p.balance)} · 维持 ${usd0(p.maintenance)}）`,
     );
+  }
+  // The OTHER liquidation domain: the Boros collateral zone(s) actually holding
+  // positions. marginRatio is Boros's own number (maintMargin / netBalance) —
+  // its complement is the cushion the Boros app labels health, 0 = liquidation
+  // line. Higher is safer; shown next to the CrossEx line so both waterlines
+  // read side by side instead of one hiding the other.
+  for (const z of s.borosZones ?? []) {
+    lines.push(`Boros 缓冲 ${fmtPct(1 - z.marginRatio, 0)}（保证金率 ${fmtPct(z.marginRatio, 0)}）`);
   }
   s.strategies.forEach((st, i) => {
     const days = Math.max(1, Math.round(st.secondsToMaturity / 86_400));

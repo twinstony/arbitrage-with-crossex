@@ -412,7 +412,25 @@ export function strategyRoutes(deps: AppDeps) {
       });
       if (partitionWarning) fillWarnings.push(partitionWarning);
       if (fillWarnings.length) result.warnings = [...result.warnings, ...fillWarnings];
-      return reply.ok(result, { stale: stalePerps });
+      // The Boros side's own margin waterline, straight from the venue's wire
+      // (marginRatio = maintMargin / netBalance, computed BY Boros — never
+      // re-modelled here). Only zones actually holding positions are listed;
+      // a message reader needs the worst one, not an inventory of empty zones.
+      // Display convention: the Boros app's 健康度 is 1 − marginRatio (0 =
+      // liquidation line); both raw and cushioned travel together so neither
+      // side has to remember the inversion.
+      const borosZones = zones
+        .map((z) => {
+          const groups = [...(z.cross ? [z.cross] : []), ...z.isolated].filter((g) =>
+            g.marketPositions.some((p) => Number(p.notionalSize) !== 0),
+          );
+          const ratios = groups
+            .map((g) => g.marginRatio)
+            .filter((r): r is number => typeof r === 'number' && Number.isFinite(r));
+          return { tokenId: z.tokenId, marginRatio: ratios.length ? Math.max(...ratios) : null };
+        })
+        .filter((z) => z.marginRatio !== null);
+      return reply.ok({ ...result, borosZones }, { stale: stalePerps });
     });
   };
 }
