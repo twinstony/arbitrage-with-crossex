@@ -419,6 +419,10 @@ export async function fetchBorosCollaterals(
     isCross,
     netBalance: String(g.netBalance ?? '0'),
     initialMargin: g.initialMargin as string | undefined,
+    // The venue's own waterline travels on the wire (maintMargin / netBalance).
+    // Deliberately copied here, not re-derived: this field is what the route's
+    // borosZones passthrough and the notification render on.
+    marginRatio: g.marginRatio as number | undefined,
     marketPositions: Array.isArray(g.marketPositions)
       ? (g.marketPositions as Array<Record<string, unknown>>).map(toPosition)
       : [],
