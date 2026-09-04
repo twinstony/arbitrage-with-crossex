@@ -1,5 +1,7 @@
 import 'dotenv/config';
+import https from 'node:https';
 import axios from 'axios';
+import type { AxiosInstance, AxiosRequestConfig, InternalAxiosRequestConfig } from 'axios';
 import { ApiClient, CrossExApi, FuturesApi, SpotApi } from 'gate-api';
 import { CoreError } from './errors';
 
@@ -9,6 +11,79 @@ import { CoreError } from './errors';
  * surfaces as a network error → the engine's UNKNOWN/error paths, which are
  * safe by design (probe-and-resolve, never guess). */
 const HTTP_TIMEOUT_MS = 15_000;
+
+/** Backoff between the first failed Gate read and its single retry. */
+const GATE_RETRY_DELAY_MS = 300;
+
+/** Shared keep-alive HTTPS agent for every Gate call. axios' default agent
+ * opens a fresh TCP+TLS connection per request; from networks where the path to
+ * api.gateio.ws is slow/flaky (handshake seconds, bursty handshake failures),
+ * reusing warm sockets across the ~10 concurrent reads of each refresh is the
+ * difference between a working overlay and the perpsUnavailableWarning degrade.
+ * The pool is a single module-level agent so the signed and public clients (and
+ * hot-swapped credentials) all ride the same warm sockets. */
+const gateHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 16 });
+
+/** Transport-level failure codes worth one retry. These all mean "no response
+ * arrived" — the server cannot have acted on the request, so repeating a GET is
+ * safe (GETs are idempotent at Gate). Response-bearing errors are handled by
+ * the status branch below (5xx only). */
+const RETRYABLE_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPROTO',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+]);
+
+/** A transient failure is one where retrying cannot double-execute anything:
+ * the request was an idempotent GET and either no response ever arrived
+ * (network error) or the server itself said 5xx. POST/DELETE writes are never
+ * retried — a lost response after a write must not resubmit the order (the
+ * engine's freeze/quarantine rules exist precisely because guessing a write's
+ * fate is forbidden). Exported for the unit test that pins the no-response
+ * branch (nock cannot emulate transport errors promptly, so the predicate is
+ * the honest seam for ECONNRESET/timeout/EAI_AGAIN coverage). */
+export function isRetryableGateError(
+  config: AxiosRequestConfig | InternalAxiosRequestConfig,
+  err: unknown,
+): boolean {
+  const method = String(config.method ?? 'get').toLowerCase();
+  if (method !== 'get') return false;
+  const e = err as { response?: { status: number } | undefined; code?: string; message?: string };
+  if (e?.response) return e.response.status >= 500 && e.response.status !== 429;
+  return Boolean(e?.code && RETRYABLE_NETWORK_CODES.has(e.code)) ||
+    /socket hang up|timeout/i.test(e?.message ?? '');
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The Gate axios instance: hard timeout, DIRECT to api.gateio.ws (`proxy:
+ * false` — axios otherwise inherits the process's HTTPS_PROXY env var and the
+ * local Clash proxy is a bursty CONNECT-failure point in front of the exchange
+ * API; the .env SHIPPED comment says Gate stays direct, this makes it true),
+ * warm keep-alive sockets, and one retry for transient read failures. The SDK
+ * (gate-api) calls exactly `axiosInstance.request(config)`, so wrapping that
+ * one method covers every Gate call — reads and writes alike — without touching
+ * the SDK. */
+function gateAxios(): AxiosInstance {
+  const ax = axios.create({ timeout: HTTP_TIMEOUT_MS, proxy: false, httpsAgent: gateHttpsAgent });
+  const rawRequest = ax.request;
+  const requestWithRetry = async (config: InternalAxiosRequestConfig) => {
+    try {
+      return await rawRequest(config);
+    } catch (err) {
+      if (!isRetryableGateError(config, err)) throw err;
+      await delay(GATE_RETRY_DELAY_MS);
+      return await rawRequest(config);
+    }
+  };
+  ax.request = requestWithRetry as typeof ax.request;
+  return ax;
+}
 
 /** Gate Broker Program channel id, sent as X-Gate-Channel-Id on every signed
  * request so Gate can attribute this tool's order flow (the same mechanism
@@ -42,7 +117,7 @@ export function makeClients(creds?: Credentials): Clients {
       'Missing GATE_API_KEY / GATE_API_SECRET. Add them to a .env file in the project root.',
     );
   }
-  const api = new ApiClient(undefined, axios.create({ timeout: HTTP_TIMEOUT_MS }));
+  const api = new ApiClient(undefined, gateAxios());
   api.setApiKeySecret(key, secret);
   // Mutate rather than assign: the SDK's defaultHeaders setter replaces the
   // whole object, which would drop its stock X-Gate-Size-Decimal header.
@@ -77,7 +152,7 @@ export function makeClientsIfConfigured(): Clients | null {
  */
 let publicClient: CrossExApi | undefined;
 export function publicCrossEx(): CrossExApi {
-  publicClient ??= new CrossExApi(new ApiClient(undefined, axios.create({ timeout: HTTP_TIMEOUT_MS })));
+  publicClient ??= new CrossExApi(new ApiClient(undefined, gateAxios()));
   return publicClient;
 }
 
