@@ -13,7 +13,7 @@
  * route response is literally the object both sides read.
  */
 export { toRows, maturityDays, venueKey, type OpportunityRow } from '../../../web/src/panels/opportunityFilters';
-export { fixedAprOnCapital, SECONDS_IN_YEAR } from '../../../web/src/panels/strategyMath';
+export { fixedAprOnCapital, SECONDS_IN_YEAR } from '../math';
 export { fmtUsd, fmtNotionalShort, fmtTokenQty, fmtPct } from '../../../web/src/lib/fmt';
 export { marginParts, type MarginParts } from '../../../web/src/lib/margin';
 export type {
