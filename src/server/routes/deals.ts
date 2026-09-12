@@ -1,10 +1,11 @@
 /**
- * Deal routes — the app's ONLY execution surface (engine). The route layer
+ * Deal routes — one of the app's two execution surfaces (engine). The other
+ * is the rebalance runner (src/server/rebalanceRunner.ts). The route layer
  * never touches venue-mutating endpoints itself: creation writes an intent row
  * the reconcile loop picks up on its next tick; commands are one-row intent
  * edits (levels, not events).
  */
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import { CoreError } from '../../core/errors';
 import { formatRestPrice } from '../../core/numbers';
 import { setLeverage } from '../../core/orders';
@@ -26,6 +27,23 @@ function dealView(deps: AppDeps, pair: PairRow) {
 
 export function dealsRoutes(deps: AppDeps) {
   return async function routes(app: FastifyInstance): Promise<void> {
+    /* A rebalance moves cash out of CrossEx for minutes, and its amount was
+       sized on the margin that was free when it started. A deal that opens
+       meanwhile takes that margin. The rebalance start refuses while a deal
+       works; this is the same rule the other way. Only a running job blocks:
+       a halted one moves nothing until it is resumed, and resume has the
+       same check. */
+    const rebalanceRunning = (): boolean => deps.rebalance?.jobs.read()?.status === 'running';
+    const refuseForRebalance = (reply: FastifyReply, what: string): FastifyReply =>
+      reply.code(409).send({
+        ok: false,
+        error: {
+          category: 'validation',
+          message: `a rebalance is still running — wait for it to finish before ${what}`,
+          retryable: true,
+        },
+      });
+
     app.post('/deals', async (req, reply) => {
       // First-run gate: no real order until the disclaimer is accepted. Tied to
       // the config-backed credentials service (always present in a real install;
@@ -50,6 +68,7 @@ export function dealsRoutes(deps: AppDeps) {
       if (deps.engine!.store.getPair(body.id)) {
         return reply.code(202).ok({ id: body.id, duplicate: true });
       }
+      if (rebalanceRunning()) return refuseForRebalance(reply, 'starting a deal');
       const clients = deps.getClients();
       const getAccount = async () =>
         (await deps.cache.get('account', TTL.live, async () => (await clients.crossEx.getCrossexAccount()).body)).value;
@@ -98,6 +117,16 @@ export function dealsRoutes(deps: AppDeps) {
       // an existing position would have had its liquidation price moved without
       // ever seeing it, on a deal that was never created.
       const applied: Array<{ contract: string; prev: number }> = [];
+      const restoreLeverage = async () => {
+        for (const { contract, prev } of applied.reverse()) {
+          if (!Number.isFinite(prev) || prev < 1) continue; // nothing trustworthy to restore
+          try {
+            await setLeverage(clients.crossEx, contract, prev);
+          } catch {
+            /* best-effort: the refusal below is the one the user must see */
+          }
+        }
+      };
       try {
         for (const { contract, lev } of levs) {
           let prev = 0;
@@ -111,19 +140,20 @@ export function dealsRoutes(deps: AppDeps) {
           applied.push({ contract, prev });
         }
       } catch (err) {
-        for (const { contract, prev } of applied.reverse()) {
-          if (!Number.isFinite(prev) || prev < 1) continue; // nothing trustworthy to restore
-          try {
-            await setLeverage(clients.crossEx, contract, prev);
-          } catch {
-            /* best-effort: the abort error below is the one the user must see */
-          }
-        }
+        await restoreLeverage();
         throw new CoreError(
           `aborted before creating the deal: leverage set failed — ${(err as Error).message}`,
         );
       }
 
+      // Again, with no await between here and the write: the checks above ran
+      // before several reads, and a rebalance can have started during them.
+      // A refusal here is the same outcome as a failed set — nothing created —
+      // so the leverage just applied is put back the same way.
+      if (rebalanceRunning()) {
+        await restoreLeverage();
+        return refuseForRebalance(reply, 'starting a deal');
+      }
       deps.engine!.store.createPair(row);
       deps.cache.bust('account');
       deps.engine!.wake?.(); // first placement happens now, not after the tick sleep
@@ -204,6 +234,7 @@ export function dealsRoutes(deps: AppDeps) {
     app.post('/deals/:id/resume', async (req, reply) => {
       const pair = requireDeal((req.params as { id: string }).id);
       if (pair.mode !== 'HALTED') throw new CoreError(`deal ${pair.id} is not halted (mode: ${pair.mode})`);
+      if (rebalanceRunning()) return refuseForRebalance(reply, 'resuming a deal');
       commands.resumeAfterHalt(deps.engine!.store, pair.id);
       deps.engine!.wake?.();
       return reply.ok({ id: pair.id, mode: 'STOPPING' });

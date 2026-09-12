@@ -36,7 +36,7 @@ import {
   type ExitMode,
   type OpportunitiesResult,
 } from '../../core/boros/opportunities';
-import { normalizeVenue } from '../../core/boros/returns';
+import { normalizeVenue } from '../../core/boros/venue';
 import { fetchVenueBook, type NormalizedBook } from '../../core/estimate/books';
 import {
   feeRowsForTier,

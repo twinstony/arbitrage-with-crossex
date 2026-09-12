@@ -446,12 +446,11 @@ curl -s "https://api.gateio.ws/api/v4/crossex/rule/symbols" | jq '.[] | select(.
     source/confidence fallback chain), fee estimation with special-fee overrides.
   - `boros/` — the fixed-rate side: `opportunities.ts` (prices every viable Boros↔CrossEx
     pair net of costs), `pair.ts` + `orders.ts` (two-leg quoting and atomic execution),
-    `returns.ts` (the position solver behind the strategy cards — pairing, cost model,
-    projections), `partition.ts` (which venue leg belongs to which strategy).
+    `venue.ts` (venue-key normalisation and the year constant every APR shares).
   - `preview.ts` — `resolveActions` + estimates = `POST /api/preview`.
 - `src/server/` — Fastify app: TTL cache with request coalescing + 429 stale-serve, localhost
-  Host/Origin guard, `/api/deals` routes (thin intent writers — the loop owns every venue
-  mutation), routes.
+  Host/Origin guard, `/api/deals` routes (thin intent writers — the loop owns every deal's
+  venue mutation; the rebalance runner owns the pay-down's), routes.
 - `web/` — React 18 + Vite + Tailwind + react-query SPA (standalone package).
 - `install.sh` / `uninstall.sh` — the macOS one-command installer (private Node runtime in
   `~/.boros-crossex`, LaunchAgent `com.boros.crossex-terminal`, user data outside the app dir).
