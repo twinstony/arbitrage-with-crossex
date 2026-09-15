@@ -22,7 +22,7 @@ import { lineFor as lineIn, liquidationLines } from '../../lib/liquidation';
 import { useBookId } from '../bookId';
 import { AddressForm, short } from '../HomeControls';
 import { useTrackedAddress } from '../trackedAddress';
-import { deriveAsset, SECONDS_IN_YEAR } from './assetModel';
+import { deriveAsset, portfolioTotals } from './assetModel';
 import { legSinceParam, loadPrefs, savePrefs, type AssetViewPrefs } from './assetPrefsStore';
 import { AssetCard } from './AssetCard';
 
@@ -87,15 +87,11 @@ export function AssetsHome() {
       }),
     [data, windows.bySince, windows.errorBySince, prefs.exclusions, prefs.sinceByAsset, feeRows],
   );
-  // Dust fold: an asset with nothing open and a negligible history total is
-  // real (the sums keep it) but not worth a card — one muted line names them.
-  const derived = allDerived.filter(
-    (a) =>
-      a.group.perpOpen.length > 0 ||
-      a.group.borosOpen.length > 0 ||
-      Math.abs(a.derived.totals.pnlUsd) >= 1,
-  );
-  const dust = allDerived.filter((a) => !derived.includes(a));
+  // Dust fold + strip totals: shared with the server's Telegram positions
+  // section (assetModel.portfolioTotals), so the message sums what the strip
+  // sums. The dust fold: an asset with nothing open and a negligible history
+  // total is real (the sums keep it) but not worth a card — one muted line
+  // names them.
 
   /* Where each coin's move liquidates the ACCOUNT. Needs margin balance,
      maintenance and the wallet equities, which the header already polls, so
@@ -122,30 +118,8 @@ export function AssetsHome() {
   // total then differs from the cards' sum by exactly this line.
   const interestAvailable = data?.interest?.available === true;
   const interestUsd = interestAvailable ? data!.interest!.paidUsd : 0;
-  const totalPnl = derived.reduce((s, a) => s + a.derived.totals.pnlUsd, 0) - interestUsd;
-  const totalCapital = derived.reduce((s, a) => s + a.derived.totals.capitalUsd, 0);
-  // Blended APR: Σpnl over Σ(capital · its own elapsed clock) — each asset
-  // keeps its clock, so a young asset doesn't dilute an old one's rate.
-  // Both sums cover the SAME assets: one with history but no capital would
-  // add PnL to the numerator while contributing zero capital-years, which
-  // silently inflates the rate.
-  const aprAgg = derived.reduce(
-    (s, a) => {
-      const d = a.derived;
-      if (d.clockStartSec === null || !data || !(d.totals.capitalUsd > 0)) return s;
-      return {
-        pnl: s.pnl + d.totals.pnlUsd,
-        capYears: s.capYears + d.totals.capitalUsd * ((data.nowSec - d.clockStartSec) / SECONDS_IN_YEAR),
-      };
-    },
-    { pnl: 0, capYears: 0 },
-  );
-  const blendedApr = aprAgg.capYears > 0 ? (aprAgg.pnl - interestUsd) / aprAgg.capYears : null;
-  // Legs to open (missing or short), counted the way the cards show them.
-  // A book whose perps do not cancel is a second, different fact — it gets
-  // its own words rather than an invisible +1 in the count.
-  const gapCount = derived.reduce((s, a) => s + a.derived.gaps.length, 0);
-  const nonNeutral = derived.some((a) => !a.derived.deltaNeutral);
+  const { carded: derived, dust, totalPnlUsd: totalPnl, totalCapitalUsd: totalCapital, blendedApr, gapCount, nonNeutral } =
+    portfolioTotals(allDerived, interestUsd, data?.nowSec ?? 0);
 
   const header = (
     <div className="mb-3 flex flex-wrap items-center gap-2">

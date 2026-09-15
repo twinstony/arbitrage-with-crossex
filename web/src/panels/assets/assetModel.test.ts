@@ -13,6 +13,7 @@ import {
   pairBorosCloseLegs,
   pairPerpCloseLegs,
   perpKey,
+  portfolioTotals,
   SECONDS_IN_YEAR,
 } from './assetModel';
 
@@ -509,5 +510,59 @@ describe('exclusions and maturity — his 2026-09-09 rules', () => {
     expect(d.gaps[0]).toMatchObject({ venue: 'HYPERLIQUID', leg: 'boros', kind: 'missing' });
     expect(d.totals.capitalUsd).toBe(10_000);
     expect(d.pairs).toHaveLength(0);
+  });
+});
+
+/**
+ * The totals strip, shared with the server's Telegram positions section: the
+ * dust fold, the one-time borrow interest and the hedge status must be the
+ * same numbers the strip renders, or the message and the screen disagree.
+ */
+describe('portfolioTotals', () => {
+  const book = (base: string, pnl: number, capital: number, over: Partial<AssetGroup> = {}) => {
+    const g = group({
+      base,
+      perpOpen: [perp({ upnlUsd: pnl, imUsd: capital, symbol: `${base}_PERP`, ...over.perpOpen?.[0] })],
+      ...over,
+    });
+    return g;
+  };
+  const entry = (g: AssetGroup) => ({ group: g, derived: deriveAsset(g, {}, 0, NOW) });
+
+  it('sums the carded assets and subtracts the account-level interest once', () => {
+    const t = portfolioTotals([entry(book('ETH', 100, 500)), entry(book('BTC', 250, 1500))], 10, NOW);
+    expect(t.carded).toHaveLength(2);
+    expect(t.totalCapitalUsd).toBeCloseTo(2000, 9);
+    expect(t.totalPnlUsd).toBeCloseTo(340, 9); // 100 + 250 − 10
+    // Blended APR: Σpnl over Σ(capital · its own elapsed clock); both books
+    // share the same 30-day clock here.
+    const years = 30 * DAY / SECONDS_IN_YEAR;
+    expect(t.blendedApr).toBeCloseTo(340 / (2000 * years), 9);
+  });
+
+  it('folds dust out of the totals but keeps naming it', () => {
+    const dust = group({ base: 'XRP', perpOpen: [], borosOpen: [], borosHistory: [] });
+    const t = portfolioTotals([entry(book('ETH', 100, 500)), entry(dust)], 0, NOW);
+    expect(t.carded.map((a) => a.group.base)).toEqual(['ETH']);
+    expect(t.dust.map((a) => a.group.base)).toEqual(['XRP']);
+  });
+
+  it('reports the hedge status the strip labels: gaps and a non-neutral book', () => {
+    const gapped = group({
+      perpOpen: [perp({ side: 'LONG', qty: 1000 })],
+      borosOpen: [boros({ side: 'LONG', sizeToken: 600 })],
+    });
+    const t = portfolioTotals([entry(gapped)], 0, NOW);
+    expect(t.gapCount).toBe(1);
+    // One perp leg on its own never cancels: the strip says "perps don't
+    // cancel" beside the gap count, and the message must say the same.
+    expect(t.nonNeutral).toBe(true);
+  });
+
+  it('is empty (and claims no APR) when nothing is carded', () => {
+    const t = portfolioTotals([entry(group({ base: 'XRP' }))], 5, NOW);
+    expect(t.carded).toHaveLength(0);
+    expect(t.totalPnlUsd).toBe(-5);
+    expect(t.blendedApr).toBeNull();
   });
 });
