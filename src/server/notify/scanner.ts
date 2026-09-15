@@ -31,18 +31,26 @@
  */
 import type { OpportunityGroup, OpportunityPair, OpportunitiesResult } from '../../core/boros/opportunities';
 import {
+  deriveAsset,
   fmtNotionalShort,
   fmtPct,
   fmtTokenQty,
   fmtUsd,
-  fixedAprOnCapital,
   marginParts,
+  portfolioTotals,
   toRows,
   venueKey,
-  type MarginParts,
+  type AssetBorosOpen,
+  type AssetDerivedPair,
+  type AssetGroup,
+  type AssetViewOut,
+  type AssetViewResponse,
+  type HedgeGapRow,
+  type WebAccount,
   type WebOpportunitiesResult,
 } from './display';
 import { readFwAlertConfig, sendFwAlert, type FwAlertConfig } from './fwalert';
+import type { PositionsSnapshot } from './positions';
 import { readTelegramConfig, sendTelegramMessage, type TelegramConfig } from './telegram';
 
 export interface NotifyConfig {
@@ -219,16 +227,10 @@ function pairLines(row: RankedPair, notionalUsd: number): string[] {
   return lines;
 }
 
-/** The rollover key of a pair: underlying + both legs' venues, case-normalized.
- * A live Strategy with the SAME key can hand its perp legs straight to this
- * pair at maturity — the zero-perp-fee rollover. */
-function rolloverKey(underlying: string, shortVenue: string, longVenue: string): string {
-  return `${underlying}:${venueKey(shortVenue)}:${venueKey(longVenue)}`;
-}
-
 /** The Telegram summary: Top-N pairs ranked exactly like the web panel, HTML.
- * Pairs whose venue pair + direction match an OPEN strategy get the ♻️ badge:
- * their perp legs are already in place, so this is a zero-perp-fee rollover. */
+ * Pairs whose venue pair + direction match a live, fully hedged bundle on the
+ * account get the ♻️ badge (see rolloverKeysFrom): their perp legs are already
+ * in place, so this is a zero-perp-fee rollover. */
 export function formatTopSummary(
   ranked: RankedPair[],
   opts: {
@@ -273,66 +275,17 @@ export function formatAlertDetails(
   return lines.join('\n');
 }
 
-// ---- positions section (Boros strategies) ----
+// ---- positions section (the web "Funding farm by asset" cards) ----
 
-/** Structural subset of GET /api/strategy/:address — only what the message
- * renders. Built by the scanner's own call to its own API, so the numbers are
- * the web Positions cards' to the digit. */
-export interface StrategyLegLite {
-  kind: string;
-  side: string;
-  venue: string;
-  notionalUsd: number;
-  entryApr?: number;
-}
+/** How many assets get a leg-by-leg block. Telegram caps a message at 4096
+ * chars and the opportunity summary rides above this section; the payload
+ * arrives biggest-footprint-first, so the cut keeps what the operator holds.
+ * The rest are counted in one tail line, never silently dropped. */
+const MAX_POSITION_ASSETS = 3;
+/** Leg lines per asset — the same bound, for the same reason. */
+const MAX_ASSET_LEGS = 6;
 
-export interface StrategySummary {
-  strategies: Array<{
-    strategyId: string;
-    base: string;
-    maturity: number;
-    secondsToMaturity: number;
-    hedge: string;
-    notionalMismatchUsd: number;
-    legs: StrategyLegLite[];
-    capitalUsd: number;
-    capitalSplit: { perpUsd: number; borosUsd: number };
-    realizedPnlUsd: number;
-    spread: number;
-    lockedAprOnCapital: number;
-    expectedPnlToMaturityUsd: number | null;
-    elapsedSeconds: number | null;
-    /** The spread-lock clock's start — the hero Fixed APY annualizes over the
-     * FULL trade life (start → maturity), exactly like StrategyCard. */
-    clockStartSec: number | null;
-    /** The sizing gate. When false the web card HIDES the headline numbers
-     * (a full-life projection on half the notional reads as a great trade);
-     * the message must hide them too. */
-    hedgeChecks: { fullyHedged: boolean };
-  }>;
-  /** Degrade reasons from the strategy route ("Couldn't load Gate positions…").
-   * Rendered verbatim — they say exactly why the numbers below look odd. */
-  warnings?: string[];
-  /** Boros-side margin waterline per collateral zone holding positions:
-   * the venue's own marginRatio (maintMargin / netBalance, computed BY Boros).
-   * The cushion the Boros app labels health is 1 − ratio; 0 is liquidation. */
-  borosZones?: Array<{ tokenId: number; marginRatio: number }>;
-  totals: {
-    capitalUsd: number;
-    realizedPnlUsd: number;
-    expectedPnlToMaturityUsd: number;
-    strategyCount: number;
-  };
-}
-
-/** Structural subset of GET /api/account — the CrossEx margin health the
- * web header strip renders as the IM/MM donuts. */
-export interface MarginLite {
-  marginBalance: number;
-  initialMargin: number;
-  maintenanceMargin: number;
-  availableMargin: number;
-}
+const signedUsd = (n: number): string => (n >= 0 ? `+${usd0(n)}` : usd0(n));
 
 /** Boros platformName → the display name the web cards use. */
 const VENUE_DISPLAY: Record<string, string> = {
@@ -345,96 +298,172 @@ const VENUE_DISPLAY: Record<string, string> = {
 };
 const venueDisplay = (venue: string): string => VENUE_DISPLAY[venue.trim().toUpperCase()] ?? venue;
 
-/** The HedgeChip, as text: the risk marker rides the hero line. Mirrors
- * StrategyCard's HedgeChip order — matured wins, then hedge state. */
-function hedgeMarker(s: StrategySummary['strategies'][number]): string {
-  if (s.maturity > 0 && s.secondsToMaturity === 0) return ' 🕐 matured';
-  if (s.hedge === 'hedged') return '';
-  if (s.hedge === 'partial') return ' ⚠️ partial hedge';
-  return ' ⛔ unhedged';
+/** The rollover key of a pair: underlying + both legs' venues, case-normalized.
+ * A live bundle with the SAME key can hand its perp legs straight to this pair
+ * at maturity — the zero-perp-fee rollover. */
+export function rolloverKey(underlying: string, shortVenue: string, longVenue: string): string {
+  return `${underlying}:${venueKey(shortVenue)}:${venueKey(longVenue)}`;
 }
 
-/** The 💼 section appended under the opportunities. Pure; exported for tests.
+/**
+ * The ♻️ key set read off the asset view.
  *
- * The hero APR is the web card's Fixed APY: expectedPnlToMaturityUsd
- * (already net of every cost the panel's default flags charge) annualized on
- * capital over the FULL trade life, start → maturity — NOT lockedAprOnCapital,
- * which is the spread-based reading and reads higher. */
+ * The old gate was the strategy feed's `hedgeChecks.fullyHedged` — only a
+ * fully hedged book may lend its perp legs (a partial book's floating streams
+ * are already spoken for). The asset view carries no strategy grouping, so the
+ * gate is rebuilt from what it does carry: a (base, maturity) bundle holding
+ * BOTH a Boros SHORT and a LONG leg on an asset whose derived book is
+ * `perfect` (delta-neutral, every venue covered). A one-sided bundle, or one
+ * on an uncovered venue, earns nothing.
+ */
+export function rolloverKeysFrom(view: AssetViewOut): Set<string> {
+  const meta = view as unknown as AssetViewResponse;
+  const keys = new Set<string>();
+  for (const raw of view.assets) {
+    const group = raw as unknown as AssetGroup;
+    const derived = deriveAsset(group, {}, meta.sinceSec ?? 0, meta.nowSec);
+    if (!derived.perfect) continue;
+    const byMaturity = new Map<number, { short?: AssetBorosOpen; long?: AssetBorosOpen }>();
+    for (const leg of group.borosOpen) {
+      const bundle = byMaturity.get(leg.maturity) ?? {};
+      if (leg.side === 'SHORT') bundle.short = leg;
+      else bundle.long = leg;
+      byMaturity.set(leg.maturity, bundle);
+    }
+    for (const bundle of byMaturity.values()) {
+      if (bundle.short && bundle.long) {
+        keys.add(rolloverKey(group.base, bundle.short.venue, bundle.long.venue));
+      }
+    }
+  }
+  return keys;
+}
+
+/** "8.30%" for a leg's rate, "—" when the venue sent none. */
+const rate = (r: number | null | undefined): string =>
+  r === null || r === undefined || !Number.isFinite(r) ? '—' : fmtPct(r);
+
+/** The gap's ask, in the unit the book is judged in — mirrors the card's
+ * gapAsk(): "LONG 0.0012 BTC perp". */
+function gapAsk(gap: HedgeGapRow, base: string): string {
+  const dir = gap.action.startsWith('long') ? 'LONG' : 'SHORT';
+  const what = gap.leg === 'boros' ? 'YU（Boros）' : 'perp';
+  const size = gap.unit === 'base' ? fmtTokenQty(gap.size, base) : usd0(gap.size);
+  return `${dir} ${size} ${what}`;
+}
+
+const maturityWithDays = (maturitySec: number, nowSec: number): string =>
+  `${maturityLabel(maturitySec)} 到期（${Math.max(0, Math.ceil((maturitySec - nowSec) / 86_400))} 天）`;
+
+/**
+ * The 💼 section: the web Positions (asset) cards in message form.
+ *
+ * Upstream 1.6.0 replaced the strategy feed with /api/asset-view — every leg
+ * grouped by its underlying coin, the numbers the venues' own lifetime
+ * records. The section reads that payload and runs the SAME derivation the
+ * cards run (assetModel.deriveAsset + portfolioTotals, through display.ts), so
+ * the message and the panel agree BY CONSTRUCTION instead of by vigilance.
+ *
+ * Two honest differences from the cards, both stated in the header: TG has no
+ * per-asset start date and no exclusion controls (they are per-browser prefs),
+ * so the section prices the whole life, uncut. Pure; exported for tests.
+ */
 export function formatPositionsSection(
-  s: StrategySummary,
-  margin?: MarginLite,
+  view: AssetViewOut,
+  margin?: WebAccount | null,
 ): string {
-  const signedUsd = (n: number): string => (n >= 0 ? `+${usd0(n)}` : usd0(n));
-  if (s.strategies.length === 0) {
-    return '<b>💼 Boros 持仓</b>\n当前无 Boros 持仓';
-  }
+  const meta = view as unknown as AssetViewResponse;
+  const nowSec = meta.nowSec;
+  const all: AssetDerivedPair[] = view.assets.map((raw) => {
+    const group = raw as unknown as AssetGroup;
+    return { group, derived: deriveAsset(group, {}, meta.sinceSec ?? 0, nowSec) };
+  });
+  if (all.length === 0) return '<b>💼 持仓汇总</b>\n当前无持仓';
+  const interestUsd = meta.interest?.available === true ? meta.interest.paidUsd : 0;
+  const totals = portfolioTotals(all, interestUsd, nowSec);
   const lines: string[] = [
-    `<b>💼 Boros 持仓汇总</b>（${s.totals.strategyCount} 个策略）`,
-    `资金 ~${usd0(s.totals.capitalUsd)} ｜ PnL now ${signedUsd(s.totals.realizedPnlUsd)}` +
-      ` ｜ 到期预期 ${signedUsd(s.totals.expectedPnlToMaturityUsd)}`,
+    `<b>💼 持仓汇总</b>（${totals.carded.length} 个资产 · 全周期）`,
   ];
-  for (const w of s.warnings ?? []) {
-    lines.push(`⚠️ ${esc(w)}`);
-  }
-  if (margin && margin.marginBalance > 0) {
-    // The web donut's own math (MarginDonut → marginParts), imported verbatim.
-    const p: MarginParts = marginParts(margin as never);
+  const hedge =
+    totals.gapCount === 0 && !totals.nonNeutral
+      ? '✅ 已完全对冲'
+      : [
+          totals.gapCount > 0 ? `⚠️ ${totals.gapCount} 条腿待补` : '',
+          totals.nonNeutral ? '⛔ perp 未中性' : '',
+        ]
+          .filter(Boolean)
+          .join(' ');
+  lines.push(
+    `总 PnL ${signedUsd(totals.totalPnlUsd)}` +
+      (totals.blendedApr === null ? '' : `（已实现 APR ≈ ${fmtPct(totals.blendedApr)}）`) +
+      ` ｜ 资金 ~${usd0(totals.totalCapitalUsd)} ｜ 对冲 ${hedge}`,
+  );
+  // The payload's degradation reasons, verbatim — they say exactly why the
+  // numbers below look odd (the cards print the same sentences).
+  for (const w of (meta.warnings ?? []).slice(0, 3)) lines.push(`⚠️ ${esc(w)}`);
+  // The CrossEx waterline: the same donut math the header strip uses.
+  const m = margin ? marginParts(margin) : null;
+  if (m?.hasFunds) {
     lines.push(
-      `保证金 IM ${fmtPct(p.imPct, 0)} ｜ MM ${fmtPct(p.mmPct, 0)}` +
-        `（可用 ${usd0(p.available)} / 余额 ${usd0(p.balance)} · 维持 ${usd0(p.maintenance)}）`,
+      `保证金 IM ${fmtPct(m.imPct, 0)} ｜ MM ${fmtPct(m.mmPct, 0)}` +
+        `（可用 ${usd0(m.available)} / 余额 ${usd0(m.balance)} · 维持 ${usd0(m.maintenance)}）`,
     );
   }
-  // The OTHER liquidation domain: the Boros collateral zone(s) actually holding
-  // positions. marginRatio is Boros's own number (maintMargin / netBalance) —
-  // its complement is the cushion the Boros app labels health, 0 = liquidation
-  // line. Higher is safer; shown next to the CrossEx line so both waterlines
-  // read side by side instead of one hiding the other.
-  for (const z of s.borosZones ?? []) {
-    lines.push(`Boros 缓冲 ${fmtPct(1 - z.marginRatio, 0)}（保证金率 ${fmtPct(z.marginRatio, 0)}）`);
-  }
-  s.strategies.forEach((st, i) => {
-    const days = Math.max(1, Math.round(st.secondsToMaturity / 86_400));
-    const boros = st.legs.filter((l) => l.kind === 'boros');
-    const short = boros.find((l) => l.side === 'SHORT');
-    const long = boros.find((l) => l.side === 'LONG');
-    // THE SIZING GATE, mirroring StrategyCard: until the position is fully
-    // hedged the headline numbers (Fixed APY / PnL at maturity / Capital) are
-    // confidently wrong — a full-life projection on half the notional reads as
-    // a great trade — so the web card hides them and shows the hedge cue
-    // instead. PnL now stays: real cash + MtM whatever the book's shape.
-    const fullyHedged = st.hedgeChecks?.fullyHedged ?? false;
-    const fixedApr = fullyHedged
-      ? fixedAprOnCapital(st.expectedPnlToMaturityUsd, st.capitalUsd, st.clockStartSec, st.maturity)
-      : null;
+
+  const live = totals.carded.filter((a) => a.group.perpOpen.length > 0 || a.group.borosOpen.length > 0);
+  const history = totals.carded.filter((a) => !live.includes(a));
+  live.slice(0, MAX_POSITION_ASSETS).forEach((a, i) => {
+    const d = a.derived;
+    const marker =
+      d.gaps.length > 0 ? ` ⚠️ ${d.gaps.length} 条腿待补` : !d.deltaNeutral ? ' ⛔ perp 未中性' : ' ✅';
     lines.push(
       '',
-      `${i + 1}. ${esc(st.base)} · ${maturityLabel(st.maturity)} 到期（${days} 天）${hedgeMarker(st)}`,
-      `   ${
-        fixedApr === null
-          ? `⚪ Fixed APY —（${fullyHedged ? '时钟或资金未知' : '对冲不完整，数字已隐藏'}）`
-          : `${fixedApr >= 0 ? '🟢' : '🔴'} Fixed APY ${fmtPct(fixedApr)}`
-      }`,
+      `${i + 1}. ${esc(a.group.base)}` +
+        (a.group.priceUsd > 0 ? ` · ${fmtUsd(a.group.priceUsd, 0)}` : '') +
+        marker,
+      `   总 PnL ${signedUsd(d.totals.pnlUsd)}` +
+        (d.roi === null ? '' : `（ROI ${fmtPct(d.roi)}）`) +
+        ` ｜ Fixed APR ${d.lockedAprFwd === null ? '—' : fmtPct(d.lockedAprFwd)}` +
+        (d.clockStartSec === null ? '' : ` ｜ 已运行 ${((nowSec - d.clockStartSec) / 86_400).toFixed(1)} 天`),
+      `   资金 ~${usd0(d.totals.capitalUsd)}` +
+        (d.totals.mtmUsd === 0 ? '' : ` ｜ MTM ${signedUsd(d.totals.mtmUsd)}`),
     );
-    if (short && long && short.entryApr !== undefined && long.entryApr !== undefined) {
-      lines.push(
-        `   SHORT · ${esc(venueDisplay(short.venue))} ${(short.entryApr * 100).toFixed(2)}%` +
-          ` ｜ LONG · ${esc(venueDisplay(long.venue))} ${(long.entryApr * 100).toFixed(2)}%`,
-        `   锁定价差 ${(st.spread * 100).toFixed(2)}% ｜ 名义 ~${usd0(short.notionalUsd)}/腿`,
+    const legs: string[] = [];
+    for (const l of a.group.borosOpen) {
+      legs.push(
+        `Boros ${l.side} · ${esc(venueDisplay(l.venue))} ${rate(l.entryApr)}` +
+          ` ｜ 名义 ~${usd0(l.notionalUsd)} ｜ ${maturityWithDays(l.maturity, nowSec)}`,
       );
     }
-    if (fullyHedged) {
-      lines.push(
-        `   资金 ~${usd0(st.capitalUsd)}（perp ${usd0(st.capitalSplit.perpUsd)} + Boros ${usd0(st.capitalSplit.borosUsd)}）`,
+    for (const p of a.group.perpOpen) {
+      legs.push(
+        `perp ${p.side} · ${esc(venueDisplay(p.venue))} ~${usd0(p.notionalUsd)}` +
+          ` ｜ uPnL ${signedUsd(p.upnlUsd)} ｜ 资金 ${usd0(p.imUsd)}`,
       );
     }
-    lines.push(
-      `   PnL now ${signedUsd(st.realizedPnlUsd)}` +
-        (fullyHedged && st.expectedPnlToMaturityUsd !== null
-          ? ` ｜ 到期预期 ${signedUsd(st.expectedPnlToMaturityUsd)}`
-          : '') +
-        (st.elapsedSeconds === null ? '' : ` ｜ 已运行 ${(st.elapsedSeconds / 86_400).toFixed(1)} 天`),
-    );
+    for (const leg of legs.slice(0, MAX_ASSET_LEGS)) lines.push(`   ${leg}`);
+    if (legs.length > MAX_ASSET_LEGS) lines.push(`   …还有 ${legs.length - MAX_ASSET_LEGS} 条腿`);
+    for (const g of d.gaps.slice(0, 2)) {
+      lines.push(`   ⚠️ ${esc(venueDisplay(g.venue))}：加 ${gapAsk(g, a.group.base)}`);
+    }
+    if (d.gaps.length > 2) lines.push(`   ⚠️ 还有 ${d.gaps.length - 2} 处缺口`);
   });
+
+  // What the message did not expand, named rather than dropped. The dust fold
+  // is the panel's own (under $1 of history and nothing open): it is NOT in the
+  // total, and the line says so.
+  const rest = [
+    live.length > MAX_POSITION_ASSETS
+      ? `另有 ${live.length - MAX_POSITION_ASSETS} 个资产有持仓未展开（已计入总 PnL）`
+      : '',
+    history.length > 0
+      ? `${history.map((a) => esc(a.group.base)).join('、')} 仅有历史（已计入总 PnL）`
+      : '',
+    totals.dust.length > 0
+      ? `另有 ${totals.dust.length} 个资产无持仓、历史 < $1（未计入）`
+      : '',
+  ].filter(Boolean);
+  if (rest.length > 0) lines.push('', `（${rest.join(' ｜ ')}）`);
   return lines.join('\n');
 }
 
@@ -444,13 +473,10 @@ export interface ScannerDeps {
   config: NotifyConfig;
   /** One full scan — the same pipeline /api/opportunities serves. */
   scan: () => Promise<OpportunitiesResult>;
-  /** The operator's Boros strategies — the same pipeline /api/strategy serves
-   * (wired in server/index.ts as a self-call with the install's API token).
-   * Absent (no BOROS_ROOT_ADDRESS) → the 💼 section is omitted entirely. */
-  scanStrategy?: () => Promise<{
-    strategy: StrategySummary;
-    margin?: MarginLite | null;
-  } | null>;
+  /** The operator's positions — the same /api/asset-view payload the web cards
+   * render (wired in server/index.ts as a self-call with the install's API
+   * token). Absent (no BOROS_ROOT_ADDRESS) → the 💼 section is omitted. */
+  scanPositions?: () => Promise<PositionsSnapshot | null>;
   /** Overridable senders (tests); default to the real channels. */
   sendTelegram?: (text: string) => Promise<boolean>;
   sendWebhook?: (details: string, coin: string) => Promise<boolean>;
@@ -524,27 +550,12 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
       // The positions read comes FIRST: its fully-hedged strategies decide
       // which pairs earn the ♻️ rollover badge. Its own failure costs only
       // the section + the badges — the opportunities part still goes.
-      let positions: Awaited<ReturnType<NonNullable<ScannerDeps['scanStrategy']>>> | null = null;
-      let rolloverKeys: ReadonlySet<string> | undefined;
-      if (deps.scanStrategy) {
+      let positions: PositionsSnapshot | null = null;
+      let rollover: ReadonlySet<string> | undefined;
+      if (deps.scanPositions) {
         try {
-          positions = await deps.scanStrategy();
-          if (positions) {
-            rolloverKeys = new Set(
-              positions.strategy.strategies
-                // Only FULLY hedged strategies may lend their perp legs: a
-                // partial book's floating streams are already spoken for.
-                .filter((st) => st.hedgeChecks?.fullyHedged)
-                .map((st) => {
-                  const short = st.legs.find((l) => l.kind === 'boros' && l.side === 'SHORT');
-                  const long = st.legs.find((l) => l.kind === 'boros' && l.side === 'LONG');
-                  return short && long
-                    ? rolloverKey(st.base, short.venue, long.venue)
-                    : null;
-                })
-                .filter((k): k is string => k !== null),
-            );
-          }
+          positions = await deps.scanPositions();
+          if (positions) rollover = rolloverKeysFrom(positions.view);
         } catch (err) {
           error('[notify] positions summary failed — section skipped', err);
         }
@@ -554,10 +565,10 @@ export async function scanPass(deps: ScannerDeps, alerted: Set<string>): Promise
         now,
         totalGroups: result.groups.length,
         viable: countViable(result),
-        rolloverKeys,
+        rolloverKeys: rollover,
       });
       if (positions) {
-        text += `\n\n──────────────\n\n${formatPositionsSection(positions.strategy, positions.margin ?? undefined)}`;
+        text += `\n\n──────────────\n\n${formatPositionsSection(positions.view, positions.margin)}`;
       }
       const ok = await (deps.sendTelegram ?? ((t) => sendTelegramMessage(config.telegram!, t)))(text);
       if (!ok) error('[notify] telegram send failed');

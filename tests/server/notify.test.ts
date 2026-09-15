@@ -25,11 +25,13 @@ import {
   pairKey,
   rankPairs,
   readNotifyConfig,
+  rolloverKey,
+  rolloverKeysFrom,
   scanPass,
   startOpportunityScanner,
-  type MarginLite,
-  type StrategySummary,
 } from '../../src/server/notify/scanner';
+import type { PositionsSnapshot } from '../../src/server/notify/positions';
+import type { AssetGroup, AssetViewResponse, CrossexAccount } from '../../web/src/api/types';
 import { readTelegramConfig } from '../../src/server/notify/telegram';
 
 function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
@@ -351,118 +353,228 @@ describe('formatAlertDetails', () => {
 
 // ---- positions section ----
 
-function makeStrategy(over: Partial<StrategySummary['strategies'][number]> = {}): StrategySummary {
+const NOW_SEC = 1_790_000_000;
+const DAY_SEC = 86_400;
+
+/**
+ * One ETH book, hand-derived: Boros SHORT Hyperliquid 10% / LONG Gate 4% on
+ * $20k a leg (settle fee 0.1% APR, both legs 30 days out), hedged by a matching
+ * perp pair, 120/−20 of settled history, capital $2,400, 180 days of clock.
+ *
+ * The expectations below are HAND-DERIVED from these numbers on purpose —
+ * do not compute them with the model under test.
+ */
+function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
+  const maturity = NOW_SEC + 30 * DAY_SEC;
   return {
-    strategies: [
+    base: 'ETH',
+    priceUsd: 2000,
+    earliestSec: NOW_SEC - 180 * DAY_SEC,
+    perpOpen: [
       {
-        strategyId: 'BTC@123',
-        base: 'BTC',
-        maturity: 1793318400,
-        secondsToMaturity: 63 * 86_400,
-        hedge: 'hedged',
-        notionalMismatchUsd: 0,
-        legs: [
-          { kind: 'boros', side: 'SHORT', venue: 'HYPERLIQUID', notionalUsd: 31_833, entryApr: 0.0848 },
-          { kind: 'boros', side: 'LONG', venue: 'OKX', notionalUsd: 31_833, entryApr: 0.0582 },
-        ],
-        capitalUsd: 2708.28,
-        capitalSplit: { perpUsd: 2117.11, borosUsd: 591.17 },
-        realizedPnlUsd: -23.34,
-        spread: 0.0266,
-        lockedAprOnCapital: 0.3123,
-        expectedPnlToMaturityUsd: 109.39,
-        elapsedSeconds: 2 * 86_400,
-        clockStartSec: 1793318400 - 65 * 86_400,
-        hedgeChecks: { fullyHedged: true },
-        ...over,
+        symbol: 'HYPERLIQUID_FUTURE_ETH_USDC',
+        venue: 'HYPERLIQUID',
+        side: 'SHORT',
+        qty: 10,
+        notionalUsd: 20_000,
+        entryPrice: 2000,
+        markPrice: 2000,
+        leverage: 25,
+        upnlUsd: 100,
+        fundingUsd: 40,
+        feesUsd: 10,
+        imUsd: 800,
+        openedAt: NOW_SEC - 180 * DAY_SEC,
+      },
+      {
+        symbol: 'GATE_FUTURE_ETH_USDT',
+        venue: 'GATE',
+        side: 'LONG',
+        qty: 10,
+        notionalUsd: 20_000,
+        entryPrice: 2000,
+        markPrice: 2000,
+        leverage: 25,
+        upnlUsd: -90,
+        fundingUsd: 30,
+        feesUsd: 10,
+        imUsd: 900,
+        openedAt: NOW_SEC - 180 * DAY_SEC,
       },
     ],
-    totals: {
-      capitalUsd: 2708.28,
-      realizedPnlUsd: -23.34,
-      expectedPnlToMaturityUsd: 109.39,
-      strategyCount: 1,
-    },
+    perpClosed: [],
+    borosOpen: [
+      {
+        marketId: 201,
+        venue: 'HYPERLIQUID',
+        maturity,
+        collateral: 'USDT',
+        side: 'SHORT',
+        sizeToken: 10,
+        notionalUsd: 20_000,
+        entryApr: 0.1,
+        markApr: 0.095,
+        floatingApr: 0.09,
+        settleUsd: 120,
+        mtmUsd: 50,
+        imUsd: 400,
+        settleFeeApr: 0.001,
+      },
+      {
+        marketId: 205,
+        venue: 'GATE',
+        maturity,
+        collateral: 'USDT',
+        side: 'LONG',
+        sizeToken: 10,
+        notionalUsd: 20_000,
+        entryApr: 0.04,
+        markApr: 0.041,
+        floatingApr: 0.09,
+        settleUsd: -20,
+        mtmUsd: -20,
+        imUsd: 300,
+        settleFeeApr: 0.001,
+      },
+    ],
+    borosHistory: [
+      {
+        marketId: 201,
+        venue: 'HYPERLIQUID',
+        maturity,
+        settleUsd: 120,
+        settleFeeUsd: 12,
+        tradePnlUsd: 0,
+        tradeFeeUsd: 0,
+        firstEventSec: NOW_SEC - 180 * DAY_SEC,
+        entryApr: 0.1,
+        side: 'SHORT',
+      },
+      {
+        marketId: 205,
+        venue: 'GATE',
+        maturity,
+        settleUsd: -20,
+        settleFeeUsd: 2,
+        tradePnlUsd: 0,
+        tradeFeeUsd: 0,
+        firstEventSec: NOW_SEC - 180 * DAY_SEC,
+        entryApr: 0.04,
+        side: 'LONG',
+      },
+    ],
+    ...over,
+  };
+}
+
+function makeAssetView(groups: AssetGroup[], over: Partial<AssetViewResponse> = {}): AssetViewResponse {
+  return {
+    sinceSec: 0,
+    nowSec: NOW_SEC,
+    assets: groups,
+    earliestSec: NOW_SEC - 180 * DAY_SEC,
+    coverage: { settlementsFromSec: 0, perpClosedFromSec: 0, borosTxnsComplete: true },
+    interest: { paidUsd: 0, byCoin: {}, coversFromSec: 0, available: true },
     warnings: [],
-    borosZones: [{ tokenId: 1, marginRatio: 0.5873 }],
+    ...over,
   };
 }
 
 describe('formatPositionsSection', () => {
-  it('renders the card fields: locked APR, entry legs, split, both PnLs, totals', () => {
-    const text = formatPositionsSection(makeStrategy());
-    expect(text).toContain('<b>💼 Boros 持仓汇总</b>（1 个策略）');
-    expect(text).toContain('资金 ~$2,708');
-    // Hero = StrategyCard's Fixed APY: 109.39 / (2708.28 × 65d/365d)
-    expect(text).toContain('Fixed APY 22.68%');
-    expect(text).not.toContain('31.23%'); // the spread-basis reading must NOT be the hero
-    expect(text).toContain('SHORT · Hyperliquid 8.48% ｜ LONG · OKX 5.82%');
-    expect(text).toContain('锁定价差 2.66% ｜ 名义 ~$31,833/腿');
-    expect(text).toContain('perp $2,117 + Boros $591');
-    expect(text).toContain('PnL now -$23 ｜ 到期预期 +$109');
-    expect(text).not.toContain('⛔'); // hedged → no marker
+  it('renders the panel strip and each asset card, from the panel derivation', () => {
+    const text = formatPositionsSection(makeAssetView([makeAssetGroup()]) as never);
+    expect(text).toContain('<b>💼 持仓汇总</b>（1 个资产 · 全周期）');
+    // portfolioTotals: Σ card PnL = perp (100 + 40 − 10) + (−90 + 30 − 10)
+    // + Boros history (120 − 20) = 160; capital = perp 1,700 + Boros 700.
+    expect(text).toContain('总 PnL +$160（已实现 APR ≈ 13.52%） ｜ 资金 ~$2,400 ｜ 对冲 ✅ 已完全对冲');
+    expect(text).toContain('1. ETH · $2,000 ✅');
+    expect(text).toContain('总 PnL +$160（ROI 6.67%） ｜ Fixed APR 48.33% ｜ 已运行 180.0 天');
+    expect(text).toContain('资金 ~$2,400 ｜ MTM +$30');
+    expect(text).toContain('Boros SHORT · Hyperliquid 10.00% ｜ 名义 ~$20,000 ｜');
+    expect(text).toMatch(/\d{4}-\d{2}-\d{2} 到期（30 天）/);
+    expect(text).toContain('Boros LONG · Gate 4.00% ｜ 名义 ~$20,000');
+    expect(text).toContain('perp SHORT · Hyperliquid ~$20,000 ｜ uPnL +$100 ｜ 资金 $800');
+    expect(text).toContain('perp LONG · Gate ~$20,000 ｜ uPnL -$90 ｜ 资金 $900');
   });
 
-  it('marks the risk state the way the web HedgeChip does', () => {
-    expect(formatPositionsSection(makeStrategy({ hedge: 'unhedged' }))).toContain('⛔ unhedged');
-    expect(formatPositionsSection(makeStrategy({ hedge: 'partial' }))).toContain('⚠️ partial hedge');
-    expect(
-      formatPositionsSection(makeStrategy({ secondsToMaturity: 0, hedge: 'hedged' })),
-    ).toContain('🕐 matured');
+  it('marks a half-hedged book and withholds the locked APR, exactly like the card', () => {
+    // 5 of the 10 ETH perp leg on Gate: a 5 ETH deficit → no deterministic
+    // carry, so `Fixed APR —` (the card gates on the same flag).
+    const group = makeAssetGroup();
+    group.perpOpen = [group.perpOpen[0], { ...group.perpOpen[1], qty: 5, notionalUsd: 10_000 }];
+    const text = formatPositionsSection(makeAssetView([group]) as never);
+    expect(text).toContain('对冲 ⚠️ 1 条腿待补');
+    expect(text).toContain('1. ETH · $2,000 ⚠️ 1 条腿待补');
+    expect(text).toContain('Fixed APR —');
+    expect(text).toContain('⚠️ Gate：加 LONG 5 ETH perp');
   });
 
-  it('renders the CrossEx margin health line (IM/MM of balance)', () => {
-    const margin: MarginLite = {
-      marginBalance: 3431.77,
-      initialMargin: 2185.49,
-      maintenanceMargin: 877.83,
-      availableMargin: 1246.28,
-    };
-    const text = formatPositionsSection(makeStrategy(), margin);
+  it('renders the CrossEx margin line through the shared donut math', () => {
+    const account = {
+      marginBalance: '3431.77',
+      initialMargin: '2185.49',
+      maintenanceMargin: '877.83',
+      availableMargin: '1246.28',
+    } as unknown as CrossexAccount;
+    const text = formatPositionsSection(makeAssetView([makeAssetGroup()]) as never, account);
     expect(text).toContain('IM 64% ｜ MM 26%');
     expect(text).toContain('可用 $1,246 / 余额 $3,432 · 维持 $878'); // available derived: balance − initial
   });
 
-  it('gates the headline numbers when the strategy is NOT fully hedged — the web card hides them, so must the message', () => {
-    // The live symptom: a transient Gate failure degraded the payload to
-    // Boros-only (capital collapsed to $590, perp legs gone) and the message
-    // cheerfully rendered "Fixed APY 126.92%" — a full-life projection on a
-    // broken capital base. The web card hides Fixed APY / PnL at maturity /
-    // Capital until fullyHedged; the message must do the same and carry the
-    // payload's warning verbatim.
-    const degraded = makeStrategy({
-      hedge: 'partial',
-      hedgeChecks: { fullyHedged: false },
-      capitalUsd: 590,
-      capitalSplit: { perpUsd: 0, borosUsd: 590 },
-      legs: [{ kind: 'boros', side: 'SHORT', venue: 'HYPERLIQUID', notionalUsd: 31_758, entryApr: 0.0848 },
-             { kind: 'boros', side: 'LONG', venue: 'OKX', notionalUsd: 31_758, entryApr: 0.0582 }],
+  it('carries the payload warnings verbatim — they say why the numbers look odd', () => {
+    const view = makeAssetView([makeAssetGroup()], {
+      warnings: [
+        "Couldn't load Gate positions right now (network) — showing the Boros side only.",
+      ],
     });
-    degraded.warnings = [
-      "Couldn't load Gate positions right now (network) — showing the Boros legs only; the perp overlay will return on the next refresh.",
-    ];
-    // The totals row is the server's aggregate — degraded too in the real
-    // payload — so make the fixture honest about it.
-    degraded.totals = {
-      capitalUsd: 590,
-      realizedPnlUsd: -10,
-      expectedPnlToMaturityUsd: 132,
-      strategyCount: 1,
-    };
-    const text = formatPositionsSection(degraded);
-    expect(text).toContain('⚠️ partial hedge');
-    expect(text).not.toMatch(/Fixed APY \d/); // no number on the hero
-    expect(text).toContain('对冲不完整');
-    expect(text).toContain('PnL now -$23 ｜ 已运行'); // PnL now STAYS; 到期预期 (gated) is gone
-    expect(text).not.toContain('（perp $0 + Boros $590）'); // the gated Capital line
-    expect(text).toContain("Couldn't load Gate positions"); // the why, verbatim
+    expect(formatPositionsSection(view as never)).toContain("Couldn't load Gate positions");
   });
 
-  it('says so explicitly when nothing is open', () => {
-    const empty = makeStrategy();
-    empty.strategies = [];
-    empty.totals.strategyCount = 0;
-    expect(formatPositionsSection(empty)).toContain('当前无 Boros 持仓');
+  it('charges borrow interest once, on the total — no card can carry it', () => {
+    const view = makeAssetView([makeAssetGroup()], {
+      interest: { paidUsd: 10, byCoin: { USDT: 10 }, coversFromSec: 0, available: true },
+    });
+    const text = formatPositionsSection(view as never);
+    expect(text).toContain('总 PnL +$150'); // 160 − 10
+    expect(text).toContain('1. ETH'); // the card itself is untouched
+    expect(text).toContain('总 PnL +$160（ROI 6.67%');
+  });
+
+  it('names what it did not expand instead of dropping it silently', () => {
+    const view = makeAssetView([
+      makeAssetGroup(),
+      makeAssetGroup({ base: 'BTC' }),
+      makeAssetGroup({ base: 'SOL' }),
+      makeAssetGroup({ base: 'DOGE' }),
+      makeAssetGroup({ base: 'XRP', perpOpen: [], borosOpen: [] }),
+    ]);
+    const text = formatPositionsSection(view as never);
+    expect(text).toContain('另有 1 个资产有持仓未展开（已计入总 PnL）');
+    expect(text).toContain('XRP 仅有历史（已计入总 PnL）');
+    expect(text).not.toContain('4. DOGE'); // the cut keeps the biggest footprint
+  });
+
+  it('says so explicitly when the account holds nothing at all', () => {
+    const view = makeAssetView([]);
+    view.assets = [];
+    expect(formatPositionsSection(view as never)).toContain('当前无持仓');
+  });
+});
+
+describe('rolloverKeysFrom', () => {
+  it('emits the venue pair of a fully hedged bundle (the zero-perp-fee rollover)', () => {
+    const keys = rolloverKeysFrom(makeAssetView([makeAssetGroup()]) as never);
+    expect([...keys]).toEqual([rolloverKey('ETH', 'HYPERLIQUID', 'GATE')]);
+  });
+
+  it('emits nothing for a one-sided or unwound book', () => {
+    const oneSided = makeAssetGroup();
+    oneSided.borosOpen = [oneSided.borosOpen[0]];
+    expect(rolloverKeysFrom(makeAssetView([oneSided]) as never).size).toBe(0);
+
+    const unwound = makeAssetGroup();
+    unwound.perpOpen = [];
+    expect(rolloverKeysFrom(makeAssetView([unwound]) as never).size).toBe(0);
   });
 });
 
@@ -541,13 +653,14 @@ describe('scanPass', () => {
     expect(sendTelegram).not.toHaveBeenCalled();
   });
 
-  it('appends the positions section to the SAME message when scanStrategy is wired', async () => {
+  it('appends the positions section to the SAME message when scanPositions is wired', async () => {
     const sendTelegram = vi.fn().mockResolvedValue(true);
+    const snapshot = { view: makeAssetView([makeAssetGroup()]), margin: null } as unknown as PositionsSnapshot;
     await scanPass(
       {
         config: config({ webhook: null }),
         scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
-        scanStrategy: vi.fn().mockResolvedValue({ strategy: makeStrategy(), margin: null }),
+        scanPositions: vi.fn().mockResolvedValue(snapshot),
         sendTelegram,
       },
       new Set(),
@@ -555,7 +668,30 @@ describe('scanPass', () => {
     const text = sendTelegram.mock.calls[0][0] as string;
     expect(text).toContain('🎯');
     expect(text).toContain('──────────────');
-    expect(text).toContain('💼 Boros 持仓汇总');
+    expect(text).toContain('💼 持仓汇总');
+  });
+
+  it('badges the pairs whose venue pair a live bundle already holds', async () => {
+    const sendTelegram = vi.fn().mockResolvedValue(true);
+    const group = makeAssetGroup();
+    // The opportunity the badge rides on: same coin, same two venues.
+    const opp = makeGroup([0.35], { underlying: 'ETH' });
+    opp.pairs[0] = {
+      ...opp.pairs[0],
+      shortLeg: { ...opp.pairs[0].shortLeg, venue: 'HYPERLIQUID' },
+      longLeg: { ...opp.pairs[0].longLeg, venue: 'GATE' },
+    };
+    const snapshot = { view: makeAssetView([group]), margin: null } as unknown as PositionsSnapshot;
+    await scanPass(
+      {
+        config: config({ webhook: null }),
+        scan: vi.fn().mockResolvedValue(makeResult([opp])),
+        scanPositions: vi.fn().mockResolvedValue(snapshot),
+        sendTelegram,
+      },
+      new Set(),
+    );
+    expect(sendTelegram.mock.calls[0][0] as string).toContain('♻️ 可续期');
   });
 
   it('a failed positions read costs only the section — the opportunities still go', async () => {
@@ -564,7 +700,7 @@ describe('scanPass', () => {
       {
         config: config({ webhook: null }),
         scan: vi.fn().mockResolvedValue(makeResult([makeGroup([0.35])])),
-        scanStrategy: vi.fn().mockRejectedValue(new Error('strategy route down')),
+        scanPositions: vi.fn().mockRejectedValue(new Error('asset view down')),
         sendTelegram,
         error: vi.fn(),
       },

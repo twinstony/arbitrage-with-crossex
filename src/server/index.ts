@@ -8,7 +8,7 @@ import 'dotenv/config';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Agent, EnvHttpProxyAgent, request, setGlobalDispatcher } from 'undici';
+import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
 import fastifyStatic from '@fastify/static';
 import { fetchBorosMarkets, resolveBorosFetch, setClientTagContext } from '../core/boros/client';
 import { makeClientsIfConfigured, requireClients, type Clients } from '../core/clients';
@@ -23,6 +23,7 @@ import type { BorosOrderClient } from '../core/boros/orders';
 import { TtlCache, TTL } from './cache';
 import { readOrCreateApiToken } from './authToken';
 import { panelExitMode, readNotifyConfig, startOpportunityScanner } from './notify/scanner';
+import { makePositionsReader } from './notify/positions';
 import { scanOpportunities } from './routes/opportunities';
 import { InterestFile } from './interestLedger';
 import { JobFile } from './rebalanceJob';
@@ -238,40 +239,20 @@ app
     // channel — the feature costs nothing unless it is switched on.
     const notifyConfig = readNotifyConfig();
     if (notifyConfig) {
-      // The 💼 positions section re-reads the operator's strategies through the
-      // SAME endpoint the web Positions cards use — a self-call with the
-      // install's API token, addressed to the bound host (never loopback: HOST
-      // may have moved the bind off it). A DIRECT dispatcher: this call must
-      // not ride the outbound proxy that Boros needs.
+      // The 💼 positions section reads the SAME payload the web Positions
+      // cards render (/api/asset-view/:address) through a self-call carrying
+      // the install's API token, addressed to the bound host (never loopback:
+      // HOST may have moved the bind off it). A DIRECT dispatcher: this call
+      // must not ride the outbound proxy the Boros reads need. Absent
+      // (no BOROS_ROOT_ADDRESS) → the section is omitted entirely.
       const positionsAddress = process.env.BOROS_ROOT_ADDRESS?.trim();
-      const scanStrategy =
+      const scanPositions =
         positionsAddress && /^0x[0-9a-fA-F]{40}$/.test(positionsAddress) && appDeps.authToken
-          ? async (): Promise<{
-              strategy: import('./notify/scanner').StrategySummary;
-              margin?: import('./notify/scanner').MarginLite | null;
-            } | null> => {
-              // A DIRECT dispatcher: these self-calls must not ride the
-              // outbound proxy that Boros needs.
-              const dispatcher = new Agent();
-              const call = <T,>(path: string): Promise<T> =>
-                request(`http://${host}:${port}${path}`, {
-                  headers: { 'x-arb-token': appDeps.authToken! },
-                  dispatcher,
-                  signal: AbortSignal.timeout(30_000),
-                }).then(async (res) => {
-                  if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
-                  return ((await res.body.json()) as { data?: T }).data as T;
-                });
-              // Margin is cosmetic next to the strategies: its own failure
-              // drops only the health line, never the section.
-              const [strategy, margin] = await Promise.all([
-                call<import('./notify/scanner').StrategySummary>(
-                  `/api/strategy/${positionsAddress.toLowerCase()}`,
-                ),
-                call<import('./notify/scanner').MarginLite>('/api/account').catch(() => null),
-              ]);
-              return strategy ? { strategy, margin } : null;
-            }
+          ? makePositionsReader({
+              baseUrl: `http://${host}:${port}`,
+              address: positionsAddress,
+              token: appDeps.authToken,
+            })
           : undefined;
       startOpportunityScanner({
         config: notifyConfig,
@@ -288,7 +269,7 @@ app
               fresh: false,
             })
           ).result,
-        scanStrategy,
+        scanPositions,
       });
       console.log(
         `opportunity notifications enabled: Telegram ${notifyConfig.telegram ? 'on' : 'off'}, ` +

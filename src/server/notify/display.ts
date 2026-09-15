@@ -13,7 +13,16 @@
  * route response is literally the object both sides read.
  */
 export { toRows, maturityDays, venueKey, type OpportunityRow } from '../../../web/src/panels/opportunityFilters';
-export { fixedAprOnCapital, SECONDS_IN_YEAR } from '../math';
+// The asset view's derivation and its totals strip: the 💼 positions section
+// runs the SAME functions the web cards do, so the message's numbers are the
+// panel's by construction (never re-derived by hand).
+export {
+  deriveAsset,
+  portfolioTotals,
+  type AssetDerived,
+  type AssetDerivedPair,
+  type HedgeGapRow,
+} from '../../../web/src/panels/assets/assetModel';
 export { fmtUsd, fmtNotionalShort, fmtTokenQty, fmtPct } from '../../../web/src/lib/fmt';
 export { marginParts, type MarginParts } from '../../../web/src/lib/margin';
 export type {
@@ -21,4 +30,8 @@ export type {
   OpportunityPair as WebPair,
   OpportunitiesResult as WebOpportunitiesResult,
   CrossexAccount as WebAccount,
+  AssetBorosOpen,
+  AssetGroup,
+  AssetViewResponse,
 } from '../../../web/src/api/types';
+export type { AssetViewOut } from '../routes/assetView';
