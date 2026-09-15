@@ -9,6 +9,7 @@ import {
   fetchBorosMarkets,
   fetchBorosOrderBook,
   fetchBorosTransactions,
+  fetchSettlementEvents,
   resolveCollateralPricesUsd,
   setClientTagContext,
   type FetchLike,
@@ -150,6 +151,105 @@ describe('fetchBorosMarkets', () => {
       name: 'CoreError',
       category: 'network',
     });
+  });
+});
+
+/**
+ * The transient-failure retry (issue #1, root cause 2).
+ *
+ * MEASURED on the live path 2026-09-15: ~25% of COLD connections to
+ * api.boros.finance died in the TLS handshake, and ONE such reset failed the
+ * whole read — the scanner went silent and the asset view answered 502 (10 of
+ * 12 fresh probes) on a healthy venue. These cases pin the ladder: exactly one
+ * retry, for failures where no verdict arrived, and never for a 429 (whose
+ * cooldown/stale-serving would be defeated) or another 4xx.
+ */
+describe('transient-failure retry', () => {
+  const bodies = { results: [{ marketId: 155, tokenId: 3 }] };
+
+  it('retries a transport failure once and succeeds — the reset that used to kill the read', async () => {
+    let calls = 0;
+    const markets = await fetchBorosMarkets(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('fetch failed');
+      return { ok: true, status: 200, json: async () => bodies };
+    });
+    expect(calls).toBe(2);
+    expect(markets).toHaveLength(1);
+  });
+
+  it('does not retry a SUCCESSFUL read (one call, always)', async () => {
+    let calls = 0;
+    await fetchBorosMarkets(async () => {
+      calls += 1;
+      return { ok: true, status: 200, json: async () => bodies };
+    });
+    expect(calls).toBe(1);
+  });
+
+  it('retries a 5xx and a truncated (non-JSON) 200 once', async () => {
+    let five = 0;
+    await fetchBorosMarkets(async () => {
+      five += 1;
+      return five === 1
+        ? { ok: false, status: 503, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => bodies };
+    });
+    expect(five).toBe(2);
+
+    let junk = 0;
+    await fetchBorosMarkets(async () => {
+      junk += 1;
+      return junk === 1
+        ? { ok: true, status: 200, json: async () => { throw new Error('Unexpected end of JSON input'); } }
+        : { ok: true, status: 200, json: async () => bodies };
+    });
+    expect(junk).toBe(2);
+  });
+
+  it('gives up after the single retry — the error the operator sees is unchanged', async () => {
+    let calls = 0;
+    await expect(
+      fetchBorosMarkets(async () => {
+        calls += 1;
+        throw new Error('Client network socket disconnected before secure TLS connection was established');
+      }),
+    ).rejects.toMatchObject({ name: 'CoreError', category: 'network' });
+    expect(calls).toBe(2);
+  });
+
+  it('never retries a 429 or a 4xx: the venue already answered', async () => {
+    let limited = 0;
+    await expect(
+      fetchBorosMarkets(async () => {
+        limited += 1;
+        return { ok: false, status: 429, json: async () => ({}) };
+      }),
+    ).rejects.toMatchObject({ category: 'rate-limited' });
+    expect(limited).toBe(1);
+
+    let bad = 0;
+    await expect(
+      fetchBorosMarkets(async () => {
+        bad += 1;
+        return { ok: false, status: 400, json: async () => ({}) };
+      }),
+    ).rejects.toMatchObject({ category: 'network' });
+    expect(bad).toBe(1);
+  });
+
+  it('carries the retry into the gateway ledger reads too (settlement events)', async () => {
+    let calls = 0;
+    const { events } = await fetchSettlementEvents(
+      async () => {
+        calls += 1;
+        if (calls === 1) throw new Error('fetch failed');
+        return { ok: true, status: 200, json: async () => ({ results: [], resumeToken: null }) };
+      },
+      ADDR,
+    );
+    expect(calls).toBe(2);
+    expect(events).toEqual([]);
   });
 });
 
