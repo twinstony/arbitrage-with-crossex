@@ -281,32 +281,104 @@ export function setClientTagContext(ctx: { version?: string | null; active?: boo
   }
 }
 
+/** Attempts one Boros READ makes (1 = no retry), and the backoff between them. */
+const BOROS_READ_ATTEMPTS = 2;
+const BOROS_RETRY_DELAY_MS = 300;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One read's outcome: the body, or the reason it failed and whether asking
+ * again is both safe and plausibly different. */
+type BorosRead =
+  | { ok: true; body: unknown }
+  | { ok: false; retry: boolean; category: 'network' | 'rate-limited'; message: string };
+
+/** A single GET. Never retries by itself — the caller owns the ladder, so the
+ * retry policy lives in ONE place (borosGetJson). */
+async function oneBorosGet(
+  fetchImpl: FetchLike,
+  url: string,
+  label: string,
+  timeoutMs: number,
+): Promise<BorosRead> {
+  let resp: Awaited<ReturnType<FetchLike>>;
+  try {
+    resp = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    // No response arrived, so the venue cannot have acted on anything — and
+    // every call here is an idempotent GET regardless.
+    return {
+      ok: false,
+      retry: true,
+      category: 'network',
+      message: `Boros API unreachable (${label}): ${(err as Error)?.message ?? String(err)}`,
+    };
+  }
+  if (!resp.ok) {
+    return {
+      ok: false,
+      // 429 keeps its rate-limited category so TtlCache's cooldown/stale
+      // serving engages instead of a retry hammering the venue; every other
+      // 4xx is a bad request, which repeating cannot fix.
+      retry: resp.status >= 500,
+      category: resp.status === 429 ? 'rate-limited' : 'network',
+      message: `Boros API ${label} returned HTTP ${resp.status}`,
+    };
+  }
+  try {
+    return { ok: true, body: await resp.json() };
+  } catch {
+    // A truncated 200 through the same flaky path is indistinguishable from
+    // junk, and a GET is safe to repeat.
+    return {
+      ok: false,
+      retry: true,
+      category: 'network',
+      message: `Boros API ${label} returned a non-JSON body`,
+    };
+  }
+}
+
+/**
+ * A Boros READ with ONE retry for transient failures.
+ *
+ * MEASURED 2026-09-15 on the live path, not guessed: ~25% of COLD connections
+ * to api.boros.finance die during the TLS handshake ("unexpected eof while
+ * reading" — the local fake-IP tunnel resets it). Direct and proxied egress
+ * are affected EQUALLY (the host resolves to the tunnel's fake IP either way),
+ * so a NO_PROXY entry is not a fix; a retry is. A single 300ms retry turned
+ * 60/60 cold handshakes into successes in the same probe.
+ *
+ * Without it ONE reset failed the whole read: the scanner went silent
+ * ("Boros API unreachable (/core/v1/markets)" — 70-130 lines a day), the asset
+ * view answered 502 and the web positions intermittently vanished (10 of 12
+ * fresh probes on a healthy venue).
+ *
+ * Deliberately NOT retried: 429 (TtlCache's cooldown owns it) and other 4xx
+ * (the request is wrong). Writes are a different call path and are never
+ * retried — a lost response must not resubmit anything.
+ */
+async function borosGetJson(
+  fetchImpl: FetchLike,
+  url: string,
+  label: string,
+  timeoutMs = 15_000,
+): Promise<unknown> {
+  for (let attempt = 1; ; attempt += 1) {
+    const outcome = await oneBorosGet(fetchImpl, url, label, timeoutMs);
+    if (outcome.ok) return outcome.body;
+    if (attempt >= BOROS_READ_ATTEMPTS || !outcome.retry) {
+      throw new CoreError(outcome.message, outcome.category);
+    }
+    await delay(BOROS_RETRY_DELAY_MS);
+  }
+}
+
 async function getJson(fetchImpl: FetchLike, path: string): Promise<unknown> {
   const clientTag =
     'pendle_client=boroscrossex' + clientTagState.version + (clientTagState.active ? '_active' : '');
   const url = `${BOROS_BASE_URL}${path}${path.includes('?') ? '&' : '?'}${clientTag}`;
-  let resp: Awaited<ReturnType<FetchLike>>;
-  try {
-    resp = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
-  } catch (err) {
-    throw new CoreError(
-      `Boros API unreachable (${path}): ${(err as Error)?.message ?? String(err)}`,
-      'network',
-    );
-  }
-  if (!resp.ok) {
-    // 429 keeps its rate-limited category so TtlCache's cooldown/stale-serving
-    // engages instead of surfacing a misleading 502.
-    throw new CoreError(
-      `Boros API ${path} returned HTTP ${resp.status}`,
-      resp.status === 429 ? 'rate-limited' : 'network',
-    );
-  }
-  try {
-    return await resp.json();
-  } catch {
-    throw new CoreError(`Boros API ${path} returned a non-JSON body`, 'network');
-  }
+  return borosGetJson(fetchImpl, url, path);
 }
 
 /** GET /core/v1/markets → normalized markets (list is small, one page).
@@ -624,22 +696,7 @@ export async function fetchSettlementEvents(
       `&accountId=${accountId}&limit=100` +
       (resumeToken ? `&resumeToken=${encodeURIComponent(resumeToken)}` : '') +
       `&${clientTag}`;
-    let resp: Awaited<ReturnType<FetchLike>>;
-    try {
-      resp = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
-    } catch (err) {
-      throw new CoreError(
-        `Boros API unreachable (settlement-events): ${(err as Error)?.message ?? String(err)}`,
-        'network',
-      );
-    }
-    if (!resp.ok) {
-      throw new CoreError(
-        `Boros API settlement-events returned HTTP ${resp.status}`,
-        resp.status === 429 ? 'rate-limited' : 'network',
-      );
-    }
-    const body = (await resp.json()) as {
+    const body = (await borosGetJson(fetchImpl, url, 'settlement-events')) as {
       results?: Array<Record<string, unknown>>;
       resumeToken?: string | null;
     };

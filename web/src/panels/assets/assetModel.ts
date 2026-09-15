@@ -395,6 +395,69 @@ export interface PendingLeg {
   imUsd: number;
 }
 
+/** One card's inputs: its payload group and the derived numbers. */
+export interface AssetDerivedPair {
+  group: AssetGroup;
+  derived: AssetDerived;
+}
+
+/** The totals strip's numbers, over the CARDED assets only.
+ *
+ * Shared by the panel (AssetsHome) and the server's Telegram positions
+ * section, so the strip in the message is the strip on screen BY
+ * CONSTRUCTION — including the two things no single card can carry: the dust
+ * fold (an asset with nothing open and under $1 of history is named, not
+ * summed) and the account-level borrow interest (subtracted once, and from
+ * the total only). */
+export function portfolioTotals<T extends AssetDerivedPair>(
+  all: readonly T[],
+  interestUsd: number,
+  nowSec: number,
+): {
+  carded: T[];
+  dust: T[];
+  totalPnlUsd: number;
+  totalCapitalUsd: number;
+  blendedApr: number | null;
+  gapCount: number;
+  nonNeutral: boolean;
+} {
+  const carded = all.filter(
+    (a) =>
+      a.group.perpOpen.length > 0 ||
+      a.group.borosOpen.length > 0 ||
+      Math.abs(a.derived.totals.pnlUsd) >= 1,
+  );
+  const dust = all.filter((a) => !carded.includes(a));
+  const totalPnlUsd = carded.reduce((s, a) => s + a.derived.totals.pnlUsd, 0) - interestUsd;
+  const totalCapitalUsd = carded.reduce((s, a) => s + a.derived.totals.capitalUsd, 0);
+  // Blended APR: Σpnl over Σ(capital · its own elapsed clock) — each asset
+  // keeps its clock, so a young asset doesn't dilute an old one's rate. Both
+  // sums cover the SAME assets: one with history but no capital would add PnL
+  // to the numerator while contributing zero capital-years, which silently
+  // inflates the rate.
+  const aprAgg = carded.reduce(
+    (s, a) => {
+      const d = a.derived;
+      if (d.clockStartSec === null || !(d.totals.capitalUsd > 0)) return s;
+      return {
+        pnl: s.pnl + d.totals.pnlUsd,
+        capYears: s.capYears + d.totals.capitalUsd * ((nowSec - d.clockStartSec) / SECONDS_IN_YEAR),
+      };
+    },
+    { pnl: 0, capYears: 0 },
+  );
+  return {
+    carded,
+    dust,
+    totalPnlUsd,
+    totalCapitalUsd,
+    blendedApr: aprAgg.capYears > 0 ? (aprAgg.pnl - interestUsd) / aprAgg.capYears : null,
+    gapCount: carded.reduce((s, a) => s + a.derived.gaps.length, 0),
+    nonNeutral: carded.some((a) => !a.derived.deltaNeutral),
+  };
+}
+
 export interface AssetDerived {
   base: string;
   priceUsd: number;
