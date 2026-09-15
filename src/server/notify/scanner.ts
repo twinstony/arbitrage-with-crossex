@@ -197,7 +197,7 @@ function notionalLine(group: OpportunityGroup, notionalUsd: number): string {
   if (isUsdCollateral || group.collateralPriceUsd === null || group.collateralPriceUsd <= 0) {
     return base;
   }
-  return `${base} (${fmtTokenQty(notionalUsd / group.collateralPriceUsd, group.collateral)})`;
+  return `${base} (${esc(fmtTokenQty(notionalUsd / group.collateralPriceUsd, group.collateral))})`;
 }
 
 /** The five stat lines one pair renders as — shared by both channels. */
@@ -348,7 +348,7 @@ const rate = (r: number | null | undefined): string =>
 function gapAsk(gap: HedgeGapRow, base: string): string {
   const dir = gap.action.startsWith('long') ? 'LONG' : 'SHORT';
   const what = gap.leg === 'boros' ? 'YU（Boros）' : 'perp';
-  const size = gap.unit === 'base' ? fmtTokenQty(gap.size, base) : usd0(gap.size);
+  const size = gap.unit === 'base' ? esc(fmtTokenQty(gap.size, base)) : usd0(gap.size);
   return `${dir} ${size} ${what}`;
 }
 
@@ -460,7 +460,7 @@ export function formatPositionsSection(
       ? `${history.map((a) => esc(a.group.base)).join('、')} 仅有历史（已计入总 PnL）`
       : '',
     totals.dust.length > 0
-      ? `另有 ${totals.dust.length} 个资产无持仓、历史 < $1（未计入）`
+      ? `另有 ${totals.dust.length} 个资产无持仓、历史 &lt; $1（未计入）`
       : '',
   ].filter(Boolean);
   if (rest.length > 0) lines.push('', `（${rest.join(' ｜ ')}）`);
