@@ -66,6 +66,13 @@ export function prettyVenue(v: string): string {
   return v.length <= 3 ? v : v.charAt(0) + v.slice(1).toLowerCase();
 }
 
+export const WALLET_SHORT: Readonly<Record<string, string>> = {
+  'USDT/CROSSEX': 'CrossEx',
+  'USDC/HYPERLIQUID': 'Hyperliquid',
+  'USDC/LIGHTER': 'Lighter',
+  'USDC/GATE': 'Gate',
+};
+
 // ---------------------------------------------------------------------------
 // Web-only additions
 // ---------------------------------------------------------------------------
@@ -195,6 +202,12 @@ export function fmtAge(ms: number): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ${m % 60}m`;
   return `${Math.floor(h / 24)}d`;
+}
+
+export function fmtAbout(seconds: number): string {
+  if (seconds < 60) return `about ${Math.round(seconds)}s`;
+  if (seconds < 600) return `about ${Math.round(seconds / 30) / 2} min`;
+  return `about ${Math.round(seconds / 60)} min`;
 }
 
 /** Unix seconds → UTC "YYYY-MM-DD" (maturities are quoted in UTC). */

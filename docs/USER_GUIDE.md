@@ -111,24 +111,85 @@ The choice is remembered per browser and applies to every position box and the t
 
 #### Rebalancing USDC and USDT
 
-Your CrossEx account has two wallets. Every venue except Hyperliquid margins and settles in USDT. Hyperliquid settles in USDC, so it has its own USDC wallet, which starts at 0.
+Your CrossEx account has three wallets. Every venue except Hyperliquid and Lighter margins and settles in USDT. Hyperliquid and Lighter settle in USDC, so each has its own USDC wallet, which starts at 0.
 
-Opening a leg does not borrow. Its margin comes from your whole account. A wallet moves only when its legs pay or receive: hourly funding, fees, and profit or loss. When a wallet's legs lose more than it holds, the wallet goes negative and Gate lends you the coin: USDC for the Hyperliquid legs, USDT for the legs on every other venue. Gate counts the unrealised loss too, so a borrow can show while the cash is still positive.
+Opening a leg does not borrow. Its margin comes from your whole account. A wallet moves only when its legs pay or receive: hourly funding, fees, and profit or loss. When a wallet's legs lose more than it holds, the wallet goes negative and Gate lends you the coin: USDC for the Hyperliquid and Lighter legs, USDT for the legs on every other venue. Gate counts the unrealised loss too, so a borrow can show while the cash is still positive.
 
-The borrow costs two things. Gate holds 20% of it as initial margin and 10% as maintenance margin. Once the wallet is more than 10,000 short, Gate also charges interest every hour.
+The borrow costs two things. Gate holds 20% of it as initial margin and 10% as maintenance margin. It also pays interest:
 
-A hedged pair is delta-neutral, but not margin-neutral. Gate liquidates the account when the margin balance falls to the maintenance margin, and the maintenance margin grows with a move against the Hyperliquid leg: each leg's maintenance margin scales with its notional, and the losing leg drives its wallet negative, a borrow that adds 10% of itself to the maintenance margin. Each card on the Positions tab carries a chip like `Liquidates if ETH hits ~$3,150 (+37%)`: the price of the coin at which the account liquidates if only that coin moves and every other coin holds still. It turns amber inside 30% and red inside 15%. A pair that the model priced to a 10x pump and a 98% dump without finding a line reads `Safe through a 10x HYPE pump or 98% dump`. If Gate's margin figures are missing, the chip reads `No liquidation estimate` rather than claiming safety. The same nearest line sits in the hover of the IM and MM gauges in the header, and the rebalance quote carries a `Liquidation` fact with the line before and after the move, as a price and a move (`ETH ~$3,150 (+37%) → ~$3,290 (+43%)`).
+| Wallet | Legs | Borrow interest |
+|---|---|---|
+| USDT · CrossEx | Gate, Binance, OKX, Bybit | From the first dollar |
+| USDC · Hyperliquid | Hyperliquid | Free up to 10,000 USDC. The part over pays about 5% a year |
+| USDC · Lighter | Lighter | From the first dollar, about 11% a year |
 
-The Balances tab shows a **Rebalance** section whenever either wallet has a borrow, Hyperliquid holds any USDC, or a job runs or is halted. An amber pill shows the borrow in the coin Gate lent. A row of six facts under it reads the same with and without a borrow, zeros included: what Gate lent you, the initial and maintenance margin it holds, the interest (`none under 10,000 USDC`, or the charge per day), the spare USDC on Hyperliquid, and the interest paid all time. All time means since 2025-01-01, the earliest date Gate's history serves. The total is kept on your machine and topped up with the new rows on each poll. Under the direction toggle one line says what the move does, and the quote is a second row of facts: the route and its wait, what is sent and what lands at which price, the cost, and, when the move repays a borrow, the borrow after, the margin it frees, the interest it saves, and the liquidation line before and after. The info mark next to the title opens a short card that says all this. The same amber pill sits in the header on every tab. Click it to open this section.
+A Lighter borrow of $50 pays interest on all $50. A Hyperliquid borrow of $50 pays nothing.
 
-The section opens on the direction that repays the borrow. Keep the prefilled amount or type one, and hold the button:
+A hedged pair is delta-neutral, but not margin-neutral. Gate liquidates the account when the margin balance falls to the maintenance margin, and the maintenance margin grows with a move against a USDC leg on Hyperliquid or Lighter: each leg's maintenance margin scales with its notional, and the losing leg drives its wallet negative, a borrow that adds 10% of itself to the maintenance margin. Each card on the Positions tab carries a chip like `Liquidates if ETH hits ~$3,150 (+37%)`: the price of the coin at which the account liquidates if only that coin moves and every other coin holds still. It turns amber inside 30% and red inside 15%. A pair that the model priced to a 10x pump and a 98% dump without finding a line reads `Safe through a 10x HYPE pump or 98% dump`. If Gate's margin figures are missing, the chip reads `No liquidation estimate` rather than claiming safety. The same nearest line sits in the hover of the IM and MM gauges in the header.
 
-- **USDT → Hyperliquid USDC** pays a USDC borrow back. The amount is capped at the borrow, at your free USDT, and at your available margin. When less than the borrow can move, an amber line says how much stays borrowed and why.
-- **Hyperliquid USDC → USDT** pays a USDT borrow back, or brings spare USDC home when there is none. The amount is capped at the USDC you own there after open losses, so this move never starts a new borrow. With a USDT borrow the prefilled amount is the borrow, and you can type more, up to the spare.
+The Balances tab shows the margin card, then the Assets table. Under the table are your borrow, its interest now and the interest paid, then **Rebalance** and **Manual Transfer**. Hover a figure to see each wallet. Rebalance splits your CrossEx equity across the three wallets by position size. Each wallet's share is its legs at mark price, divided by all legs. Equity is cash plus unrealized profit or loss.
 
-Two routes exist and the terminal takes the cheaper one: a direct convert on Hyperliquid (instant, about 20 bps), or a spot loop through Gate (a spot trade plus two transfers; about 2.5 minutes toward USDC, about 6.5 minutes plus a flat $1 fee toward USDT). Under 1 USDC the hold is hidden.
+Example: $500 of positions on Gate, $250 on Hyperliquid and $250 on Lighter give 50%, 25% and 25%. With $1,000 of equity, the wallets aim for $500, $250 and $250. A wallet with no legs sends all its money to the wallets that have legs. With no open positions, there is nothing to rebalance.
 
-A running job shows a progress bar, one segment per step with its seconds. A halted job shows the reason, the line `Funds are in <place>`, and a **Resume** and an **Abandon** button. After **Abandon**, move any USDC left in the Gate spot wallet by hand in Gate.
+In the Rebalance window, the **Position share** column shows each wallet's share and the position size behind it, for example `49% · $1,774`. The USDC · Lighter row shows only when it has legs, money or a move.
+
+USDC · Gate is one more CrossEx wallet for USDC. It counts as margin. Rebalance sells what is in it, in both directions, when it is worth 3 USDT or more.
+
+Press **Rebalance** to open the Rebalance window. It lists the routes, and **Show steps** lists every step. Press and hold **Hold to rebalance** to start. There is no direction to pick and no amount to type. The button moves every wallet toward its share. When more than one wallet sends or receives, one hold runs every move, one after another. Convert always shows. A Spot loop row shows only when it costs less than Convert and its plan takes 15 minutes or less. The app marks the cheapest route as **Recommended** and picks it first. You can pick another route. The routes are:
+
+- **Spot loop**: runs rounds until every wallet reaches its share. A last amount under the transfer minimum moves by Convert. If a round comes out smaller while it runs, the job can add a round, so the run can pass 15 minutes.
+- **Spot loop, then Convert**: runs the rounds that fit in 15 minutes and give the lowest cost, then moves the rest with Convert.
+- **Convert**: an instant swap inside CrossEx. It costs 0.2% of the amount moved. USDC between Hyperliquid and Lighter swaps twice, through USDT, so it costs about 0.4%. Gate takes at most 500,000 in one Convert, so a larger move runs as several Converts, 2 s apart.
+
+The window shows the **Fee** and the **Interest** your borrow pays in 30 days, now and after the move. When the fee is less than 30 days of the interest it saves, the Balances tab and the window read `Rebalance is recommended.` with the days under it, for example `The fee equals 12 days of the interest it saves.` When the fee is more than 30 days of that interest, they read `Not worth it yet`. You can still rebalance. A Hyperliquid borrow under 10,000 USDC pays no interest, so with no other borrow they read `No interest payment yet`.
+
+A round moves money through Gate spot, because Gate has no direct transfer between CrossEx wallets. Time and cost are for one round. Cost adds the spot fee and spread when the round buys or sells USDC.
+
+| Round | What it does | Time | Gate fee |
+|---|---|---|---|
+| USDT to Hyperliquid | Buys USDC in CrossEx, moves it through Gate spot into the Hyperliquid wallet | About 2 min | $0.05 |
+| Hyperliquid to USDT | Moves USDC out through Gate spot, back into CrossEx, sells it for USDT | About 6.5 min | $1.00 |
+| USDT to Lighter | Buys USDC in CrossEx, moves it through Gate spot into the Lighter wallet | About 4 min | $1.03 |
+| Lighter to USDT | Moves USDC out through Gate spot, back into CrossEx, sells it for USDT | About 3 min | Free |
+| Hyperliquid to Lighter | Moves USDC out of Hyperliquid, through Gate spot, into Lighter | About 10 min | $2.03 |
+| Lighter to Hyperliquid | Moves USDC out of Lighter, through Gate spot, into Hyperliquid | About 5 min | $0.05 |
+
+A round moves 11 USDC or more. A round from Hyperliquid to Lighter moves 12 or more, so 11 still reaches Gate spot after the $1.00 fee. A smaller move goes by Convert.
+
+Each round leaves at least 112% of initial margin in the account. With $29.41 of initial margin, at least $32.94 of margin balance stays. Gate refuses a move that would leave less than 110%. A borrow locks 20% of its size as initial margin. Early rounds are small, and later rounds grow as the borrow shrinks.
+
+A finished run shows **Moved**, the amount that landed after fees. The chip reads **Balanced**, or **Done** when less landed than planned.
+
+You cannot stop a run once it starts. A failed step stops it. An app restart stops it too. When Gate is already moving a step's money, the app first waits for that step to land, then stops. New deals and transfers wait until the run ends.
+
+A stopped run shows **Resume** and **Abandon**. Resume first looks up the last send on Gate by its tag. When that lookup misses, it sweeps Gate's order history for the same tag. When Gate cannot confirm the order, the run stays stopped. Press Resume again. When Gate does not show a send after 2 min, the run stops. Resume looks again, and sends the step again only when Gate still does not show it. When Gate rate-limits the account, the run stops with **Gate is rate-limiting this account**. Nothing was sent. Press Resume a minute later. Gate allows 100 Convert quotes a day per account. When they are used up, the run stops and says so. Press Resume later: Gate's count clears within 24 hours. The app never sends a step twice on its own.
+
+When a run stops, a banner at the top of every tab shows where the money is. Click **View** to open the Balances tab.
+
+After Abandon, any money left in Gate spot is plain spot money. Move it with Manual Transfer.
+
+#### Manual Transfer between Gate spot and CrossEx
+
+The **Manual Transfer** button next to Rebalance opens a window. It moves USDT and USDC between your Gate spot wallet and your four CrossEx wallets. Gate's own website cannot do this.
+
+Without Spot Trading Read Only on your key, the Assets table shows `Add Spot read permission to see spot balances.` The Gate spot tile in Manual Transfer then reads `balance hidden`. When an open Gate spot order holds part of a spot balance, hover the balance to see how much is free.
+
+Two tabs set the direction. **Into CrossEx** moves money from Gate spot into a CrossEx wallet. **Out of CrossEx** moves money from a CrossEx wallet to Gate spot.
+
+There are eight paths, one for each wallet in each direction:
+
+| Wallet | Coin | Into CrossEx | Out of CrossEx | Minimum |
+|---|---|---|---|---|
+| USDT · CrossEx | USDT | Free, about 3 s | Free, about 3 s | None |
+| USDC · Gate | USDC | Free, about 5 s | Free, about 5 s | None |
+| USDC · Hyperliquid | USDC | $0.05, about 2 min | $1.00, about 6.5 min | 11 USDC, fee included |
+| USDC · Lighter | USDC | $1.03, about 4 min | Free, about 3 min | 11 USDC, fee included |
+
+A move out of CrossEx is capped so 112% of initial margin stays in the account. With $29.41 of initial margin, at least $32.94 of margin balance stays. This is the same floor a rebalance round uses.
+
+Transfers wait while a rebalance runs or is stopped, or while a deal is still working. Only one transfer moves at a time. If the app restarts mid-transfer, it never sends that transfer twice.
+
+A deal waits a few seconds after a transfer starts, until Gate has taken the money.
 
 ## 3. How to maximise return
 These few factors move the needle the most in maximising your return on the 4-legged Funding Rate Arbitrage

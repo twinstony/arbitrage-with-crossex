@@ -137,7 +137,7 @@ export interface CrossexAccount {
 // GET /api/rebalance · POST /api/rebalance · POST /api/rebalance/:id/{resume,abandon}
 // ---------------------------------------------------------------------------
 
-export type RebalanceDirection = 'toUsdc' | 'toUsdt';
+export type Pool = 'CROSSEX' | 'HYPERLIQUID' | 'LIGHTER';
 
 export interface RebalanceBucket {
   coin: string;
@@ -151,26 +151,63 @@ export interface RebalanceBucket {
   /** All time, or as far back as Gate's history reaches (2025-01-01). */
   interestPaidUsd: number;
   interestPerDayUsd: number;
+  ratePerYear: number | null;
 }
 
-export interface RebalanceRoute {
-  costUsd: number;
-  waitSeconds: number;
+export type RouteName = 'mix' | 'loop' | 'convert';
+
+export type GateAccount = 'SPOT' | 'CROSSEX' | 'CROSSEX_GATE' | 'CROSSEX_HYPERLIQUID' | 'CROSSEX_LIGHTER';
+
+export type TransferCoin = 'USDT' | 'USDC';
+
+export interface WalletAfter {
+  coin: string;
+  venue: string;
+  cash: number;
+  equity: number;
+}
+
+export interface WalletShare {
+  coin: string;
+  venue: string;
+  notionalUsd: number;
+  share: number;
+}
+
+export interface PlannedStep {
+  round: number | null;
+  kind: 'round' | 'convert';
+  buy: number;
+  move: number;
+  arrives: number;
+  borrowLeft: number;
+  seconds: number;
+  from: Pool;
+  to: Pool;
+}
+
+export interface RoutePlan {
   available: boolean;
   reason: string | null;
+  costUsd: number;
+  seconds: number;
+  rounds: number;
+  oneMoreRoundCostUsd: number | null;
+  marginFreedUsd: number;
+  savesPerDayUsd: number;
+  after: WalletAfter[];
+  steps: PlannedStep[];
 }
 
-export interface RebalancePlan {
-  direction: RebalanceDirection;
-  amount: number;
-  receives: number;
-  price: number | null;
-  borrowAfterUsd: number;
-  shortfall: { reason: 'cash' | 'margin' | 'spare'; remaining: number } | null;
-  routes: { loop: RebalanceRoute; convert: RebalanceRoute };
-  route: 'loop' | 'convert' | null;
-  savesPerDayUsd: number;
-  marginFreedUsd: number;
+export interface EvenPlan {
+  balanced: boolean;
+  noLegs: boolean;
+  moves: number;
+  shortOfEven: number;
+  roundCap: number;
+  split: WalletShare[];
+  routes: { mix: RoutePlan | null; loop: RoutePlan | null; convert: RoutePlan };
+  recommended: RouteName | null;
 }
 
 export interface RebalanceStep {
@@ -183,26 +220,82 @@ export interface RebalanceStep {
   status: 'pending' | 'running' | 'done';
   startedAt: number | null;
   doneAt: number | null;
+  round: number | null;
+  planned: number | null;
+  arrives: number | null;
+  borrowLeft: number | null;
+  from: Pool;
+  to: Pool;
+  cashBefore?: number;
+  sentAt?: number;
 }
 
 export interface RebalanceJob {
   id: string;
-  direction: RebalanceDirection;
-  route: 'loop' | 'convert';
+  route: RouteName;
   amount: number;
+  costUsd: number | null;
+  target: WalletAfter[] | null;
   status: 'running' | 'halted' | 'done' | 'abandoned';
   stepIndex: number;
   steps: RebalanceStep[];
-  fundsAt: 'CROSSEX' | 'GATE' | 'SPOT' | 'HYPERLIQUID';
+  fundsAt: 'CROSSEX' | 'GATE' | 'SPOT' | 'HYPERLIQUID' | 'LIGHTER';
   haltReason: string | null;
   createdAt: number;
   updatedAt: number;
+  inTransit: { coin: 'USDC'; qty: number; at: 'SPOT' | 'MOVING' } | null;
 }
 
 export interface RebalanceView {
   buckets: RebalanceBucket[];
-  plan: RebalancePlan;
+  plan: EvenPlan;
   job: RebalanceJob | null;
+}
+
+export interface SpotBalance {
+  coin: TransferCoin;
+  available: number;
+  locked: number;
+}
+
+export interface TransferPath {
+  coin: TransferCoin;
+  from: GateAccount;
+  to: GateAccount;
+  max: number | null;
+  min: number;
+  feeUsd: number;
+  seconds: number;
+}
+
+export interface TransferJob {
+  id: string;
+  coin: TransferCoin;
+  from: GateAccount;
+  to: GateAccount;
+  amount: number;
+  status: 'moving' | 'done' | 'failed';
+  received: number | null;
+  failText: string | null;
+  createdAt: number;
+  doneAt: number | null;
+}
+
+export type TransferLock = 'rebalance' | 'halted' | 'deal';
+
+export interface TransferView {
+  spot: SpotBalance[] | null;
+  paths: TransferPath[];
+  lock: TransferLock | null;
+  transfer: TransferJob | null;
+}
+
+export interface StartTransferBody {
+  id?: string;
+  coin: TransferCoin;
+  from: GateAccount;
+  to: GateAccount;
+  amount: string;
 }
 
 // ---------------------------------------------------------------------------
