@@ -7,8 +7,15 @@
  *   1. Mint an agent keypair locally, from the browser's CSPRNG.
  *   2. Have the ROOT wallet EIP-712-sign an `ApproveAgentMessage`, encode it
  *      into the router's relayable `approveAgent(req, signature)` overload, and
- *      POST it to `/v1/send-txs/approve` — where Pendle's bot submits it and
- *      pays the gas, so the user needs no ETH on Arbitrum.
+ *      hand the calldata to the LOCAL terminal (`/api/boros/agent/approve`),
+ *      which relays it to Boros's `/v1/send-txs/approve` — where Pendle's bot
+ *      submits it and pays the gas, so the user needs no ETH on Arbitrum.
+ *
+ * ⚠ Never POST straight to api-boros from the browser: that API answers no
+ * CORS headers on any response, so a cross-origin script call dies in the
+ * preflight. The server-side relay (undici, HTTPS_PROXY-aware) is the only
+ * channel that reaches it, and it is the same one every other Boros call in
+ * this app uses.
  *
  * ⚠ THE KEY IS RANDOM, not derived from a wallet signature. The SDK derived it
  * from a signed "welcome message", which reads like a recoverable derivation
@@ -22,9 +29,6 @@
  */
 import { encodeFunctionData, toHex, type Address, type Hex, type WalletClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-
-/** The documented production host (the OpenAPI spec's only `servers` entry). */
-export const BOROS_API_BASE = 'https://api-boros.pendle.finance/apis';
 
 /** Arbitrum One, and the router the approval is bound to. Both are part of the
  * EIP-712 domain, so a wrong value yields a signature the contract rejects
@@ -110,10 +114,35 @@ const approvalNonce = (): bigint => BigInt(Date.now()) * 1000n;
 
 export class BorosApiError extends Error {}
 
+/**
+ * The per-install API token injected into index.html by the serving backend.
+ * Absent, or still the untouched placeholder, means this page did not come
+ * from the terminal backend — send nothing (matches `client.ts`'s authHeader).
+ */
+function arbToken(): string {
+  if (typeof document === 'undefined') return '';
+  const content =
+    document.querySelector('meta[name="arb-token"]')?.getAttribute('content') ?? '';
+  return content && content !== '__ARB_TOKEN__' ? content : '';
+}
+
+/**
+ * POST to the LOCAL terminal (same origin — no CORS), which relays the
+ * approval to Boros server-side. The browser must never call api-boros
+ * directly: that API answers no CORS headers on any response, so a
+ * cross-origin script request dies in the preflight. The server's own fetch
+ * (undici, riding HTTPS_PROXY like every other Boros call) is the one channel
+ * that actually gets there.
+ */
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const resp = await fetch(`${BOROS_API_BASE}${path}`, {
+  const resp = await fetch(path, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      // The relay route sits behind the terminal's auth hook — carry the same
+      // per-install token every other /api call does (see client.ts).
+      'x-arb-token': arbToken(),
+    },
     body: JSON.stringify(body),
   });
   const json = (await resp.json().catch(() => null)) as
@@ -151,7 +180,9 @@ export interface ApproveAgentInput {
  * EIP-712 domain, so calldata that does not match is rejected on-chain rather
  * than approving something else.
  */
-export async function approveAgent(input: ApproveAgentInput): Promise<{ txHash?: string }> {
+export async function approveAgent(
+  input: ApproveAgentInput,
+): Promise<{ txHash?: string; expiryTime: number }> {
   const accountId = input.accountId ?? 0;
   const message = {
     root: input.root,
@@ -173,11 +204,59 @@ export async function approveAgent(input: ApproveAgentInput): Promise<{ txHash?:
     functionName: 'approveAgent',
     args: [message, signature],
   });
-  const res = await postJson<{ approveAgentResult?: { txHash?: string; error?: string } }>(
-    '/v1/send-txs/approve',
-    { approveAgentCalldata },
+  // Relayed by the local server (`skipReceipt` — the bot broadcasts and
+  // answers immediately), then polled on-chain until the approval lands. The
+  // chain is the truth: an approval the bot could not confirm stays 0 forever
+  // and must read as a failure, not a silent success.
+  const relayRes = await postJson<{
+    data?: { txHash?: string; status?: string; error?: string };
+  }>('/api/boros/agent/approve', { approveAgentCalldata });
+  const relayed = relayRes?.data;
+  if (relayed?.error) throw new BorosApiError(`Boros refused the approval: ${relayed.error}`);
+  if (relayed?.status === 'reverted') {
+    throw new BorosApiError(`Boros approval was reverted on-chain`);
+  }
+
+  const deadlineAt = Date.now() + APPROVAL_CONFIRM_MS;
+  let expiryTime = 0;
+  let lastLookupError: unknown = null;
+  while (Date.now() < deadlineAt) {
+    try {
+      expiryTime = await chainExpiry();
+      if (expiryTime > Math.floor(Date.now() / 1000)) {
+        return { txHash: relayed?.txHash, expiryTime };
+      }
+    } catch (err) {
+      lastLookupError = err;
+    }
+    await new Promise((r) => setTimeout(r, APPROVAL_POLL_MS));
+  }
+  // The broadcast was accepted but the chain never showed the approval.
+  // Reverted (nonce/sim), dropped, or merely slow — all read the same here.
+  if (lastLookupError instanceof BorosApiError) throw lastLookupError;
+  throw new BorosApiError(
+    `The approval was submitted but the chain has not confirmed it within ${Math.round(APPROVAL_CONFIRM_MS / 60_000)} min. Check the agent list in the Boros app before retrying.`,
   );
-  const result = res?.approveAgentResult;
-  if (result?.error) throw new BorosApiError(`Boros refused the approval: ${result.error}`);
-  return { txHash: result?.txHash };
+}
+
+/** How long to wait for the on-chain approval to land after relaying. */
+const APPROVAL_CONFIRM_MS = 3 * 60 * 1000;
+/** Poll interval for the chain-side status. */
+const APPROVAL_POLL_MS = 1_500;
+
+/** The chain's expiry for the currently configured agent (0 = not approved). */
+async function chainExpiry(): Promise<number> {
+  const resp = await fetch('/api/boros/agent/chain-expiry', {
+    headers: { 'x-arb-token': arbToken() },
+    signal: AbortSignal.timeout(10_000),
+  });
+  const json = (await resp.json().catch(() => null)) as {
+    ok?: boolean;
+    data?: { expiryTime?: number };
+    error?: { message?: string };
+  } | null;
+  if (!resp.ok || !json?.ok) {
+    throw new BorosApiError(json?.error?.message ?? `chain-expiry lookup failed (HTTP ${resp.status})`);
+  }
+  return json.data?.expiryTime ?? 0;
 }

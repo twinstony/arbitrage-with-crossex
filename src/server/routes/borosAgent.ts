@@ -24,8 +24,9 @@
  * anything that looks like one being passed as the root field.
  */
 import type { FastifyInstance } from 'fastify';
+import { privateKeyToAccount } from 'viem/accounts';
 import { CoreError } from '../../core/errors';
-import { makeBorosApiOrderClient, USD_TOKEN_ID } from '../../core/boros/borosApi';
+import { BOROS_API_BASE, makeBorosApiOrderClient, USD_TOKEN_ID } from '../../core/boros/borosApi';
 import { fetchBorosMarkets, resolveBorosFetch } from '../../core/boros/client';
 import type { AppDeps } from '../app';
 import { TTL } from '../cache';
@@ -189,6 +190,91 @@ export function borosAgentRoutes(deps: AppDeps) {
         configured: false,
         note: 'The key is gone from this machine. The on-chain approval is still live until you revoke it in the Boros app or it expires.',
       });
+    });
+
+    /**
+     * Relay an agent approval to Boros from the SERVER side.
+     *
+     * The browser cannot call api-boros directly: that API answers no CORS
+     * headers on any response, so a cross-origin script request dies in the
+     * preflight before it ever leaves. Every other Boros path in this app
+     * rides the server's own fetch (undici, HTTPS_PROXY-aware); this route
+     * makes the approval the same channel — the browser signs the EIP-712
+     * message locally, then hands the calldata here to be relayed.
+     *
+     * `skipReceipt` is deliberately OFF-side: the bot broadcasts and answers
+     * immediately with the txHash, and the CALLER polls the on-chain agent
+     * expiry (`/boros/agent/chain-expiry`) for the outcome. Waiting for the
+     * receipt server-side would marry this route to Arbitrum's confirmation
+     * latency (often >60s) and turn a slow-but-valid approval into a timeout.
+     */
+    app.post('/boros/agent/approve', async (req, reply) => {
+      const body = req.body as { approveAgentCalldata?: string } | undefined;
+      const calldata = body?.approveAgentCalldata?.trim();
+      if (!calldata || !/^0x[0-9a-fA-F]+$/.test(calldata)) {
+        throw new CoreError('approveAgentCalldata must be 0x-prefixed hex calldata', 'validation');
+      }
+
+      let resp: Awaited<ReturnType<typeof fetch>>;
+      try {
+        resp = await fetch(`${BOROS_API_BASE}/v1/send-txs/approve`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ approveAgentCalldata: calldata, skipReceipt: true }),
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (err) {
+        throw new CoreError(
+          `Boros approve relay unreachable: ${(err as Error)?.message ?? err}`,
+          'network',
+        );
+      }
+      const json = (await resp.json().catch(() => null)) as {
+        approveAgentResult?: { txHash?: string; status?: string; error?: string };
+      } | null;
+      const result = json?.approveAgentResult;
+      if (!resp.ok || !result) {
+        const detail = result?.error ?? (json as { message?: string } | null)?.message;
+        throw new CoreError(
+          `Boros refused the approval relay (HTTP ${resp.status})${detail ? `: ${detail}` : ''}`,
+          'venue-rejected',
+        );
+      }
+      return reply.ok({ txHash: result.txHash, status: result.status, error: result.error });
+    });
+
+    /**
+     * The CHAIN's answer for the currently configured agent — `expiryTime` is
+     * 0 while the approval has not landed (never approved / revoked), and a
+     * future unix timestamp once it has. The panel polls this after an
+     * approve relay, using the chain rather than the .env mirror as truth.
+     */
+    app.get('/boros/agent/chain-expiry', async (_req, reply) => {
+      const root = process.env.BOROS_ROOT_ADDRESS?.trim();
+      const key = process.env.BOROS_AGENT_PRIVATE_KEY?.trim();
+      if (!root || !key) {
+        throw new CoreError('Boros agent is not configured on this server', 'validation');
+      }
+      const agentAddress = privateKeyToAccount(key as `0x${string}`).address;
+      const accountId = Number(process.env.BOROS_ACCOUNT_ID ?? 0);
+
+      let resp: Awaited<ReturnType<typeof fetch>>;
+      try {
+        resp = await fetch(
+          `${BOROS_API_BASE}/v1/agents/expiry-time?root=${root}&accountId=${accountId}&agentAddress=${agentAddress}`,
+          { signal: AbortSignal.timeout(10_000) },
+        );
+      } catch (err) {
+        throw new CoreError(
+          `Boros chain-expiry unreachable: ${(err as Error)?.message ?? err}`,
+          'network',
+        );
+      }
+      const json = (await resp.json().catch(() => null)) as { expiryTime?: number } | null;
+      if (!resp.ok || typeof json?.expiryTime !== 'number') {
+        throw new CoreError(`Boros refused the expiry lookup (HTTP ${resp.status})`, 'venue-rejected');
+      }
+      return reply.ok({ expiryTime: json.expiryTime });
     });
   };
 }
