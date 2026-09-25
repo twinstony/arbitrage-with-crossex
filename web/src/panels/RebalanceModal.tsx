@@ -19,13 +19,26 @@ import { BalanceBars, jobRows, jobSeconds, planRows, ProgressBar, ROUTE_ORDER, s
 import type { BarRow, StepRow } from './RebalanceBits';
 import { AFTER_LABEL, GATE_SPOT, GOAL_LABEL, HOLD_LABEL, HOVER, MODAL_ABANDON } from './rebalanceCopy';
 import { MODAL_FEE_LABEL, MODAL_FREES, MODAL_INTEREST, MODAL_REFRESH_ROUTE, MODAL_RESUME, MODAL_STEPS, PER_MONTH } from './rebalanceCopy';
-import { CARD_LABEL, MOVE, MOVE_FROM, MOVE_TO, NOTHING_TO_MOVE, poolKey, PRESET_OFF, SHORT_OF_CASH, USE_PRESET, VERDICT_BALANCED } from './rebalanceCopy';
+import {
+  CARD_LABEL,
+  MOVE,
+  MOVE_FROM,
+  MOVE_TO,
+  NOTHING_TO_MOVE,
+  poolKey,
+  PRESET_OFF,
+  SHORT_OF_CASH,
+  USE_PRESET,
+  VERDICT_BALANCED,
+  VERDICT_NO_CASH_TO_MOVE,
+} from './rebalanceCopy';
 import { RATE_UNKNOWN, WAITS_FOR_DEAL, WAITS_FOR_TRANSFER, WALLET_LABEL } from './rebalanceCopy';
 import { barRowsOf, Facts, hasUnknownRate, isCashLimitedEven, keyOf, MONTH_DAYS, movesKey, movesOf, pickedRoute, stopsPerDayOf, worthLine } from './RebalanceHovers';
 import { defaultGoal, planSteps, receivingBorrow, receivingHeld } from './RebalanceHovers';
 import { ROUTE_LABEL, roundCountOf, roundOf, RouteRow, shownKeys, SpotLines, targetsOf, Term } from './RebalanceHovers';
 import type { Fact } from './RebalanceHovers';
 import { NoSpotReadLine } from './TransferBits';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 
 const TITLE = 'Rebalance';
 const FOR_LABEL = 'For';
@@ -55,11 +68,17 @@ function initialGoal(view: RebalanceView): GoalKind {
   return 'custom';
 }
 
+/** Nothing moves although the wallets are uneven. With no positions the
+ * wallet is short of cash; with positions the cash is their margin — the
+ * card's wording, so the dialog never names a different cause. */
+const cashLimitedText = (plan: EvenPlan): string =>
+  plan.noLegs ? `${fmtUsd(plan.shortOfEven)} ${SHORT_OF_CASH}` : VERDICT_NO_CASH_TO_MOVE;
+
 /** Why a preset is off, for its hover. */
 function presetOffText(preset: Preset, plan: EvenPlan): string | undefined {
   if (!plan.balanced) return undefined;
   if (preset === 'even' && plan.noLegs) return PRESET_OFF.even;
-  if (isCashLimitedEven(plan)) return `${fmtUsd(plan.shortOfEven)} ${SHORT_OF_CASH}`;
+  if (isCashLimitedEven(plan)) return cashLimitedText(plan);
   return preset === 'even' ? VERDICT_BALANCED : PRESET_OFF.repay;
 }
 
@@ -190,7 +209,7 @@ function quoteFactsOf(route: RoutePlan, view: RebalanceView): Fact[] {
 function StepsFold({ open, onToggle, hover, rows }: { open: boolean; onToggle: () => void; hover: string | null; rows: StepRow[] }) {
   const toggle = (
     <button type="button" className="btn-link inline-flex items-center gap-1" aria-expanded={open} onClick={onToggle}>
-      <span aria-hidden="true">{open ? '▾' : '▸'}</span>
+      {open ? <ChevronDown size={14} aria-hidden /> : <ChevronRight size={14} aria-hidden />}
       {open ? HIDE_STEPS : MODAL_STEPS}
     </button>
   );
@@ -529,7 +548,7 @@ export function RebalanceModal({
       body = (
         <>
           {header}
-          <p className="text-xs text-ink-400">{isCashLimitedEven(plan) ? `${fmtUsd(plan.shortOfEven)} ${SHORT_OF_CASH}` : NOTHING_TO_MOVE}</p>
+          <p className="text-xs text-ink-400">{isCashLimitedEven(plan) ? cashLimitedText(plan) : NOTHING_TO_MOVE}</p>
         </>
       );
     } else body = (
@@ -567,33 +586,35 @@ export function RebalanceModal({
               inside the dialog. */}
           {worth && <VerdictAlert tone={worth.tone} text={worth.text} sub={worth.sub} />}
         </div>
-        <div className="flex flex-wrap items-center gap-3">
-          {/* A stale plan replaces the confirm outright rather than sitting as a
-              warning above a disabled one: the only move available is to take
-              the new route, so it is one button, not a sentence plus a button
-              plus a dead control (his call 2026-09-18). */}
-          {stale ? (
-            <button type="button" className="btn btn-primary num" onClick={() => setAccepted(acceptedOf(plan, chosen))}>
-              {MODAL_REFRESH_ROUTE}
-            </button>
-          ) : (
-            <HoldToConfirmButton
-              tone="cyan"
-              holdMs={holdMs}
-              disabled={lock !== null || chosen === null || start.isPending || pricing}
-              onConfirm={() =>
-                chosen &&
-                start.mutate(
-                  { goal, route: chosen, costUsd: route.costUsd, ...(goal === 'custom' && customMove ? customMove : {}) },
-                  { onError: onStartError },
-                )
-              }
-            >
-              {HOLD_LABEL[goal]}
-            </HoldToConfirmButton>
-          )}
-          {lock !== null && <span className="text-xs text-ink-500">{lock}</span>}
-          {lock === null && pricing && <span className="text-xs text-ink-500">{PRICING}</span>}
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-3">
+            {/* A stale plan replaces the confirm outright rather than sitting as a
+                warning above a disabled one: the only move available is to take
+                the new route, so it is one button, not a sentence plus a button
+                plus a dead control (his call 2026-09-18). */}
+            {stale ? (
+              <button type="button" className="btn btn-primary num" onClick={() => setAccepted(acceptedOf(plan, chosen))}>
+                {MODAL_REFRESH_ROUTE}
+              </button>
+            ) : (
+              <HoldToConfirmButton
+                tone="cyan"
+                holdMs={holdMs}
+                disabled={lock !== null || chosen === null || start.isPending || pricing}
+                onConfirm={() =>
+                  chosen &&
+                  start.mutate(
+                    { goal, route: chosen, costUsd: route.costUsd, ...(goal === 'custom' && customMove ? customMove : {}) },
+                    { onError: onStartError },
+                  )
+                }
+              >
+                {HOLD_LABEL[goal]}
+              </HoldToConfirmButton>
+            )}
+            {lock !== null && <span className="text-xs text-ink-500">{lock}</span>}
+            {lock === null && pricing && <span className="text-xs text-ink-500">{PRICING}</span>}
+          </div>
         </div>
         <SpotLines transfer={transfer} job={job} onTransfer={onTransfer} />
       </>

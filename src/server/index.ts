@@ -29,6 +29,13 @@ import { InterestFile } from './interestLedger';
 import { JobFile, TransferFile } from './rebalanceJob';
 import { tokenizedIndexHtml } from './spa';
 import { restrictToOwner } from './secretFile';
+import { botBaseUrl, createBotClient } from './telegram/botClient';
+import { createTelegramLink } from './telegram/link';
+import { TelegramStatus } from './telegram/status';
+import { createRollProbe } from './telegram/rollProbe';
+import { createTelegramSync, readTriggerCoins } from './telegram/sync';
+import { createAssetViewBuilder } from './routes/assetView';
+import { configuredRoot, createPairPricer } from './routes/borosPair';
 import { readInstallInfo, readLocalVersion } from './version';
 
 // Outbound fetch traffic (Boros, the fwalert webhook, the update check) rides
@@ -132,7 +139,12 @@ let loopDeps: LoopDeps | undefined;
     /* best-effort */
   }
 
-  loopDeps = { store, venue: gateVenue(getClients), clock: { now: () => Date.now() } };
+  loopDeps = {
+    store,
+    venue: gateVenue(getClients),
+    clock: { now: () => Date.now() },
+    onFinish: () => telegramSync.requestSync('deal'),
+  };
   engine = { store, venue: loopDeps.venue, clock: loopDeps.clock };
 }
 
@@ -175,6 +187,46 @@ try {
   console.error(`⚠️  ${(err as Error).message}`);
 }
 
+const telegramVersion = readLocalVersion(repoRoot) ?? 'unknown';
+const telegramBot = createBotClient({
+  baseUrl: botBaseUrl(process.env),
+  fetchImpl: resolveBorosFetch(),
+  wallet: configuredRoot,
+});
+const telegramStatus = new TelegramStatus();
+let assetViewBuilder: ReturnType<typeof createAssetViewBuilder> | null = null;
+let pairPricer: ReturnType<typeof createPairPricer> | null = null;
+const telegramSync = createTelegramSync({
+  dataDir,
+  bot: telegramBot,
+  status: telegramStatus,
+  readCoins: () => readTriggerCoins({ cache, getClients }),
+  probeRolls: createRollProbe({
+    borosAddress: configuredRoot,
+    buildAssetView: (params) => (assetViewBuilder ??= createAssetViewBuilder(appDeps))(params),
+    loadMarkets: (fresh) => (pairPricer ??= createPairPricer(appDeps)).loadMarkets(fresh),
+    price: (body, fresh) => (pairPricer ??= createPairPricer(appDeps)).priceRequest(body, fresh),
+    now: Date.now,
+  }),
+  port,
+  version: telegramVersion,
+  now: Date.now,
+  wallet: configuredRoot,
+});
+const telegramLink = createTelegramLink({
+  dataDir,
+  bot: telegramBot,
+  pageUrl: `${botBaseUrl(process.env)}/alerts`,
+  version: telegramVersion,
+  now: Date.now,
+  status: telegramStatus,
+  onConfirmed: () => {
+    telegramStatus.setAuth('ok');
+    telegramSync.requestSync('linked');
+  },
+  onRestored: () => telegramSync.requestSync('restored'),
+});
+
 const webDist = path.join(repoRoot, 'web', 'dist');
 
 const appDeps = {
@@ -182,14 +234,20 @@ const appDeps = {
   // The same cache the Boros agent wiring above reads markets through, so a
   // MarketAcc pack and a priced panel can never disagree.
   cache,
+  dataDir,
   // Created on first boot beside the .env.
   authToken: readOrCreateApiToken(path.dirname(envPath)),
   engine,
   // UPDATE_CHECK=0 lets an install opt out of the GitHub read entirely.
   install: readInstallInfo(repoRoot),
   updateCheck: { current: readLocalVersion(repoRoot), disabled: process.env.UPDATE_CHECK === '0' },
-  rebalance: { jobs: new JobFile(dataDir), interest: new InterestFile(dataDir) },
-  transfer: { jobs: new TransferFile(dataDir) },
+  rebalance: {
+    jobs: new JobFile(dataDir),
+    interest: new InterestFile(dataDir),
+    onDone: () => telegramSync.requestSync('rebalance'),
+  },
+  transfer: { jobs: new TransferFile(dataDir), onDone: () => telegramSync.requestSync('transfer') },
+  telegram: { link: telegramLink, sync: telegramSync, status: telegramStatus, bot: telegramBot, wallet: configuredRoot },
   getBorosOrders: () => borosOrdersRef.current,
   borosAgent: {
     envPath,
@@ -197,6 +255,9 @@ const appDeps = {
     setOrderClient: (client: BorosOrderClient | undefined) => {
       borosOrdersRef.current = client;
     },
+    // A new login syncs Telegram alerts for this wallet now, not at the next
+    // 5-minute sync.
+    onApproved: () => telegramSync.requestSync('login'),
   },
   credentials: {
     envPath,
@@ -279,6 +340,8 @@ app
           `every ${Math.round(notifyConfig.intervalMs / 1000)}s`,
       );
     }
+    void telegramLink.settled().then(() => telegramSync.start());
+
     const shown = host === '127.0.0.1' ? 'localhost' : host;
     console.log(`arb-tools server listening on http://${shown}:${port}`);
   })

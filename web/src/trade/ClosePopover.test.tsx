@@ -80,7 +80,7 @@ describe('ClosePopover', () => {
     expect(await screen.findByText(/limit px/i)).toBeInTheDocument();
     expect(screen.getByText('2497.45')).toBeInTheDocument();
     expect(screen.getByText(/Reduce-only/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Close now ▸' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Close now' })).toBeEnabled();
   });
 
   it('a size above the position shows an inline error and disables Close', async () => {
@@ -94,7 +94,24 @@ describe('ClosePopover', () => {
     // ETH is coin-margined, so the box defaults to the coin and the error
     // names the limit in that unit.
     expect(await screen.findByText(/close size exceeds position \(0\.3 ETH\)/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Close now ▸' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Close now' })).toBeDisabled();
+  });
+
+  it.each([
+    ['4100', '4,100 ETH'],
+    ['12345678.9', '12,345,678.9 ETH'],
+  ])('states a %s ETH maximum with every digit and commas, never compact or exponent', async (qty, text) => {
+    server.use(...baseHandlers(), closePreviewHandler());
+    renderWithClient(
+      <ClosePopover position={makeCrossexPosition({ ...ethPosition, positionQty: qty })} onDismiss={() => {}} />,
+    );
+
+    expect(await screen.findByRole('button', { name: `max ${text}` })).toBeInTheDocument();
+    expect((screen.getByLabelText('Close size') as HTMLInputElement).value).not.toContain(',');
+    await userEvent.clear(screen.getByLabelText('Close size'));
+    await userEvent.type(screen.getByLabelText('Close size'), '99999999');
+    expect(await screen.findByText(`close size exceeds position (${text})`)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\d(k|M) ETH|e\+/);
   });
 
   it('accepts the COIN maximum the dialog itself displays', async () => {
@@ -112,7 +129,7 @@ describe('ClosePopover', () => {
     await userEvent.type(screen.getByLabelText('Close size'), '151.202');
 
     expect(screen.queryByText(/close size exceeds position/)).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Close now ▸' })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Close now' })).toBeEnabled());
   });
 
   it('holding "Close now" POSTs a reduce-only banded close deal (no review modal)', async () => {
@@ -127,7 +144,7 @@ describe('ClosePopover', () => {
     );
     renderWithClient(<ClosePopover position={ethPosition} onDismiss={() => {}} />);
 
-    const btn = await screen.findByRole('button', { name: 'Close now ▸' });
+    const btn = await screen.findByRole('button', { name: 'Close now' });
     await waitFor(() => expect(btn).toBeEnabled());
     fireEvent.pointerDown(btn);
     await waitFor(() => expect(dealCalls).toHaveLength(1), { timeout: 2_000 });
@@ -149,7 +166,7 @@ describe('ClosePopover', () => {
    */
   describe('reporting what it closed', () => {
     const executed = async () => {
-      const btn = await screen.findByRole('button', { name: 'Close now ▸' });
+      const btn = await screen.findByRole('button', { name: 'Close now' });
       await waitFor(() => expect(btn).toBeEnabled());
       fireEvent.pointerDown(btn);
     };
@@ -230,7 +247,7 @@ describe('ClosePopover', () => {
     server.use(...baseHandlers(), closePreviewHandler());
     renderWithClient(<ClosePopover position={ethPosition} onDismiss={() => {}} />);
 
-    const btn = await screen.findByRole('button', { name: 'Close now ▸' });
+    const btn = await screen.findByRole('button', { name: 'Close now' });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.hover(btn);
 
@@ -250,7 +267,7 @@ describe('ClosePopover', () => {
     );
     renderWithClient(<ClosePopover position={ethPosition} onDismiss={() => {}} />);
 
-    const btn = await screen.findByRole('button', { name: 'Close now ▸' });
+    const btn = await screen.findByRole('button', { name: 'Close now' });
     await waitFor(() => expect(btn).toBeEnabled());
     fireEvent.pointerDown(btn);
 
@@ -303,7 +320,7 @@ describe('ClosePopover — sizing a close in dollars', () => {
     await userEvent.clear(screen.getByLabelText('Close value'));
     await userEvent.type(screen.getByLabelText('Close value'), '200');
     expect(await screen.findByText(/close size exceeds position/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Close now ▸' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Close now' })).toBeDisabled();
   });
 
   it('falls back to COIN units when the mark is unusable — never sends dollars as qty', async () => {
@@ -324,6 +341,24 @@ describe('ClosePopover — sizing a close in dollars', () => {
     expect(screen.queryByLabelText('Close value')).not.toBeInTheDocument();
     expect(screen.queryByRole('radiogroup', { name: 'Close size unit' })).not.toBeInTheDocument();
     // And the limit is stated in coins, so 2 (> 1.89) is refused.
+    await userEvent.clear(screen.getByLabelText('Close qty'));
+    await userEvent.type(screen.getByLabelText('Close qty'), '2');
+    expect(await screen.findByText(/close size exceeds position \(1\.89 HYPE\)/)).toBeInTheDocument();
+  });
+
+  it('drops the USD unit when the mark is one the server remembered', async () => {
+    server.use(...baseHandlers(), closePreviewHandler());
+    renderWithClient(
+      <ClosePopover
+        position={makeCrossexPosition({ ...hypePosition, markHeldSinceMs: Date.parse('2026-09-21T14:32:00Z') })}
+        onDismiss={() => {}}
+      />,
+    );
+    await screen.findByText(/limit px/i);
+
+    expect(screen.getByLabelText('Close qty')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Close value')).not.toBeInTheDocument();
+    expect(screen.queryByRole('radiogroup', { name: 'Close size unit' })).not.toBeInTheDocument();
     await userEvent.clear(screen.getByLabelText('Close qty'));
     await userEvent.type(screen.getByLabelText('Close qty'), '2');
     expect(await screen.findByText(/close size exceeds position \(1\.89 HYPE\)/)).toBeInTheDocument();
@@ -433,6 +468,6 @@ describe('ClosePopover — the conversion mark is latched at open', () => {
     await userEvent.type(screen.getByLabelText('Close value'), max);
 
     expect(screen.queryByText(/close size exceeds position/)).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Close now ▸' })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Close now' })).toBeEnabled());
   });
 });

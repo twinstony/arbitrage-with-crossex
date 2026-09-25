@@ -30,12 +30,14 @@ import {
 import {
   buildOpportunities,
   groupBorosMarkets,
+  normalizeUnderlying,
   type BorosEntryMode,
   type EntryMode,
   type ExitMode,
   type OpportunitiesResult,
 } from '../../core/boros/opportunities';
 import { normalizeVenue } from '../../core/boros/venue';
+import { isSupportedCoin } from '../../core/coins';
 import { BOOK_VENUES, fetchVenueBook, type NormalizedBook } from '../../core/estimate/books';
 import {
   feeRowsForTier,
@@ -216,12 +218,15 @@ export async function scanOpportunities(
   const takerFeeOverride = Number.isFinite(envTakerFee) ? envTakerFee : undefined;
   const { notionalUsd, borosEntry, entryMode, exitMode, feeTier, fresh } = params;
 
-  const { value: markets, stale } = await deps.cache.get(
+  const { value: allMarkets, stale } = await deps.cache.get(
     'boros:markets',
     TTL.boros,
     () => fetchBorosMarkets(fetchImpl),
     { fresh },
   );
+  // 上游 1.7.2：只保留受支持的币种 —— CrossEx 不认识的基础币无法挂对冲腿，
+  // 提前过滤掉可避免它们进入机会计算（与上游内联版行为一致）。
+  const markets = allMarkets.filter((m) => isSupportedCoin(normalizeUnderlying(m.base)));
 
   // The CrossEx universe decides which Boros market can carry a perp leg.
   // Losing it (no keys, rate limit, outage) leaves the Boros spreads intact,

@@ -1,3 +1,4 @@
+import { Check } from 'lucide-react';
 import { useId, useState, type FormEvent } from 'react';
 import { ApiError } from '../api/client';
 import { usePutCredentials } from '../api/queries';
@@ -6,7 +7,18 @@ import { Spinner } from './Spinner';
 /** Shared key/secret form (first-run setup guide + Settings drawer).
  * A 404/405/network failure on PUT (a backend without the credentials service)
  * renders as a friendly inline message rather than a raw error. */
-export function CredentialsForm({ submitLabel = 'Save credentials' }: { submitLabel?: string }) {
+function refusedText(err: unknown): string | null {
+  if (!(err instanceof ApiError) || err.category !== 'auth') return null;
+  return `Gate refused this key: ${err.label ?? err.message.replace(/\.$/, '')}. Check you pasted the whole key.`;
+}
+
+export function CredentialsForm({
+  submitLabel = 'Save credentials',
+  onSaved,
+}: {
+  submitLabel?: string;
+  onSaved?: () => void;
+}) {
   const keyId = useId();
   const secretId = useId();
   const [key, setKey] = useState('');
@@ -25,6 +37,7 @@ export function CredentialsForm({ submitLabel = 'Save credentials' }: { submitLa
           setSaved(true);
           setKey('');
           setSecret('');
+          onSaved?.();
         },
       },
     );
@@ -34,6 +47,7 @@ export function CredentialsForm({ submitLabel = 'Save credentials' }: { submitLa
   const serviceMissing =
     err instanceof ApiError &&
     (err.httpStatus === 404 || err.httpStatus === 405 || err.category === 'network');
+  const refused = refusedText(err);
 
   return (
     <form onSubmit={onSubmit} className="flex flex-col gap-3">
@@ -71,6 +85,10 @@ export function CredentialsForm({ submitLabel = 'Save credentials' }: { submitLa
           <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
             credentials service not available yet
           </p>
+        ) : refused ? (
+          <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+            {refused}
+          </p>
         ) : (
           <p className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
             {err instanceof ApiError ? err.message : String(err)}
@@ -80,13 +98,13 @@ export function CredentialsForm({ submitLabel = 'Save credentials' }: { submitLa
 
       {saved && !put.isPending && err == null && (
         <p className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
-          Credentials saved ✓
+          Credentials saved <Check size={12} aria-hidden className="inline" />
         </p>
       )}
 
-      <button type="submit" className="btn btn-primary" disabled={put.isPending || !key.trim() || !secret.trim()}>
+      <button type="submit" className="btn btn-primary self-start" disabled={put.isPending || !key.trim() || !secret.trim()}>
         {put.isPending && <Spinner />}
-        {submitLabel}
+        {put.isPending ? 'Checking with Gate…' : submitLabel}
       </button>
     </form>
   );

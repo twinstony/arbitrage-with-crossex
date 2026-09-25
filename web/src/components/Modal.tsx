@@ -1,6 +1,7 @@
+import { X } from 'lucide-react';
 import { useEffect, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { useFocusTrap } from '../lib/focusTrap';
+import { claimEscape, useFocusTrap } from '../lib/focusTrap';
 
 interface Props {
   title: ReactNode;
@@ -34,7 +35,7 @@ export function Modal({ title, locked = false, onClose, widthClass = 'w-[700px]'
       // e.repeat: a HELD Escape auto-repeats, and surfaces with an arm-then-
       // confirm close guard (the wizard's leave warning) would see the repeat
       // as the confirming second call.
-      if (e.key === 'Escape' && !e.repeat) onClose();
+      if (e.key === 'Escape' && !e.repeat && claimEscape(e, panel.current)) onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -56,7 +57,7 @@ export function Modal({ title, locked = false, onClose, widthClass = 'w-[700px]'
               aria-label="close"
               className="rounded-md px-2 py-0.5 text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-100"
             >
-              ✕
+              <X size={14} aria-hidden />
             </button>
           )}
         </div>

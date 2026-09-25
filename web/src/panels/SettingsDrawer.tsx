@@ -1,93 +1,69 @@
-import { useBorosAgent, useCredentials, useVersion } from '../api/queries';
-import { CredentialsForm } from '../components/CredentialsForm';
+import { useState } from 'react';
+import { useVersion } from '../api/queries';
 import { Drawer } from '../components/Drawer';
-import { AddressForm } from './HomeControls';
-import { useTrackedAddress } from './trackedAddress';
+import { GithubMark } from '../components/GithubMark';
+import { REPO_URL } from '../lib/app';
+import type { SetupStep } from './setup/setupState';
+import { SetupRows } from './setup/SetupRows';
 
-/** Settings drawer: the tracked Boros address, masked key display, and the
- * replace-credentials form. */
-export function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { data } = useCredentials();
-  const { address, setAddress } = useTrackedAddress();
+export function SettingsDrawer({
+  open,
+  onClose,
+  focusStep = null,
+}: {
+  open: boolean;
+  onClose: () => void;
+  focusStep?: SetupStep | null;
+}) {
   const version = useVersion(); // same query key as the header pill — deduped
   const install = version.data?.install ?? null;
-  // The wallet this install's agent key trades (BOROS_ROOT_ADDRESS). Tracking
-  // a different one is allowed — it is read-only — but every Boros order form
-  // then prices one account and signs for another, so the way back is one click.
-  const tradingRoot = useBorosAgent().data?.root?.toLowerCase() ?? null;
-  const tracksTradingWallet = tradingRoot !== null && address?.toLowerCase() === tradingRoot;
+  const [openStep, setOpenStep] = useState<SetupStep | null>(open ? focusStep : null);
+  const [committed, setCommitted] = useState({ open, focusStep });
+  if (committed.open !== open || committed.focusStep !== focusStep) {
+    setCommitted({ open, focusStep });
+    if (open) setOpenStep(focusStep);
+  }
 
   return (
     <Drawer open={open} title="Settings" onClose={onClose}>
       <div className="flex flex-col gap-6">
+        {/* Named like the first-run checklist ("Set up the terminal"), so the
+            three rows read as the same setup, reopened (his call 2026-09-23). */}
         <section>
           <h3 className="mb-2 text-[12px] font-normal leading-[14.52px] text-ink-300">
-            Tracked Boros address
+            Terminal setup
           </h3>
-          <p className="mb-2 text-xs leading-relaxed text-ink-400">
-            The EVM address holding your Boros legs. The terminal matches them with your Gate perp
-            legs to show your locked and realized return, net of all costs.
-          </p>
-          {/* No read-only card above the field: it printed the very address the
-              input below is pre-filled with, so the drawer showed it twice. */}
-          {!address && (
-            <div className="mb-2 text-xs text-ink-400">Not tracking any address.</div>
-          )}
-          {/* Remount on change so the input picks up the new address. */}
-          <AddressForm
-            key={address ?? 'none'}
-            full
-            initial={address ?? ''}
-            submitLabel={address ? 'Update' : 'Track'}
-            onTrack={setAddress}
+          <SetupRows
+            openStep={openStep}
+            onOpenStep={setOpenStep}
+            onDone={() => setOpenStep(null)}
+            variant="settings"
           />
-          {tradingRoot !== null && !tracksTradingWallet && (
-            <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/[0.05] px-3 py-2 text-[11.5px] leading-relaxed text-amber-100">
-              {address ? 'This is not the wallet your agent key trades, so Boros orders from here will be refused.' : 'Your agent key trades a wallet you can track in one click.'}{' '}
-              <button type="button" className="btn-link" onClick={() => setAddress(tradingRoot)}>
-                Track trading wallet ({tradingRoot.slice(0, 6)}…{tradingRoot.slice(-4)})
-              </button>
-            </div>
-          )}
-          {address && (
-            <button
-              type="button"
-              className="btn-ghost-xs mt-2"
-              onClick={() => setAddress(null)}
-            >
-              Stop tracking
-            </button>
-          )}
-        </section>
-
-        <section>
-          <h3 className="mb-2 text-[12px] font-normal leading-[14.52px] text-ink-300">
-            Gate API key
-          </h3>
-          <div className="card num px-4 py-3 text-sm text-ink-200">
-            {data?.configured ? data.keyMasked ?? '(configured)' : 'not configured'}
-          </div>
-        </section>
-
-        <section>
-          <h3 className="mb-2 text-[12px] font-normal leading-[14.52px] text-ink-300">
-            Replace credentials
-          </h3>
-          <CredentialsForm submitLabel="Replace credentials" />
         </section>
         <section>
           <h3 className="mb-2 text-[12px] font-normal leading-[14.52px] text-ink-300">
             About
           </h3>
           <div className="flex flex-col gap-[5px] rounded border border-ink-700 px-3 py-[11px] text-[11.5px] text-ink-100">
-            <div className="num">
-              Version {version.data?.current ?? 'unknown'}
-              {/* Gold, not a button: an available update is a FACT about this
-                  install, and the upgrade runs through the installer, not from
-                  in here. Colouring it is what makes it noticed. */}
-              {version.data?.updateAvailable && version.data.latest ? (
-                <span className="text-gold"> — v{version.data.latest} available</span>
-              ) : null}
+            <div className="flex items-baseline justify-between gap-3">
+              <div className="num">
+                Version {version.data?.current ?? 'unknown'}
+                {/* Gold, not a button: an available update is a FACT about this
+                    install, and the upgrade runs through the installer, not from
+                    in here. Colouring it is what makes it noticed. */}
+                {version.data?.updateAvailable && version.data.latest ? (
+                  <span className="text-gold"> — v{version.data.latest} available</span>
+                ) : null}
+              </div>
+              <a
+                href={REPO_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex shrink-0 items-center gap-1.5 text-ink-300 hover:text-ink-100"
+              >
+                <GithubMark size={13} />
+                GitHub
+              </a>
             </div>
             {/* Which code is actually running: the installer records the exact
                 commit it laid down, so "did I install what I audited?" has an

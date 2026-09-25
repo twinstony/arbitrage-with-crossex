@@ -35,7 +35,7 @@ import type { AssetGroup, AssetViewResponse, CrossexAccount } from '../../web/sr
 import { readTelegramConfig } from '../../src/server/notify/telegram';
 
 function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
-  const leg = (venue: string, execApr: number | null, midApr: number, marketId: number) => ({
+  const leg = (venue: string, execApr: number | null, midApr: number, marketId: number, settleFeeApr = 0.001) => ({
     marketId,
     venue,
     crossexVenue: venue,
@@ -43,11 +43,12 @@ function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
     base: 'BTC',
     midApr,
     execApr,
+    settleFeeApr,
   });
   return {
     base: 'BTC',
-    shortLeg: leg('BINANCE', 0.082, 0.081, 1),
-    longLeg: leg('BYBIT', 0.031, 0.032, 2),
+    shortLeg: leg('BINANCE', 0.082, 0.081, 1, 0.001),
+    longLeg: leg('BYBIT', 0.031, 0.032, 2, 0.001),
     grossSpreadApr: 0.049,
     execSpreadApr: 0.051,
     borosImpactApr: -0.002,
@@ -368,6 +369,7 @@ function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
   const maturity = NOW_SEC + 30 * DAY_SEC;
   return {
     base: 'ETH',
+    supported: true,
     priceUsd: 2000,
     earliestSec: NOW_SEC - 180 * DAY_SEC,
     perpOpen: [
@@ -471,9 +473,11 @@ function makeAssetView(groups: AssetGroup[], over: Partial<AssetViewResponse> = 
   return {
     sinceSec: 0,
     nowSec: NOW_SEC,
+    defaultSinceSec: null,
     assets: groups,
+    supportedCoins: [],
     earliestSec: NOW_SEC - 180 * DAY_SEC,
-    coverage: { settlementsFromSec: 0, perpClosedFromSec: 0, borosTxnsComplete: true },
+    coverage: { settlementsFromSec: 0, perpClosedFromSec: 0, borosTxnsComplete: true, backfilling: false },
     interest: { paidUsd: 0, byCoin: {}, coversFromSec: 0, available: true },
     warnings: [],
     ...over,

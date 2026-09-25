@@ -11,12 +11,8 @@
  *  - Closed perps: /crossex/history_positions — the venue reports each closed
  *    position's whole-lifetime closedPnl, fundingFee and fee directly.
  *  - Boros (open AND closed, uniformly): the per-settlement event ledger plus
- *    /pnl/transactions fills, both timestamped, summed per market since the
+ *    the per-market fill feed, both timestamped, summed per market since the
  *    start instant. The live zones feed adds the open legs' MtM and IM.
- *
- * Nothing is reconstructed and nothing is stored: the response is a pure
- * function of (address, since, venue records), so the same inputs render the
- * same numbers on any device.
  *
  * Double-count guard: a Boros OPEN leg's cumulative `rateSettlementPnl` and
  * the settlement-events sums cover the same flows. The per-leg figure is
@@ -29,26 +25,39 @@
  */
 import type { FastifyInstance } from 'fastify';
 import {
+  createRequestPacer,
   fetchBorosCollaterals,
   fetchBorosMarket,
   fetchBorosMarkets,
   fetchBorosTransactions,
-  fetchSettlementEvents,
+  settlementWindow,
+  syncSettlementLedger,
+  type BorosSettlementLedger,
   norm18,
+  readSettlementHead,
   resolveBorosFetch,
   resolveCollateralPricesUsd,
   BOROS_TOKEN_SYMBOLS,
   type BorosMarket,
+  type BorosTxn,
   type FetchLike,
 } from '../../core/boros/client';
 import { normalizeVenue, type PerpPositionLike } from '../../core/boros/venue';
+import { isSupportedCoin, SUPPORTED_COINS } from '../../core/coins';
 import { classifyGateError, CoreError } from '../../core/errors';
+import { rememberMarks } from '../../core/marks';
 import { parseSymbol } from '../../core/numbers';
 import type { AppDeps } from '../app';
 import { TTL } from '../cache';
+import { currentRebateClient, loggedInRoot } from '../borosRebate';
 import { GATE_HISTORY_FLOOR_MS, INTEREST_MAX_PAGES, INTEREST_PAGE_SIZE } from '../interestLedger';
+import { LedgerStore } from '../ledgerStore';
+import { earliestSupportedOpenMs, TrackingStartFile } from '../trackingStart';
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Boros allows 200 computing units per IP per minute, measured against its live rate-limit headers on 2026-09-21. */
+export const BOROS_LIVE_TTL_MS = 60_000;
 
 // The venue pages newest-first at up to 1,000 rows; 100 pages is the same
 // ceiling the persisted interest ledger uses. With `from` set to the window
@@ -133,7 +142,7 @@ export interface AssetBorosOpenOut {
   /** |notionalSize| in the collateral token. */
   sizeToken: number;
   notionalUsd: number;
-  entryApr: number;
+  entryApr: number | null;
   markApr: number;
   floatingApr: number;
   /** Cumulative settlement of the CURRENT position, net of settle fees.
@@ -165,6 +174,10 @@ export interface AssetBorosHistoryOut {
   settleUsd: number;
   /** The fees inside that net, positive cost (display; do not re-subtract). */
   settleFeeUsd: number;
+  /** Σ CrossEx settlement-fee rebate the backend attributed to this market's
+   * settlements inside the window — a positive credit ADDED BACK to PnL, never
+   * a re-netting. 0 when the account is not rebated. */
+  rebateUsd: number;
   /** Σ realized trade PnL, net of trade fees. */
   tradePnlUsd: number;
   /** The trade fees inside that net, positive cost (display; do not re-subtract). */
@@ -191,6 +204,7 @@ export interface AssetBorosHistoryOut {
 
 export interface AssetGroupOut {
   base: string;
+  supported: boolean;
   /** USD price of the underlying (0 = no live market to price it from). */
   priceUsd: number;
   /** Earliest activity instant that entered THIS asset's sums (APR clock). */
@@ -204,7 +218,9 @@ export interface AssetGroupOut {
 export interface AssetViewOut {
   sinceSec: number;
   nowSec: number;
+  defaultSinceSec: number | null;
   assets: AssetGroupOut[];
+  supportedCoins: string[];
   /** Earliest activity instant that entered any sum (unix sec) — the APR
    * clock floor; null when nothing was found at all. */
   earliestSec: number | null;
@@ -214,6 +230,7 @@ export interface AssetViewOut {
     /** Oldest closed-position row read when the page cap was hit; 0 = complete. */
     perpClosedFromSec: number;
     borosTxnsComplete: boolean;
+    backfilling: boolean;
   };
   /** Margin-borrow interest the CrossEx account paid inside the window.
    * ACCOUNT-level: the venue books it per liability coin, not per market,
@@ -294,8 +311,19 @@ interface HistoryPositionLike {
   openAvgPrice?: string;
   closedAvgPrice?: string;
   closedQty?: string;
+  createTime?: string;
   updateTime?: string;
+  userId?: string;
 }
+
+const oldestSec = (rows: HistoryPositionLike[]): number => {
+  let oldest = Number.POSITIVE_INFINITY;
+  for (const r of rows) {
+    const t = fin(r.updateTime);
+    if (t > 0) oldest = Math.min(oldest, epochToSec(t));
+  }
+  return oldest;
+};
 
 async function fetchClosedPositions(
   deps: AppDeps,
@@ -317,26 +345,793 @@ async function fetchClosedPositions(
     if (batch.length < PAGE_LIMIT) break;
     if (page === MAX_PAGES) capped = true;
   }
-  let oldest = Number.POSITIVE_INFINITY;
-  for (const r of rows) {
-    const t = fin(r.updateTime);
-    if (t > 0) oldest = Math.min(oldest, epochToSec(t));
-  }
+  const oldest = oldestSec(rows);
   return { rows, coversFromSec: capped && Number.isFinite(oldest) ? oldest : 0 };
 }
 
-export function assetViewRoutes(deps: AppDeps) {
+export interface AssetViewParams {
+  address: string;
+  requestedSinceSec: number | null;
+  legSince: Map<number, number>;
+  fresh: boolean;
+}
+
+export function createAssetViewBuilder(deps: AppDeps) {
+  // Last synced ledger per address — the next sync reads only rows newer than its head.
+  const settlementLedgers = new Map<string, BorosSettlementLedger>();
+  const backfills = new Set<string>();
+  const lastFills = new Map<string, { txns: BorosTxn[]; complete: boolean }>();
+  const ledgerStore = new LedgerStore(deps.dataDir);
+  const trackingStart = new TrackingStartFile(deps.dataDir);
+  const pace = createRequestPacer({
+    perMinute: 30,
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  });
   const fetchImpl: FetchLike = resolveBorosFetch(deps.borosFetch);
 
+  const keepLedger = (
+    address: string,
+    prev: BorosSettlementLedger | undefined,
+    next: BorosSettlementLedger,
+  ): void => {
+    settlementLedgers.set(address, next);
+    const unchanged =
+      prev !== undefined &&
+      prev.coversFromSec === next.coversFromSec &&
+      prev.rows.length === next.rows.length &&
+      prev.rows[0]?.id === next.rows[0]?.id;
+    if (!unchanged) ledgerStore.write(address, next);
+  };
+
+  const startSync = (address: string, floorSec: number): void => {
+    if (backfills.has(address)) return;
+    const prev = settlementLedgers.get(address);
+    backfills.add(address);
+    syncSettlementLedger(fetchImpl, address, 0, prev, { floorSec, pace })
+      .then((next) => {
+        keepLedger(address, prev, next);
+        deps.cache.bust(`boros:settlements:${address}`);
+      })
+      .catch(() => undefined)
+      .finally(() => backfills.delete(address));
+  };
+
+  const syncHead = async (address: string, floorSec: number): Promise<BorosSettlementLedger> => {
+    const prev = settlementLedgers.get(address) ?? ledgerStore.read(address) ?? undefined;
+    const next = await readSettlementHead(fetchImpl, address, 0, prev, pace);
+    if (next !== null) {
+      if (!backfills.has(address)) keepLedger(address, prev, next);
+      return next;
+    }
+    if (prev) settlementLedgers.set(address, prev);
+    startSync(address, floorSec);
+    return prev ?? { rows: [], coversFromSec: Math.floor(Date.now() / 1000) };
+  };
+
+  const readLedger = async (address: string, floorSec: number, fresh: boolean): Promise<BorosSettlementLedger> => {
+    const running = backfills.has(address) ? settlementLedgers.get(address) : undefined;
+    if (running) return running;
+    const { value } = await deps.cache.get(
+      `boros:settlements:${address}`,
+      BOROS_LIVE_TTL_MS,
+      () => syncHead(address, floorSec),
+      { fresh },
+    );
+    return value;
+  };
+
+  /**
+   * (marketId:timeSec) → the rebate amount (token units) the backend attributed
+   * to that settlement. Empty unless this install is logged in AS `address` (the
+   * rebate is the agent-owner's, keyed on the root) and the read succeeds — every
+   * failure degrades to no rebate, so a rebate lookup never breaks the view.
+   * The backend is the single source of truth for the amount; the terminal only
+   * joins it onto the settlements it already windows.
+   */
+  const readRebateByEvent = async (
+    address: string,
+    fromSec: number,
+    fresh: boolean,
+  ): Promise<Map<string, number>> => {
+    if (loggedInRoot() !== address) return new Map();
+    const client = currentRebateClient(deps);
+    if (!client) return new Map();
+    try {
+      const { value } = await deps.cache.get(
+        `boros:rebate-settlements:${address}:${fromSec}`,
+        TTL.boros,
+        async () => {
+          const rows = await client.settlements(fromSec);
+          const map = new Map<string, number>();
+          for (const r of rows) {
+            const key = `${r.marketId}:${r.timestamp}`;
+            map.set(key, (map.get(key) ?? 0) + norm18(r.rebateX18));
+          }
+          return map;
+        },
+        { fresh },
+      );
+      return value;
+    } catch {
+      return new Map();
+    }
+  };
+
+  return async function buildAssetView(params: AssetViewParams): Promise<AssetViewOut> {
+    const { address, requestedSinceSec, legSince, fresh } = params;
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const warnings: string[] = [];
+
+    let perpPositions: PerpPositionLike[] = [];
+    let perpAvailable = true;
+    try {
+      const { value } = await deps.cache.get(
+        'positions',
+        TTL.live,
+        async () => (await deps.getClients().crossEx.listCrossexPositions()).body,
+        { fresh },
+      );
+      perpPositions = rememberMarks(value as PerpPositionLike[]).rows;
+    } catch (err) {
+      perpAvailable = false;
+      const category = classifyGateError(err).category;
+      if (category !== 'not-configured') {
+        warnings.push(
+          `Couldn't load Gate positions right now (${category}) — showing the Boros side only.`,
+        );
+      }
+    }
+
+    let closedRows: HistoryPositionLike[] = [];
+    let closedAvailable = false;
+    let perpClosedFromSec = 0;
+    if (perpAvailable) {
+      try {
+        const { value } = await deps.cache.get(
+          'crossex:closed-positions',
+          TTL.boros,
+          () => fetchClosedPositions(deps),
+          { fresh },
+        );
+        closedRows = value.rows;
+        perpClosedFromSec = value.coversFromSec;
+        closedAvailable = true;
+      } catch (err) {
+        const category = classifyGateError(err).category;
+        warnings.push(
+          `Couldn't load closed-position history (${category}) — totals cover open positions and Boros only.`,
+        );
+      }
+    }
+
+    let defaultSinceSec: number | null = null;
+    {
+      const gateRows: Array<{ symbol?: string; createTime?: string; userId?: unknown }> = [
+        ...perpPositions,
+        ...closedRows,
+      ];
+      const owner = gateRows.find((r) => r.userId !== undefined && r.userId !== null && r.userId !== '')?.userId;
+      const userId = owner === undefined ? null : String(owner);
+      const saved = trackingStart.read();
+      if (saved && (userId === null || saved.userId === userId)) {
+        defaultSinceSec = Math.floor(saved.firstOpenMs / 1000);
+      } else if (perpAvailable && closedAvailable) {
+        const firstOpenMs = earliestSupportedOpenMs(gateRows);
+        if (firstOpenMs !== null) {
+          trackingStart.write({ userId: userId ?? '', firstOpenMs });
+          defaultSinceSec = Math.floor(firstOpenMs / 1000);
+        }
+      }
+    }
+
+    const sinceSec = requestedSinceSec ?? defaultSinceSec ?? 0;
+    const floorFor = (marketId: number): number => Math.max(sinceSec, legSince.get(marketId) ?? 0);
+
+    // --- Boros reads (shared cache keys with the strategy feed) ----------
+    const marketsP = deps.cache
+      .get('boros:markets', TTL.boros, () => fetchBorosMarkets(fetchImpl), { fresh })
+      .then((r) => r.value);
+    const [markets, zones, ledger] = await Promise.all([
+      marketsP,
+      marketsP.then((ms) =>
+        deps.cache
+          .get(`boros:collaterals:${address}`, TTL.boros, () => fetchBorosCollaterals(fetchImpl, address, ms), {
+            fresh,
+          })
+          .then((r) => r.value),
+      ),
+      readLedger(address, sinceSec, fresh),
+    ]);
+    const settlements = settlementWindow(ledger, sinceSec);
+    // Backend-provided per-settlement rebate amounts, joined onto the windowed
+    // events by (marketId, timeSec). Nothing before the program start is ever
+    // rebated, so the backend returns none — the client passes `sinceSec` and
+    // lets the backend bound it.
+    const rebateByEvent = await readRebateByEvent(address, sinceSec, fresh);
+
+    const marketById = new Map<number, BorosMarket>(markets.map((m) => [m.marketId, m]));
+    const collateralPriceUsd = resolveCollateralPricesUsd(markets);
+    const tokenPrice = (tokenId: number): number | null => collateralPriceUsd.get(tokenId) ?? null;
+
+    // Txns for EVERY zone the account has — history sums must include
+    // markets whose positions are long gone, and a fill's zone is the
+    // token it settled in, position or not.
+    //
+    // The fill feed is keyed by (marketAcc, marketId) and refuses to answer
+    // without a marketId, so each zone's id set is BUILT: every market the
+    // account ever settled (the ledger above, not just the window),
+    // plus the ones it holds right now. Its coverage is that sweep's own.
+    const txnsComplete: boolean[] = [];
+    const txnsByToken = new Map<
+      number,
+      Array<{ marketId: number; time: number; pnlTok: number; feeTok: number; fixedApr: number; prev: number; post: number }>
+    >(
+      await Promise.all(
+        zones.map(async (z): Promise<[number, Array<{ marketId: number; time: number; pnlTok: number; feeTok: number; fixedApr: number; prev: number; post: number }>]> => {
+          const pairs = new Map<string, { marketAcc: string; marketId: number; live: boolean }>();
+          for (const a of settlements.pairs) {
+            if (a.tokenId !== z.tokenId) continue;
+            pairs.set(`${a.marketAcc.toLowerCase()}:${a.marketId}`, { ...a, live: false });
+          }
+          for (const g of [z.cross, ...z.isolated]) {
+            if (!g) continue;
+            for (const p of g.marketPositions) {
+              pairs.set(`${g.marketAcc.toLowerCase()}:${p.marketId}`, {
+                marketAcc: g.marketAcc,
+                marketId: p.marketId,
+                live: true,
+              });
+            }
+          }
+          // One cache entry per (marketAcc, marketId), so a newly traded
+          // market does not invalidate the rest of the zone. A market the
+          // zone no longer holds takes no new fills, so it refreshes slowly.
+          const perMarket = await Promise.all(
+            [...pairs.values()].map(async ({ marketAcc, marketId, live }) => {
+              const key = `boros:txns:${marketAcc}:${marketId}:${live ? 'live' : 'past'}`;
+              const { value } = await deps.cache.get(
+                key,
+                live ? BOROS_LIVE_TTL_MS : TTL.borosHistory,
+                async () => {
+                  const read = await fetchBorosTransactions(fetchImpl, marketAcc, marketId, {
+                    pace,
+                    prev: lastFills.get(key),
+                  });
+                  lastFills.set(key, read);
+                  return read;
+                },
+                { fresh },
+              );
+              return value;
+            }),
+          );
+          for (const v of perMarket) txnsComplete.push(v.complete);
+          return [
+            z.tokenId,
+            perMarket.flatMap((v) =>
+              v.txns.map((t) => ({
+                marketId: t.marketId,
+                time: t.time,
+                pnlTok: norm18(t.pnl),
+                feeTok: Math.abs(norm18(t.fee)),
+                fixedApr: Number(t.fixedApr),
+                prev: norm18(t.prevPositionS ?? '0'),
+                post: norm18(t.postPositionS ?? '0'),
+              })),
+            ),
+          ];
+        }),
+      ),
+    );
+
+    // The listing serves LIVE markets only — a matured market drops out of
+    // it, taking its history's asset/venue mapping with it. Resolve every
+    // id the account's history references but the listing lacks through the
+    // by-id endpoint (which still serves matured markets); metadata of a
+    // matured market is immutable, so these ride the long static TTL.
+    {
+      const referenced = new Set<number>();
+      for (const ev of settlements.events) referenced.add(ev.marketId);
+      for (const txns of txnsByToken.values()) for (const t of txns) referenced.add(t.marketId);
+      const unknown = [...referenced].filter((id) => !marketById.has(id));
+      const resolved = await Promise.all(
+        unknown.map(async (id) => {
+          try {
+            const { value } = await deps.cache.get(`boros:market:${id}`, TTL.static, () =>
+              fetchBorosMarket(fetchImpl, id),
+            );
+            return value;
+          } catch {
+            return null; // stays unmapped; counted into the warning below
+          }
+        }),
+      );
+      for (const m of resolved) if (m) marketById.set(m.marketId, m);
+    }
+
+    /**
+     * WINDOWED open-leg funding and fees (only when a start date is set).
+     * The venue's cumulative fundingFee/fee cover the position's whole
+     * life; a window starting mid-life must count only in-window flows.
+     * The account book has one FUNDING_FEE row per tick per position —
+     * and each row is the amount actually paid AT THE SIZE OF THAT TICK,
+     * so summing in-window rows is exact through resizes (a 1000→500 cut
+     * before the window contributes only 500-sized rows inside it). Fees
+     * come from the per-fill history the same way. If a ledger cannot
+     * reach the window start, the cumulative stands with a warning.
+     */
+    let fundingWindow: Map<string, number> | null = null; // positionId → USD
+    let feesWindow: Map<string, number> | null = null; // symbol → USD
+    if (perpAvailable && sinceSec > 0) {
+      try {
+        const { value } = await deps.cache.get(
+          `crossex:funding-window:${Math.floor(sinceSec / 3600)}`,
+          TTL.boros,
+          async () => {
+            const rows: Array<{ businessId?: string; change?: string; createTime?: string }> = [];
+            let capped = true;
+            for (let page = 1; page <= 25; page += 1) {
+              const { body } = await deps.getClients().crossEx.listCrossexAccountBook({
+                statementType: 'FUNDING_FEE',
+                from: sinceSec * 1000 - 3_600_000,
+                limit: PAGE_LIMIT,
+                page,
+              });
+              rows.push(...(body as typeof rows));
+              if ((body as unknown[]).length < PAGE_LIMIT) {
+                capped = false;
+                break;
+              }
+            }
+            const byPosition = new Map<string, number>();
+            for (const r of rows) {
+              const pid = String(r.businessId ?? '').split('_')[0];
+              const t = fin(r.createTime);
+              const usd = Number(r.change);
+              if (!pid || !Number.isFinite(usd) || epochToSec(t) < sinceSec) continue;
+              byPosition.set(pid, (byPosition.get(pid) ?? 0) + usd);
+            }
+            return { byPosition, capped };
+          },
+          { fresh },
+        );
+        fundingWindow = value.byPosition;
+        if (value.capped) {
+          warnings.push(
+            'The funding ledger read hit its page cap before covering the whole window — windowed funding may be missing early ticks.',
+          );
+        }
+      } catch {
+        warnings.push(
+          'Funding ledger unavailable — open-leg funding shows whole-position cumulatives despite the start date.',
+        );
+      }
+      try {
+        const { value } = await deps.cache.get(
+          `crossex:fees-window:${Math.floor(sinceSec / 3600)}`,
+          TTL.boros,
+          async () => {
+            const bySymbol = new Map<string, number>();
+            let capped = true;
+            for (let page = 1; page <= 25; page += 1) {
+              const { body } = await deps.getClients().crossEx.listCrossexHistoryTrades({
+                page,
+                limit: PAGE_LIMIT,
+                from: sinceSec * 1000,
+              });
+              for (const f of body as Array<{ symbol?: string; fee?: string }>) {
+                const sym = String(f.symbol ?? '');
+                if (!sym) continue;
+                bySymbol.set(sym, (bySymbol.get(sym) ?? 0) + Math.abs(Number(f.fee) || 0));
+              }
+              if ((body as unknown[]).length < PAGE_LIMIT) {
+                capped = false;
+                break;
+              }
+            }
+            return { bySymbol, capped };
+          },
+          { fresh },
+        );
+        feesWindow = value.bySymbol;
+        if (value.capped) {
+          warnings.push(
+            'The fill-history read hit its page cap before covering the whole window — windowed perp fees may be missing early fills.',
+          );
+        }
+      } catch {
+        warnings.push(
+          'Fill history unavailable — perp fees show whole-position cumulatives despite the start date.',
+        );
+      }
+    }
+
+    // --- Group by asset --------------------------------------------------
+    const groups = new Map<string, AssetGroupOut>();
+    const groupFor = (base: string): AssetGroupOut => {
+      const key = base.toUpperCase();
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          base: key,
+          supported: isSupportedCoin(key),
+          priceUsd: 0,
+          earliestSec: null,
+          perpOpen: [],
+          perpClosed: [],
+          borosOpen: [],
+          borosHistory: [],
+        };
+        groups.set(key, g);
+      }
+      return g;
+    };
+    const seen = (g: AssetGroupOut, t: number | null | undefined): void => {
+      if (!t || !Number.isFinite(t) || t <= 0) return;
+      if (g.earliestSec === null || t < g.earliestSec) g.earliestSec = t;
+    };
+
+    const openFeesBySymbol = new Map<string, number>();
+    for (const pos of perpPositions) {
+      const qty = fin(pos.positionQty);
+      if (qty === 0) continue;
+      const { exchange, base } = parseSymbol(pos.symbol ?? '');
+      if (!base) continue;
+      const openedAtRaw = fin(pos.createTime);
+      const openedAt = openedAtRaw > 0 ? epochToSec(openedAtRaw) : null;
+      const notionalUsd = Math.abs(fin(pos.positionValue));
+      const absQty = Math.abs(qty);
+      const g = groupFor(base);
+      seen(g, openedAt);
+      if (g.priceUsd === 0 && absQty > 0) g.priceUsd = notionalUsd / absQty;
+      const pid = (pos as { positionId?: string }).positionId ?? '';
+      const feesUsd =
+        feesWindow !== null && pos.symbol && (openedAt === null || openedAt < sinceSec)
+          ? (feesWindow.get(pos.symbol) ?? 0)
+          : Math.abs(fin(pos.fee));
+      if (pos.symbol) openFeesBySymbol.set(pos.symbol, (openFeesBySymbol.get(pos.symbol) ?? 0) + feesUsd);
+      g.perpOpen.push({
+        symbol: pos.symbol ?? '',
+        venue: normalizeVenue(exchange),
+        side: (pos.positionSide ?? '').toUpperCase() === 'SHORT' || qty < 0 ? 'SHORT' : 'LONG',
+        qty: absQty,
+        notionalUsd,
+        entryPrice: fin(pos.entryPrice),
+        markPrice: fin((pos as { markPrice?: string }).markPrice),
+        leverage: fin(pos.leverage),
+        upnlUsd: fin(pos.upnl),
+        fundingUsd:
+          fundingWindow !== null && pid ? (fundingWindow.get(pid) ?? 0) : fin(pos.fundingFee),
+        feesUsd,
+        imUsd: Math.abs(fin(pos.initialMargin)),
+        openedAt,
+      });
+    }
+
+    // Closed perps since T0, aggregated per symbol.
+    //
+    // ⚠ SPLIT-POSITION DEDUPE, BY POSITION ID (ledger-verified 2026-09-04):
+    // a PARTIAL close's funding/fee ride the SURVIVING open row's
+    // cumulatives (the open row's cumulative equals the account-book total
+    // exactly), so counting the closed slice again double-charges it. The
+    // match is by position id — a close-and-REOPEN mints a new id, and the
+    // old COMPLETE_CLOSED row rightly keeps its own funding/fees (an
+    // earlier symbol-based match would have swallowed them).
+    const openIds = new Set(
+      perpPositions.map((p) => (p as { positionId?: string }).positionId ?? '').filter(Boolean),
+    );
+    const closedBySymbol = new Map<string, AssetPerpClosedOut>();
+    for (const r of closedRows) {
+      const closedAtRaw = fin(r.updateTime);
+      const closedAt = closedAtRaw > 0 ? epochToSec(closedAtRaw) : null;
+      if (sinceSec > 0 && closedAt !== null && closedAt < sinceSec) continue;
+      const { exchange, base } = parseSymbol(r.symbol ?? '');
+      if (!base) continue;
+      seen(groupFor(base), closedAt);
+      const key = r.symbol ?? '';
+      let agg = closedBySymbol.get(key);
+      if (!agg) {
+        agg = {
+          symbol: key,
+          venue: normalizeVenue(exchange),
+          closedPnlUsd: 0,
+          fundingUsd: 0,
+          feesUsd: 0,
+          count: 0,
+          lastClosedAt: null,
+          rows: [],
+        };
+        closedBySymbol.set(key, agg);
+        groupFor(base).perpClosed.push(agg);
+      }
+      const deduped = r.positionId !== undefined && openIds.has(r.positionId);
+      agg.closedPnlUsd += fin(r.closedPnl);
+      if (!deduped) {
+        agg.fundingUsd +=
+          fundingWindow !== null && r.positionId
+            ? (fundingWindow.get(r.positionId) ?? 0)
+            : fin(r.fundingFee);
+        // Windowed mode assigns fees per SYMBOL below (fills carry no
+        // position id), exactly once — adding the whole-life fee here too
+        // would double-count a position closed inside the window.
+        if (feesWindow === null) {
+          agg.feesUsd += Math.abs(fin(r.fee)) + Math.abs(fin(r.liqFee));
+        }
+      } else {
+        agg.dedupedIntoOpen = true;
+      }
+      if (agg.rows.length < 20) {
+        agg.rows.push({
+          closedAt,
+          qty: fin(r.closedQty),
+          openPx: fin(r.openAvgPrice),
+          closePx: fin(r.closedAvgPrice),
+          priceUsd: fin(r.closedPnl),
+          fundingUsd: deduped
+            ? 0
+            : fundingWindow !== null && r.positionId
+              ? (fundingWindow.get(r.positionId) ?? 0)
+              : fin(r.fundingFee),
+          feesUsd: deduped ? 0 : Math.abs(fin(r.fee)) + Math.abs(fin(r.liqFee)),
+          complete: String(r.closedType ?? '') === 'COMPLETE_CLOSED',
+          dedupedIntoOpen: deduped,
+        });
+      }
+      agg.count += 1;
+      if (closedAt !== null && (agg.lastClosedAt === null || closedAt > agg.lastClosedAt)) {
+        agg.lastClosedAt = closedAt;
+      }
+    }
+    if (feesWindow !== null) {
+      for (const agg of closedBySymbol.values()) {
+        agg.feesUsd = Math.max(0, (feesWindow.get(agg.symbol) ?? 0) - (openFeesBySymbol.get(agg.symbol) ?? 0));
+      }
+    }
+
+    // Open Boros legs.
+    let unpricedZones = 0;
+    for (const zone of zones) {
+      const px = tokenPrice(zone.tokenId);
+      const zoneGroups = [...(zone.cross ? [zone.cross] : []), ...zone.isolated];
+      const hasPositions = zoneGroups.some((mg) => mg.marketPositions.some((p) => norm18(p.notionalSize) !== 0));
+      if (px === null) {
+        if (hasPositions) unpricedZones += 1;
+        continue;
+      }
+      for (const mg of zoneGroups) {
+        for (const p of mg.marketPositions) {
+          const sizeSigned = norm18(p.notionalSize);
+          if (sizeSigned === 0) continue;
+          const market = marketById.get(p.marketId);
+          if (!market) continue;
+          const g = groupFor(market.base);
+          if (g.priceUsd === 0 && market.assetMarkPriceUsd > 0) g.priceUsd = market.assetMarkPriceUsd;
+          g.borosOpen.push({
+            marketId: p.marketId,
+            venue: normalizeVenue(market.venue),
+            maturity: market.maturity,
+            collateral: BOROS_TOKEN_SYMBOLS[zone.tokenId] ?? `token${zone.tokenId}`,
+            side: p.side === 0 || sizeSigned > 0 ? 'LONG' : 'SHORT',
+            sizeToken: Math.abs(sizeSigned),
+            notionalUsd: Math.abs(sizeSigned) * px,
+            entryApr: p.fixedApr,
+            markApr: p.markApr,
+            floatingApr: market.floatingApr,
+            settleUsd: norm18(p.pnl.rateSettlementPnl) * px,
+            mtmUsd: norm18(p.pnl.unrealisedPnl) * px,
+            imUsd: norm18(p.positionInitialMargin ?? p.initialMargin) * px,
+            settleFeeApr: market.settleFeeApr,
+          });
+        }
+      }
+    }
+    if (unpricedZones > 0) {
+      warnings.push(
+        `${unpricedZones} Boros collateral zone(s) hold positions in a token with no live USD price — their legs are excluded from the view.`,
+      );
+    }
+
+    // Boros history sums per market: settlements + fills since T0.
+    interface HistAgg extends AssetBorosHistoryOut {
+      _base: string;
+    }
+    const histByMarket = new Map<number, HistAgg>();
+    let unknownMarketRows = 0;
+    const histFor = (marketId: number): HistAgg | null => {
+      let h = histByMarket.get(marketId);
+      if (h) return h;
+      const market = marketById.get(marketId);
+      if (!market) return null;
+      h = {
+        marketId,
+        venue: normalizeVenue(market.venue),
+        maturity: market.maturity,
+        settleUsd: 0,
+        settleFeeUsd: 0,
+        rebateUsd: 0,
+        tradePnlUsd: 0,
+        tradeFeeUsd: 0,
+        peakSizeToken: 0,
+        peakNotionalUsd: 0,
+        firstEventSec: 0,
+        entryApr: null,
+        side: null,
+        _base: market.base,
+      };
+      histByMarket.set(marketId, h);
+      return h;
+    };
+    // readRebateByEvent already SUMS every backend rebate row for a
+    // (marketId, timeSec) into one entry, so its value is the full rebate for
+    // that market-second. Credit it once per key — were two settlement events
+    // ever to share a (marketId, timeSec), adding per event would multiply it.
+    // A local set (never the cached map) so the shared cache is not mutated.
+    const rebateCredited = new Set<string>();
+    for (const ev of settlements.events) {
+      if (ev.timeSec < floorFor(ev.marketId)) continue;
+      const market = marketById.get(ev.marketId);
+      const px = market ? tokenPrice(market.tokenId) : null;
+      // Unpriceable ⇒ no aggregate at all. histFor() stores the row it
+      // creates and the final loop pushes every stored row — creating one
+      // here and then skipping it shipped a $0 history line with a real
+      // locked rate while the leg's PnL was left out of the sums.
+      if (px === null) {
+        unknownMarketRows += 1;
+        continue;
+      }
+      const h = histFor(ev.marketId);
+      if (!h) {
+        unknownMarketRows += 1;
+        continue;
+      }
+      seen(groupFor(h._base), ev.timeSec);
+      h.settleUsd += ev.settlementToken * px;
+      h.settleFeeUsd += ev.feeToken * px;
+      // Same floor as the settlement it belongs to (this event already passed
+      // it above): a settlement outside the window contributes no rebate either.
+      const rebateKey = `${ev.marketId}:${ev.timeSec}`;
+      if (!rebateCredited.has(rebateKey)) {
+        const rebateTok = rebateByEvent.get(rebateKey);
+        if (rebateTok) h.rebateUsd += rebateTok * px;
+        rebateCredited.add(rebateKey);
+      }
+      if (ev.positionAbs > h.peakSizeToken) {
+        h.peakSizeToken = ev.positionAbs;
+        h.peakNotionalUsd = ev.positionAbs * px;
+      }
+      if (h.firstEventSec === 0 || ev.timeSec < h.firstEventSec) h.firstEventSec = ev.timeSec;
+    }
+    /**
+     * The locked rate is a property of the POSITION, not of the window:
+     * a leg opened before the start date and settling inside it still
+     * locked its rate on that earlier fill. So the opening-fill average is
+     * replayed over EVERY fill (per-market "counted from" respected, the
+     * asset window not), and attached only to markets the window shows.
+     */
+    const openRate = new Map<number, { size: number; sizeApr: number; side: 'LONG' | 'SHORT' }>();
+    for (const [tokenId, txns] of txnsByToken) {
+      const px = tokenPrice(tokenId);
+      for (const t of txns) {
+        // An OPENING fill grows |position|; its traded rate, weighted by
+        // the size it added, is what the position locked.
+        const grew = Math.abs(t.post) - Math.abs(t.prev);
+        if (grew > 0 && Number.isFinite(t.fixedApr) && t.time >= (legSince.get(t.marketId) ?? 0)) {
+          const r = openRate.get(t.marketId) ?? { size: 0, sizeApr: 0, side: 'LONG' as const };
+          r.size += grew;
+          r.sizeApr += grew * t.fixedApr;
+          r.side = t.post > 0 ? 'LONG' : 'SHORT';
+          openRate.set(t.marketId, r);
+        }
+        if (t.time < floorFor(t.marketId)) continue;
+        if (px === null) {
+          unknownMarketRows += 1;
+          continue;
+        }
+        const h = histFor(t.marketId);
+        if (!h) {
+          unknownMarketRows += 1;
+          continue;
+        }
+        seen(groupFor(h._base), t.time);
+        h.tradePnlUsd += t.pnlTok * px;
+        h.tradeFeeUsd += t.feeTok * px;
+        // The peak is what a partial exclusion is measured against once the
+        // leg is gone. Settlements alone miss a leg opened and closed
+        // between two settlements — its fills are the only size record.
+        // Both sides of the fill: a leg opened before the window and wound
+        // down inside it is seen only through its pre-fill sizes.
+        const absPeak = Math.max(Math.abs(t.prev), Math.abs(t.post));
+        if (absPeak > h.peakSizeToken) {
+          h.peakSizeToken = absPeak;
+          h.peakNotionalUsd = absPeak * px;
+        }
+        if (h.firstEventSec === 0 || t.time < h.firstEventSec) h.firstEventSec = t.time;
+      }
+    }
+    if (unknownMarketRows > 0) {
+      warnings.push(
+        `${unknownMarketRows} Boros history row(s) reference a market that is no longer listed or cannot be priced — they are excluded from the sums.`,
+      );
+    }
+    for (const h of histByMarket.values()) {
+      const { _base, ...out } = h;
+      const r = openRate.get(h.marketId);
+      out.entryApr = r && r.size > 0 ? r.sizeApr / r.size : null;
+      out.side = r?.side ?? null;
+      groupFor(_base).borosHistory.push(out);
+    }
+
+    // Stable order: biggest live footprint first, then name.
+    const assets = [...groups.values()]
+      .filter((g) => g.supported || g.perpOpen.length > 0 || g.borosOpen.length > 0)
+      .sort((a, b) => {
+        const foot = (g: AssetGroupOut): number =>
+          g.perpOpen.reduce((s, l) => s + l.notionalUsd, 0) +
+          g.borosOpen.reduce((s, l) => s + l.notionalUsd, 0);
+        return foot(b) - foot(a) || a.base.localeCompare(b.base);
+      });
+    const earliestSec = assets.reduce<number | null>(
+      (min, g) => (g.earliestSec !== null && (min === null || g.earliestSec < min) ? g.earliestSec : min),
+      null,
+    );
+
+    // Borrow interest rides beside the per-asset sums, never inside them.
+    // A failed read must not sink the view: the total is then reported
+    // without it, and says so.
+    let interest: AssetViewOut['interest'] = { paidUsd: 0, byCoin: {}, coversFromSec: 0, available: false };
+    try {
+      const { value } = await deps.cache.get(
+        `crossex:interest:${Math.floor(sinceSec / 3600)}`,
+        TTL.trades,
+        () => fetchInterestPaid(deps, sinceSec),
+        { fresh },
+      );
+      interest = { ...value, available: true };
+      const unpriced = Object.keys(value.byCoin).filter((c) => !STABLE_COIN_RE.test(c));
+      if (unpriced.length > 0) {
+        warnings.push(`Borrow interest in ${unpriced.join(', ')} is not priced — left out of the total.`);
+      }
+    } catch (err) {
+      // Unconfigured Gate is the Boros-only mode, not a failure worth a line.
+      const c = classifyGateError(err);
+      if (c.category !== 'not-configured') {
+        warnings.push(`Borrow interest unavailable — the total PnL omits it (${c.category}).`);
+      }
+    }
+
+    if (ledger.coversFromSec !== 0 && ledger.coversFromSec > sinceSec) startSync(address, sinceSec);
+
+    const out: AssetViewOut = {
+      sinceSec,
+      nowSec,
+      defaultSinceSec,
+      assets,
+      supportedCoins: [...SUPPORTED_COINS],
+      interest,
+      earliestSec,
+      coverage: {
+        settlementsFromSec: settlements.coversFromSec,
+        perpClosedFromSec,
+        borosTxnsComplete: txnsComplete.every(Boolean),
+        backfilling: backfills.has(address),
+      },
+      warnings,
+    };
+    return out;
+  };
+}
+
+export function assetViewRoutes(deps: AppDeps) {
+  const buildAssetView = createAssetViewBuilder(deps);
   return async function plugin(app: FastifyInstance): Promise<void> {
     app.get('/asset-view/:address', async (req, reply) => {
       const raw = (req.params as { address: string }).address;
       if (!EVM_ADDRESS_RE.test(raw)) {
         throw new CoreError('invalid EVM address (expected 0x + 40 hex chars)', 'validation');
       }
-      const address = raw.toLowerCase();
       const query = req.query as { since?: string; fresh?: string; legSince?: string };
-      const fresh = query.fresh === '1';
       /**
        * Per-market "counted from" floors: `legSince=<marketId>:<sec>,…`.
        * A Boros market that was traded before, closed, and re-opened for THIS
@@ -352,10 +1147,9 @@ export function assetViewRoutes(deps: AppDeps) {
           legSince.set(Number(m[1]), Number(m[2]));
         }
       }
-      const floorFor = (marketId: number): number => Math.max(sinceSec, legSince.get(marketId) ?? 0);
       const nowSec = Math.floor(Date.now() / 1000);
 
-      let sinceSec = 0;
+      let requestedSinceSec: number | null = null;
       if (query.since !== undefined && query.since !== '') {
         const n = /^\d+$/.test(query.since)
           ? Number(query.since)
@@ -366,583 +1160,15 @@ export function assetViewRoutes(deps: AppDeps) {
         if (n >= nowSec) {
           throw new CoreError('since must be in the past', 'validation');
         }
-        sinceSec = n;
+        requestedSinceSec = n;
       }
 
-      const warnings: string[] = [];
-
-      // --- Boros reads (shared cache keys with the strategy feed) ----------
-      const [markets, zones, settlements] = await Promise.all([
-        deps.cache
-          .get('boros:markets', TTL.boros, () => fetchBorosMarkets(fetchImpl), { fresh })
-          .then((r) => r.value),
-        deps.cache
-          .get(`boros:collaterals:${address}`, TTL.boros, () => fetchBorosCollaterals(fetchImpl, address), {
-            fresh,
-          })
-          .then((r) => r.value),
-        deps.cache
-          .get(
-            `boros:settlements:${address}:0:${Math.floor(sinceSec / 3600)}`,
-            TTL.boros,
-            () => fetchSettlementEvents(fetchImpl, address, 0, sinceSec),
-            { fresh },
-          )
-          .then((r) => r.value),
-      ]);
-
-      const marketById = new Map<number, BorosMarket>(markets.map((m) => [m.marketId, m]));
-      const collateralPriceUsd = resolveCollateralPricesUsd(markets);
-      const tokenPrice = (tokenId: number): number | null => collateralPriceUsd.get(tokenId) ?? null;
-
-      // Txns for EVERY zone the account has — history sums must include
-      // markets whose positions are long gone, and a fill's zone is the
-      // token it settled in, position or not.
-      const txnsComplete: boolean[] = [];
-      const txnsByToken = new Map<
-        number,
-        Array<{ marketId: number; time: number; pnlTok: number; feeTok: number; fixedApr: number; prev: number; post: number }>
-      >(
-        await Promise.all(
-          zones.map(async (z): Promise<[number, Array<{ marketId: number; time: number; pnlTok: number; feeTok: number; fixedApr: number; prev: number; post: number }>]> => {
-            const { value } = await deps.cache.get(
-              `boros:txns:${address}:${z.tokenId}`,
-              TTL.boros,
-              () => fetchBorosTransactions(fetchImpl, address, z.tokenId),
-              { fresh },
-            );
-            txnsComplete.push(value.complete);
-            return [
-              z.tokenId,
-              value.txns.map((t) => ({
-                marketId: t.marketId,
-                time: t.time,
-                pnlTok: norm18(t.pnl),
-                feeTok: Math.abs(norm18(t.fee)),
-                fixedApr: Number(t.fixedApr),
-                prev: norm18(t.prevPositionS ?? '0'),
-                post: norm18(t.postPositionS ?? '0'),
-              })),
-            ];
-          }),
-        ),
-      );
-
-      // The listing serves LIVE markets only — a matured market drops out of
-      // it, taking its history's asset/venue mapping with it. Resolve every
-      // id the account's history references but the listing lacks through the
-      // by-id endpoint (which still serves matured markets); metadata of a
-      // matured market is immutable, so these ride the long static TTL.
-      {
-        const referenced = new Set<number>();
-        for (const ev of settlements.events) referenced.add(ev.marketId);
-        for (const txns of txnsByToken.values()) for (const t of txns) referenced.add(t.marketId);
-        const unknown = [...referenced].filter((id) => !marketById.has(id));
-        const resolved = await Promise.all(
-          unknown.map(async (id) => {
-            try {
-              const { value } = await deps.cache.get(`boros:market:${id}`, TTL.static, () =>
-                fetchBorosMarket(fetchImpl, id),
-              );
-              return value;
-            } catch {
-              return null; // stays unmapped; counted into the warning below
-            }
-          }),
-        );
-        for (const m of resolved) if (m) marketById.set(m.marketId, m);
-      }
-
-      // --- Perp reads (degrade to Boros-only, same doctrine as /strategy) --
-      let perpPositions: PerpPositionLike[] = [];
-      let perpAvailable = true;
-      try {
-        const { value } = await deps.cache.get(
-          'positions',
-          TTL.live,
-          async () => (await deps.getClients().crossEx.listCrossexPositions()).body,
-          { fresh },
-        );
-        perpPositions = value as PerpPositionLike[];
-      } catch (err) {
-        perpAvailable = false;
-        const category = classifyGateError(err).category;
-        if (category !== 'not-configured') {
-          warnings.push(
-            `Couldn't load Gate positions right now (${category}) — showing the Boros side only.`,
-          );
-        }
-      }
-
-      /**
-       * WINDOWED open-leg funding and fees (only when a start date is set).
-       * The venue's cumulative fundingFee/fee cover the position's whole
-       * life; a window starting mid-life must count only in-window flows.
-       * The account book has one FUNDING_FEE row per tick per position —
-       * and each row is the amount actually paid AT THE SIZE OF THAT TICK,
-       * so summing in-window rows is exact through resizes (a 1000→500 cut
-       * before the window contributes only 500-sized rows inside it). Fees
-       * come from the per-fill history the same way. If a ledger cannot
-       * reach the window start, the cumulative stands with a warning.
-       */
-      let fundingWindow: Map<string, number> | null = null; // positionId → USD
-      let feesWindow: Map<string, number> | null = null; // symbol → USD
-      if (perpAvailable && sinceSec > 0) {
-        try {
-          const { value } = await deps.cache.get(
-            `crossex:funding-window:${Math.floor(sinceSec / 3600)}`,
-            TTL.boros,
-            async () => {
-              const rows: Array<{ businessId?: string; change?: string; createTime?: string }> = [];
-              let capped = true;
-              for (let page = 1; page <= 25; page += 1) {
-                const { body } = await deps.getClients().crossEx.listCrossexAccountBook({
-                  statementType: 'FUNDING_FEE',
-                  from: sinceSec * 1000 - 3_600_000,
-                  limit: PAGE_LIMIT,
-                  page,
-                });
-                rows.push(...(body as typeof rows));
-                if ((body as unknown[]).length < PAGE_LIMIT) {
-                  capped = false;
-                  break;
-                }
-              }
-              const byPosition = new Map<string, number>();
-              for (const r of rows) {
-                const pid = String(r.businessId ?? '').split('_')[0];
-                const t = fin(r.createTime);
-                const usd = Number(r.change);
-                if (!pid || !Number.isFinite(usd) || epochToSec(t) < sinceSec) continue;
-                byPosition.set(pid, (byPosition.get(pid) ?? 0) + usd);
-              }
-              return { byPosition, capped };
-            },
-            { fresh },
-          );
-          fundingWindow = value.byPosition;
-          if (value.capped) {
-            warnings.push(
-              'The funding ledger read hit its page cap before covering the whole window — windowed funding may be missing early ticks.',
-            );
-          }
-        } catch {
-          warnings.push(
-            'Funding ledger unavailable — open-leg funding shows whole-position cumulatives despite the start date.',
-          );
-        }
-        try {
-          const { value } = await deps.cache.get(
-            `crossex:fees-window:${Math.floor(sinceSec / 3600)}`,
-            TTL.boros,
-            async () => {
-              const bySymbol = new Map<string, number>();
-              let capped = true;
-              for (let page = 1; page <= 25; page += 1) {
-                const { body } = await deps.getClients().crossEx.listCrossexHistoryTrades({
-                  page,
-                  limit: PAGE_LIMIT,
-                  from: sinceSec * 1000,
-                });
-                for (const f of body as Array<{ symbol?: string; fee?: string }>) {
-                  const sym = String(f.symbol ?? '');
-                  if (!sym) continue;
-                  bySymbol.set(sym, (bySymbol.get(sym) ?? 0) + Math.abs(Number(f.fee) || 0));
-                }
-                if ((body as unknown[]).length < PAGE_LIMIT) {
-                  capped = false;
-                  break;
-                }
-              }
-              return { bySymbol, capped };
-            },
-            { fresh },
-          );
-          feesWindow = value.bySymbol;
-          if (value.capped) {
-            warnings.push(
-              'The fill-history read hit its page cap before covering the whole window — windowed perp fees may be missing early fills.',
-            );
-          }
-        } catch {
-          warnings.push(
-            'Fill history unavailable — perp fees show whole-position cumulatives despite the start date.',
-          );
-        }
-      }
-
-      let closedRows: HistoryPositionLike[] = [];
-      let perpClosedFromSec = 0;
-      if (perpAvailable) {
-        try {
-          const { value } = await deps.cache.get(
-            'crossex:closed-positions',
-            TTL.boros,
-            () => fetchClosedPositions(deps),
-            { fresh },
-          );
-          closedRows = value.rows;
-          perpClosedFromSec = value.coversFromSec;
-        } catch (err) {
-          const category = classifyGateError(err).category;
-          warnings.push(
-            `Couldn't load closed-position history (${category}) — totals cover open positions and Boros only.`,
-          );
-        }
-      }
-
-      // --- Group by asset --------------------------------------------------
-      const groups = new Map<string, AssetGroupOut>();
-      const groupFor = (base: string): AssetGroupOut => {
-        const key = base.toUpperCase();
-        let g = groups.get(key);
-        if (!g) {
-          g = {
-            base: key,
-            priceUsd: 0,
-            earliestSec: null,
-            perpOpen: [],
-            perpClosed: [],
-            borosOpen: [],
-            borosHistory: [],
-          };
-          groups.set(key, g);
-        }
-        return g;
-      };
-      let earliestSec = Number.POSITIVE_INFINITY;
-      const seen = (g: AssetGroupOut, t: number | null | undefined): void => {
-        if (!t || !Number.isFinite(t) || t <= 0) return;
-        earliestSec = Math.min(earliestSec, t);
-        if (g.earliestSec === null || t < g.earliestSec) g.earliestSec = t;
-      };
-
-      // Open perps.
-      for (const pos of perpPositions) {
-        const qty = fin(pos.positionQty);
-        if (qty === 0) continue;
-        const { exchange, base } = parseSymbol(pos.symbol ?? '');
-        if (!base) continue;
-        const openedAtRaw = fin(pos.createTime);
-        const openedAt = openedAtRaw > 0 ? epochToSec(openedAtRaw) : null;
-        const notionalUsd = Math.abs(fin(pos.positionValue));
-        const absQty = Math.abs(qty);
-        const g = groupFor(base);
-        seen(g, openedAt);
-        if (g.priceUsd === 0 && absQty > 0) g.priceUsd = notionalUsd / absQty;
-        const pid = (pos as { positionId?: string }).positionId ?? '';
-        g.perpOpen.push({
-          symbol: pos.symbol ?? '',
-          venue: normalizeVenue(exchange),
-          side: (pos.positionSide ?? '').toUpperCase() === 'SHORT' || qty < 0 ? 'SHORT' : 'LONG',
-          qty: absQty,
-          notionalUsd,
-          entryPrice: fin(pos.entryPrice),
-          markPrice: fin((pos as { markPrice?: string }).markPrice),
-          leverage: fin(pos.leverage),
-          upnlUsd: fin(pos.upnl),
-          fundingUsd:
-            fundingWindow !== null && pid ? (fundingWindow.get(pid) ?? 0) : fin(pos.fundingFee),
-          feesUsd:
-            feesWindow !== null && pos.symbol
-              ? (feesWindow.get(pos.symbol) ?? 0)
-              : Math.abs(fin(pos.fee)),
-          imUsd: Math.abs(fin(pos.initialMargin)),
-          openedAt,
-        });
-      }
-
-      // Closed perps since T0, aggregated per symbol.
-      //
-      // ⚠ SPLIT-POSITION DEDUPE, BY POSITION ID (ledger-verified 2026-09-04):
-      // a PARTIAL close's funding/fee ride the SURVIVING open row's
-      // cumulatives (the open row's cumulative equals the account-book total
-      // exactly), so counting the closed slice again double-charges it. The
-      // match is by position id — a close-and-REOPEN mints a new id, and the
-      // old COMPLETE_CLOSED row rightly keeps its own funding/fees (an
-      // earlier symbol-based match would have swallowed them).
-      const openIds = new Set(
-        perpPositions.map((p) => (p as { positionId?: string }).positionId ?? '').filter(Boolean),
-      );
-      const closedBySymbol = new Map<string, AssetPerpClosedOut>();
-      for (const r of closedRows) {
-        const closedAtRaw = fin(r.updateTime);
-        const closedAt = closedAtRaw > 0 ? epochToSec(closedAtRaw) : null;
-        if (sinceSec > 0 && closedAt !== null && closedAt < sinceSec) continue;
-        const { exchange, base } = parseSymbol(r.symbol ?? '');
-        if (!base) continue;
-        seen(groupFor(base), closedAt);
-        const key = r.symbol ?? '';
-        let agg = closedBySymbol.get(key);
-        if (!agg) {
-          agg = {
-            symbol: key,
-            venue: normalizeVenue(exchange),
-            closedPnlUsd: 0,
-            fundingUsd: 0,
-            feesUsd: 0,
-            count: 0,
-            lastClosedAt: null,
-            rows: [],
-          };
-          closedBySymbol.set(key, agg);
-          groupFor(base).perpClosed.push(agg);
-        }
-        const deduped = r.positionId !== undefined && openIds.has(r.positionId);
-        agg.closedPnlUsd += fin(r.closedPnl);
-        if (!deduped) {
-          agg.fundingUsd +=
-            fundingWindow !== null && r.positionId
-              ? (fundingWindow.get(r.positionId) ?? 0)
-              : fin(r.fundingFee);
-          // Windowed mode assigns fees per SYMBOL below (fills carry no
-          // position id), exactly once — adding the whole-life fee here too
-          // would double-count a position closed inside the window.
-          if (feesWindow === null) {
-            agg.feesUsd += Math.abs(fin(r.fee)) + Math.abs(fin(r.liqFee));
-          }
-        } else {
-          agg.dedupedIntoOpen = true;
-        }
-        if (agg.rows.length < 20) {
-          agg.rows.push({
-            closedAt,
-            qty: fin(r.closedQty),
-            openPx: fin(r.openAvgPrice),
-            closePx: fin(r.closedAvgPrice),
-            priceUsd: fin(r.closedPnl),
-            fundingUsd: deduped
-              ? 0
-              : fundingWindow !== null && r.positionId
-                ? (fundingWindow.get(r.positionId) ?? 0)
-                : fin(r.fundingFee),
-            feesUsd: deduped ? 0 : Math.abs(fin(r.fee)) + Math.abs(fin(r.liqFee)),
-            complete: String(r.closedType ?? '') === 'COMPLETE_CLOSED',
-            dedupedIntoOpen: deduped,
-          });
-        }
-        agg.count += 1;
-        if (closedAt !== null && (agg.lastClosedAt === null || closedAt > agg.lastClosedAt)) {
-          agg.lastClosedAt = closedAt;
-        }
-      }
-      // Windowed fees are per-symbol fill sums with no position attribution:
-      // count each symbol's in-window fills exactly ONCE — on the open row
-      // when one exists (its symbol lookup above already holds them), else on
-      // the closed batch. This also windows closed-batch fees, which the
-      // all-time path cannot (closed rows only report whole-life fees).
-      if (feesWindow !== null) {
-        const openSymbols = new Set(perpPositions.map((p) => p.symbol ?? '').filter(Boolean));
-        for (const agg of closedBySymbol.values()) {
-          if (!openSymbols.has(agg.symbol)) {
-            agg.feesUsd = feesWindow.get(agg.symbol) ?? 0;
-          }
-        }
-      }
-
-      // Open Boros legs.
-      let unpricedZones = 0;
-      for (const zone of zones) {
-        const px = tokenPrice(zone.tokenId);
-        const zoneGroups = [...(zone.cross ? [zone.cross] : []), ...zone.isolated];
-        const hasPositions = zoneGroups.some((mg) => mg.marketPositions.some((p) => norm18(p.notionalSize) !== 0));
-        if (px === null) {
-          if (hasPositions) unpricedZones += 1;
-          continue;
-        }
-        for (const mg of zoneGroups) {
-          for (const p of mg.marketPositions) {
-            const sizeSigned = norm18(p.notionalSize);
-            if (sizeSigned === 0) continue;
-            const market = marketById.get(p.marketId);
-            if (!market) continue;
-            const g = groupFor(market.base);
-            if (g.priceUsd === 0 && market.assetMarkPriceUsd > 0) g.priceUsd = market.assetMarkPriceUsd;
-            g.borosOpen.push({
-              marketId: p.marketId,
-              venue: normalizeVenue(market.venue),
-              maturity: market.maturity,
-              collateral: BOROS_TOKEN_SYMBOLS[zone.tokenId] ?? `token${zone.tokenId}`,
-              side: p.side === 0 || sizeSigned > 0 ? 'LONG' : 'SHORT',
-              sizeToken: Math.abs(sizeSigned),
-              notionalUsd: Math.abs(sizeSigned) * px,
-              entryApr: p.fixedApr,
-              markApr: p.markApr,
-              floatingApr: market.floatingApr,
-              settleUsd: norm18(p.pnl.rateSettlementPnl) * px,
-              mtmUsd: norm18(p.pnl.unrealisedPnl) * px,
-              imUsd: norm18(p.positionInitialMargin ?? p.initialMargin) * px,
-              settleFeeApr: market.settleFeeApr,
-            });
-          }
-        }
-      }
-      if (unpricedZones > 0) {
-        warnings.push(
-          `${unpricedZones} Boros collateral zone(s) hold positions in a token with no live USD price — their legs are excluded from the view.`,
-        );
-      }
-
-      // Boros history sums per market: settlements + fills since T0.
-      interface HistAgg extends AssetBorosHistoryOut {
-        _base: string;
-      }
-      const histByMarket = new Map<number, HistAgg>();
-      let unknownMarketRows = 0;
-      const histFor = (marketId: number): HistAgg | null => {
-        let h = histByMarket.get(marketId);
-        if (h) return h;
-        const market = marketById.get(marketId);
-        if (!market) return null;
-        h = {
-          marketId,
-          venue: normalizeVenue(market.venue),
-          maturity: market.maturity,
-          settleUsd: 0,
-          settleFeeUsd: 0,
-          tradePnlUsd: 0,
-          tradeFeeUsd: 0,
-          peakSizeToken: 0,
-          peakNotionalUsd: 0,
-          firstEventSec: 0,
-          entryApr: null,
-          side: null,
-          _base: market.base,
-        };
-        histByMarket.set(marketId, h);
-        return h;
-      };
-      for (const ev of settlements.events) {
-        if (ev.timeSec < floorFor(ev.marketId)) continue;
-        const market = marketById.get(ev.marketId);
-        const px = market ? tokenPrice(market.tokenId) : null;
-        // Unpriceable ⇒ no aggregate at all. histFor() stores the row it
-        // creates and the final loop pushes every stored row — creating one
-        // here and then skipping it shipped a $0 history line with a real
-        // locked rate while the leg's PnL was left out of the sums.
-        if (px === null) {
-          unknownMarketRows += 1;
-          continue;
-        }
-        const h = histFor(ev.marketId);
-        if (!h) {
-          unknownMarketRows += 1;
-          continue;
-        }
-        seen(groupFor(h._base), ev.timeSec);
-        h.settleUsd += ev.settlementToken * px;
-        h.settleFeeUsd += ev.feeToken * px;
-        if (ev.positionAbs > h.peakSizeToken) {
-          h.peakSizeToken = ev.positionAbs;
-          h.peakNotionalUsd = ev.positionAbs * px;
-        }
-        if (h.firstEventSec === 0 || ev.timeSec < h.firstEventSec) h.firstEventSec = ev.timeSec;
-      }
-      /**
-       * The locked rate is a property of the POSITION, not of the window:
-       * a leg opened before the start date and settling inside it still
-       * locked its rate on that earlier fill. So the opening-fill average is
-       * replayed over EVERY fill (per-market "counted from" respected, the
-       * asset window not), and attached only to markets the window shows.
-       */
-      const openRate = new Map<number, { size: number; sizeApr: number; side: 'LONG' | 'SHORT' }>();
-      for (const [tokenId, txns] of txnsByToken) {
-        const px = tokenPrice(tokenId);
-        for (const t of txns) {
-          // An OPENING fill grows |position|; its traded rate, weighted by
-          // the size it added, is what the position locked.
-          const grew = Math.abs(t.post) - Math.abs(t.prev);
-          if (grew > 0 && Number.isFinite(t.fixedApr) && t.time >= (legSince.get(t.marketId) ?? 0)) {
-            const r = openRate.get(t.marketId) ?? { size: 0, sizeApr: 0, side: 'LONG' as const };
-            r.size += grew;
-            r.sizeApr += grew * t.fixedApr;
-            r.side = t.post > 0 ? 'LONG' : 'SHORT';
-            openRate.set(t.marketId, r);
-          }
-          if (t.time < floorFor(t.marketId)) continue;
-          if (px === null) {
-            unknownMarketRows += 1;
-            continue;
-          }
-          const h = histFor(t.marketId);
-          if (!h) {
-            unknownMarketRows += 1;
-            continue;
-          }
-          seen(groupFor(h._base), t.time);
-          h.tradePnlUsd += t.pnlTok * px;
-          h.tradeFeeUsd += t.feeTok * px;
-          // The peak is what a partial exclusion is measured against once the
-          // leg is gone. Settlements alone miss a leg opened and closed
-          // between two settlements — its fills are the only size record.
-          // Both sides of the fill: a leg opened before the window and wound
-          // down inside it is seen only through its pre-fill sizes.
-          const absPeak = Math.max(Math.abs(t.prev), Math.abs(t.post));
-          if (absPeak > h.peakSizeToken) {
-            h.peakSizeToken = absPeak;
-            h.peakNotionalUsd = absPeak * px;
-          }
-          if (h.firstEventSec === 0 || t.time < h.firstEventSec) h.firstEventSec = t.time;
-        }
-      }
-      if (unknownMarketRows > 0) {
-        warnings.push(
-          `${unknownMarketRows} Boros history row(s) reference a market that is no longer listed or cannot be priced — they are excluded from the sums.`,
-        );
-      }
-      for (const h of histByMarket.values()) {
-        const { _base, ...out } = h;
-        const r = openRate.get(h.marketId);
-        out.entryApr = r && r.size > 0 ? r.sizeApr / r.size : null;
-        out.side = r?.side ?? null;
-        groupFor(_base).borosHistory.push(out);
-      }
-
-      // Stable order: biggest live footprint first, then name.
-      const assets = [...groups.values()].sort((a, b) => {
-        const foot = (g: AssetGroupOut): number =>
-          g.perpOpen.reduce((s, l) => s + l.notionalUsd, 0) +
-          g.borosOpen.reduce((s, l) => s + l.notionalUsd, 0);
-        return foot(b) - foot(a) || a.base.localeCompare(b.base);
+      const out = await buildAssetView({
+        address: raw.toLowerCase(),
+        requestedSinceSec,
+        legSince,
+        fresh: query.fresh === '1',
       });
-
-      // Borrow interest rides beside the per-asset sums, never inside them.
-      // A failed read must not sink the view: the total is then reported
-      // without it, and says so.
-      let interest: AssetViewOut['interest'] = { paidUsd: 0, byCoin: {}, coversFromSec: 0, available: false };
-      try {
-        const { value } = await deps.cache.get(
-          `crossex:interest:${Math.floor(sinceSec / 3600)}`,
-          TTL.trades,
-          () => fetchInterestPaid(deps, sinceSec),
-          { fresh },
-        );
-        interest = { ...value, available: true };
-        const unpriced = Object.keys(value.byCoin).filter((c) => !STABLE_COIN_RE.test(c));
-        if (unpriced.length > 0) {
-          warnings.push(`Borrow interest in ${unpriced.join(', ')} is not priced — left out of the total.`);
-        }
-      } catch (err) {
-        // Unconfigured Gate is the Boros-only mode, not a failure worth a line.
-        const c = classifyGateError(err);
-        if (c.category !== 'not-configured') {
-          warnings.push(`Borrow interest unavailable — the total PnL omits it (${c.category}).`);
-        }
-      }
-
-      const out: AssetViewOut = {
-        sinceSec,
-        nowSec,
-        assets,
-        interest,
-        earliestSec: Number.isFinite(earliestSec) ? earliestSec : null,
-        coverage: {
-          settlementsFromSec: settlements.coversFromSec,
-          perpClosedFromSec,
-          borosTxnsComplete: txnsComplete.every(Boolean),
-        },
-        warnings,
-      };
       return reply.ok(out);
     });
   };

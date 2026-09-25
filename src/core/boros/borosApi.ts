@@ -45,6 +45,7 @@
  * wallet. Deposits and withdrawals need root, and this module has no verb for
  * either, so the worst a leaked agent key can do is trade.
  */
+import { BOROS_NETWORK } from '../../../web/src/lib/borosNetwork';
 import { keccak256, formatUnits, parseUnits, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { CoreError } from '../errors';
@@ -63,7 +64,7 @@ import {
 } from './orders';
 
 /** The documented production host (the spec's only `servers` entry). */
-export const BOROS_API_BASE = 'https://api-boros.pendle.finance/apis';
+export const BOROS_API_BASE = BOROS_NETWORK.apiBase;
 
 /** Boros sizes and rates are 18-decimal fixed point on the wire. */
 const DECIMALS = 18;
@@ -71,8 +72,8 @@ const DECIMALS = 18;
 /** Arbitrum One, and the router the agent signature is bound to. Both are
  * part of the EIP-712 domain, so a wrong value produces a signature the
  * backend rejects rather than anything silently mis-sent. */
-const CHAIN_ID = 42161;
-const ROUTER_ADDRESS = '0x8080808080daB95eFED788a9214e400ba552DEf6';
+const CHAIN_ID = BOROS_NETWORK.chainId;
+const ROUTER_ADDRESS = BOROS_NETWORK.routerAddress;
 
 /** `marketId` sentinel for a CROSS account — max uint24. */
 export const CROSS_MARKET_ID = 0xff_ff_ff;
@@ -852,12 +853,6 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
      * an order one unit larger than the position crosses it and opens a fresh
      * one the other way. The route already clamps the size to what is open,
      * but it clamps two DOUBLES — and the order is not built from a double.
-     * `parseUnits(decimalString(50000000000000000 / 1e18))` is
-     * 50000000000000003, so a clean 0.05 close asked for three units more
-     * than existed and left a 3-unit opposing position behind. Too small to
-     * see, too small to close again (the venue refuses orders under $10 of
-     * notional), and reported as "closed" because in float space the two
-     * numbers were equal.
      *
      * So the float is only ever allowed to make the order SMALLER here. The
      * venue's own integer is the ceiling, and it is never re-derived.

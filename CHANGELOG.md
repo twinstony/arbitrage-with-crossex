@@ -3,6 +3,113 @@
 Only substantial releases are listed here — each one bumps `version.json` (which is what the
 in-app update check compares against).
 
+## 1.7.2 — 2026-09-25
+
+TLDR: Settlement-fee rebates show in the terminal. A rebated wallet sees its rebate on every
+opportunity, and the rebate it has earned counts in its PnL. Viewing a wallet you are not
+logged in to is now one clean read-only view.
+
+- **Settlement-fee rebates.** Some wallets get part of the Boros settlement fee back. For
+  those wallets, each opportunity shows a small "N% fee rebate" tag, and "Include rebate in
+  APR" (on by default) adds it to the APR, the return and the ranking. The details waterfall
+  shows it as a green "Settlement rebate" bar. Boros computes the amounts; the terminal only
+  reads them for the logged-in wallet.
+- **Rebates on Positions.** The rebate earned since the start date counts in Total PnL and
+  ROI. Current APR, $/day and each pair's APR and profit use the lower settlement fee. The
+  PnL breakdown has a Rebates column, and the PnL waterfall a rebate bar. A wallet with no
+  rebate sees no change.
+- **One clean view for a wallet you are not logged in to.** Positions says "Viewing 0x…, not
+  logged in" and names the logged-in wallet to switch back to. The header hides the Gate
+  balance and margin, which belong to the logged-in account, and Opportunities no longer
+  pairs your Gate positions with that wallet's Boros legs. Switch back and the full view
+  returns.
+- **Telegram per wallet.** The setup step reads done only for the wallet the alerts are
+  linked to. Other wallets read "Not set up for this wallet".
+
+## 1.7.1 — 2026-09-24
+
+TLDR: One Boros wallet at a time, like the Boros app, and Telegram alerts for each wallet. The
+bot warns you before a leg liquidates, when a wallet starts paying interest, when a pair is a
+week from maturity, and when a later maturity pays a better APR. The liquidation line is the
+real price, however far away, read from Gate's real margin table, so it is right on a large
+account.
+
+- **One Boros wallet, like the Boros app.** The terminal shows one wallet everywhere and
+  follows the account in Rabby or MetaMask. A chip in the header shows that wallet on every
+  tab, with a green dot when you are logged in to it. A wallet you are not logged in to is view only: it shows "Boros PnL ·
+  0x…", hides your Gate positions, and every trade button reads "Log in to trade 0x…".
+- **Login is checked on the chain.** Log in waits for Boros to confirm, then says "Logged in".
+  While it waits, the wallet reads "Logging in…". A rejected prompt keeps your old login. An
+  expired or revoked login says so and offers "Renew login". Settings warns 14 days before a
+  login ends.
+- **One login per terminal.** Logging in a second wallet asks first. The question names both
+  wallets and warns about unhedged Gate perps. Gas top-up works only for the logged-in wallet.
+- **After the update.** The terminal shows the account in Rabby or MetaMask, and switches when
+  you switch there. With no wallet account, it shows the logged-in wallet once. There is no
+  typed address any more: to see another wallet, switch to it in Rabby or MetaMask.
+
+- **Telegram alerts for each wallet.** Settings has a Set up button. It opens the Boros
+  notifications page. Confirm the terminal there, and the bot watches your legs from then on.
+  Each wallet sets up once, and many wallets can use the same Telegram chat. Alerts cover the
+  logged-in wallet. The alerts of your other wallets pause until you log in to them again. Four alerts: a leg nearing
+  liquidation, a wallet that starts paying interest, a pair within 7 days of maturity, and a
+  roll-over opportunity where a later maturity pays a better APR after fees. Each names the
+  coin, the leg or the wallet, and the price or the maturity, so you know which side to fix.
+  Turn any alert off in Settings. Each wallet keeps its own settings. The terminal checks roll
+  targets itself every 5 minutes, so the alerts work with the browser closed.
+- **The Telegram row says what is true now.** It reads "Checking…" until the first sync, and
+  "not set up" for a wallet with no alerts. It links to the Boros notifications page. Opening
+  it asks the bot at once, so a change made on that page shows here. "Disconnect this
+  terminal" asks first.
+- **Every 1.7.1 setting reads the same way.** Each Settings row opens and closes with its
+  arrow. The interest caption says when a wallet starts borrowing, with the exact floors in a
+  hover. The sync note is in the hover on "synced 3 min ago". A stale price says how long it has been
+  missing instead of a clock time.
+- **The liquidation line reads Gate's margin table.** Gate raises the margin rate in steps as a
+  position grows, so a $400k HYPE leg is liquidated nearer than a flat rate says. The app now
+  reads the table per coin and uses the rate for your size. On a $400k account at 3x that moves
+  the line by $25.
+- **The liquidation line is the real price.** The estimate used to stop at a 10x pump or a 98%
+  dump. It now finds the price however far it is. A coin that no price liquidates reads
+  "No HYPE price liquidates the account".
+- **A coin Gate stops pricing says so.** The last good price is kept for 60 seconds, marked as
+  held. Past that the card says "No liquidation estimate" and names the leg Gate stopped pricing,
+  instead of showing nothing. A held price can no longer size a close: the close window drops its
+  USD field until a real price arrives.
+- **A setup checklist on first run.** Each step says what it needs and what is missing, so a new
+  install reaches a working terminal without reading the guide. The Gate key step lists the
+  four steps to a key, as the 1.7.0 guide did: fund Gate, enable CrossEx, fund CrossEx, make the
+  key with its permissions. Point at a step for the detail.
+- **About links to the code.** Settings › About has a GitHub link to the terminal's source.
+- **A roll-over sizes to what the book fills.** The default roll size, and the size a roll-over
+  alert quotes, now fill the book up to the slippage band, not only its first price level. A
+  small first level no longer shrinks the default to almost nothing on a large pair, so more
+  pairs can qualify for a roll-over alert.
+- **Exit PnL is right for a leg entered at a negative rate.** A long entered at −5% and closed at
+  −3% showed an 8% loss. It now shows the 2% gain.
+- **Rebalance says when no cash can move.** When the wallets are uneven but the gap is margin for
+  open positions, the card and the dialog say "Equity unbalanced but no available cash to move",
+  not "Balanced".
+- **First-run setup does not need a login.** "Continue without logging in" goes on to the next
+  step with the wallet in view only.
+- **Only coins both venues support.** A coin one venue lists and the other does not is no longer
+  offered, on Opportunities and in the order ticket.
+- **A close-only market says so.** The order ticket marks a close-only market and asks you to
+  tick Reduce-only before it sends.
+- **Your tracking start date has a sensible default.** Funding and interest are counted from
+  when you started, not from the beginning of the account. Click the date to change it. The
+  arrow beside it has "All time" and "Use default".
+- **Boros payment history is no longer capped.** The full settlement history loads.
+- **Lighter reads on the Boros API cost less.** The order book is read every 90 seconds instead
+  of 60, fill history and the settlement head every 60 instead of 30, and a hidden ticket stops
+  polling. The worst minute now fits inside the Boros allowance instead of running past it.
+- **The Spot loop says how long it will take.** The confirm step shows the route, the fee and
+  the time, "Spot loop · Fee $3.41 · about 17 h 22 m", before you hold.
+- **Smaller things.** Long waits read as "about 17 h 22 m" instead of "about 1042 min". The
+  Positions health strip names the nearest line first. Venue names read as Gate and Hyperliquid,
+  not as codes. A bundle's Notional hover carries the exact figure beside the short one. Icons
+  match the Boros app. Buttons in one row have one height.
+
 ## 1.7.0 — 2026-09-21
 
 TLDR: Roll a 4-legged position into the next maturity from the app, as one all-or-nothing

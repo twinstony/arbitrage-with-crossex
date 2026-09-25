@@ -62,6 +62,7 @@ const yu = (marketId: number, venue: string, side: 'LONG' | 'SHORT'): AssetBoros
 });
 const group: AssetGroup = {
   base: 'ETH',
+  supported: true,
   priceUsd: 2500,
   earliestSec: NOW - 10 * DAY,
   perpOpen: [perp('GATE', 'LONG'), perp('HYPERLIQUID', 'SHORT')],
@@ -291,7 +292,7 @@ async function armAndHold(user: ReturnType<typeof userEvent.setup>) {
   const dialog = await screen.findByRole('dialog');
   // PICK: the one target maturity is auto-selected; "Roll over →" opens the
   // review once the venue context is in.
-  const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+  const next = await within(dialog).findByRole('button', { name: 'Roll over' });
   await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
   await user.click(next);
   // REVIEW: the hold unlocks once the roll is quoted and the agent is live.
@@ -309,18 +310,22 @@ beforeEach(() => {
 });
 
 describe('RollOverModal — the pick page', () => {
-  it('defaults the size to what fills inside the seed tolerance, LESS a 5% buffer; the shortcuts override it', async () => {
+  it('defaults the size to what fills at the WIDEST tolerance the roll may carry, LESS a 5% buffer; the shortcuts override it', async () => {
     const user = userEvent.setup();
     fitSize = 40;
+    deepSize = 50; // the whole side holds 90
     install();
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
     const box = within(dialog).getByLabelText('Size to roll (ETH)');
-    // Whole position until the quotes land, then the books' own limit — 40
-    // fills inside the seed, and a size ON the limit is one cancelled lot
-    // from a refused batch, so 5% is kept back: 38.
-    await waitFor(() => expect(box).toHaveValue('38'), { timeout: 4_000 });
-    expect(within(dialog).getByText('38%')).toBeInTheDocument();
+    // Whole position until the quotes land, then the books' own limit. Only
+    // 40 fills inside the 1% seed, but the modal widens the tolerance for any
+    // size the band reaches, so the level 1.3% out counts too: 90. A size ON
+    // the limit is one cancelled lot from a refused batch, so 5% is kept
+    // back: 85.5. Sizing at the seed defaulted a live 870 ETH pair to 0.0095
+    // ETH off one stray level (his catch 2026-09-23).
+    await waitFor(() => expect(box).toHaveValue('85.5'), { timeout: 4_000 });
+    expect(within(dialog).getByText('86%')).toBeInTheDocument();
     // The size speaks for itself: no sentence explaining it (his call 2026-09-20).
     expect(within(dialog).queryByRole('note')).not.toBeInTheDocument();
 
@@ -356,7 +361,8 @@ describe('RollOverModal — the pick page', () => {
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
     const box = within(dialog).getByLabelText('Size to roll (ETH)');
-    await waitFor(() => expect(box).toHaveValue('38'), { timeout: 4_000 });
+    // The whole 100 sits inside the band (40 + 60), so it is the default.
+    await waitFor(() => expect(box).toHaveValue('95'), { timeout: 4_000 });
 
     // 75 needs the level 1.3% out: 1.3% × 1.1 headroom = 1.43%, on BOTH
     // batches (both books are this ladder). No warning — it is just done.
@@ -370,7 +376,7 @@ describe('RollOverModal — the pick page', () => {
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
 
     // The review inherits it rather than falling back to the 1% seed.
-    await user.click(within(dialog).getByRole('button', { name: 'Roll over →' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Roll over' }));
     await waitFor(() => {
       const last = rollSims.at(-1)!;
       expect(last.exit.legA.slippageApr).toBeCloseTo(0.0143, 9);
@@ -386,7 +392,9 @@ describe('RollOverModal — the pick page', () => {
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
     const box = within(dialog).getByLabelText('Size to roll (ETH)');
-    await waitFor(() => expect(box).toHaveValue('38'), { timeout: 4_000 });
+    // The default already sits inside what the book holds: no warning.
+    await waitFor(() => expect(box).toHaveValue('66.5'), { timeout: 4_000 });
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
     await user.click(within(dialog).getByRole('button', { name: '75%' }));
     const alert = await within(dialog).findByRole('alert');
     expect(alert).toHaveTextContent(/Size too big: .+ does not hold this much liquidity\. The most that rolls now is 70 ETH\./);
@@ -404,6 +412,8 @@ describe('RollOverModal — the pick page', () => {
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
     const box = within(dialog).getByLabelText('Size to roll (ETH)');
+    // Past the band nothing more counts: the default is what fills inside
+    // it, 40, less the buffer.
     await waitFor(() => expect(box).toHaveValue('38'), { timeout: 4_000 });
     await user.click(within(dialog).getByRole('button', { name: '75%' }));
     expect(await within(dialog).findByRole('alert')).toHaveTextContent(
@@ -558,7 +568,7 @@ describe('RollOverModal — the review page', () => {
     install({ onRollExecute: (body) => { sent.push(body); return okRoll(body); }, onRollSimulate: (b) => sims.push(b) });
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
 
@@ -613,7 +623,7 @@ describe('RollOverModal — the review page', () => {
     });
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
 
@@ -643,7 +653,7 @@ describe('RollOverModal — the review page', () => {
     });
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
     expect(await within(dialog).findByText(/Not enough margin/)).toBeInTheDocument();
@@ -658,7 +668,7 @@ describe('RollOverModal — the review page', () => {
     install();
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
     const required = await within(dialog).findByText('Required margin');
@@ -676,7 +686,7 @@ describe('RollOverModal — the review page', () => {
     install({ rollSimGate: gate });
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
     const confirm = await within(dialog).findByRole('button', { name: 'Roll over' });
@@ -692,7 +702,7 @@ describe('RollOverModal — the review page', () => {
     install();
     renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
     const dialog = await screen.findByRole('dialog');
-    const next = await within(dialog).findByRole('button', { name: 'Roll over →' });
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
     await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
     await user.click(next);
     // Gate LONG locked 4%, closed at 6% → gains 2% × 100 ETH × 8/365y; the

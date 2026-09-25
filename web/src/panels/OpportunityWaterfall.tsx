@@ -24,7 +24,7 @@ import {
   WaterfallPlot,
   type WaterfallStep,
 } from '../components/Waterfall';
-import { fmtPct, fmtUsd } from '../lib/fmt';
+import { fmtPct, fmtUsd, prettyVenue } from '../lib/fmt';
 
 const SECONDS_IN_YEAR = 365 * 86_400;
 
@@ -61,6 +61,20 @@ function costRows(pair: OpportunityPair): Array<[string, number | null, string, 
       'Boros settlement',
       `Boros settlement fees accrued to maturity ${costText(c.borosSettleFeeUsd, true)}`,
     ],
+    // A favorable (negative) cost right after the settlement fee it rebates —
+    // present only when `applyRebate` credited it (toggle on). A dashedAmber
+    // marker draws as dashed emerald because the amount is negative.
+    ...((c.borosSettleRebateUsd ?? 0) > 0
+      ? ([
+          [
+            'opp-boros-settle-rebate',
+            -(c.borosSettleRebateUsd as number),
+            dashedAmber,
+            'Settlement rebate',
+            `Boros settlement-fee rebate credited to maturity ${costText(-(c.borosSettleRebateUsd as number), true)}`,
+          ] as [string, number | null, string, string, string],
+        ])
+      : []),
     [
       'opp-perp-entry-fees',
       c.perpEntryFeesUsd,
@@ -180,28 +194,28 @@ function buildCapitalSteps(pair: OpportunityPair): WaterfallStep[] {
       cap.borosShortImUsd,
       'bg-info/45',
       'Boros short IM',
-      `Boros initial margin · ${pair.shortLeg.venue} (short) +${fmtUsd(cap.borosShortImUsd ?? 0)}`,
+      `Boros initial margin · ${prettyVenue(pair.shortLeg.venue)} (short) +${fmtUsd(cap.borosShortImUsd ?? 0)}`,
     ],
     [
       'cap-boros-long',
       cap.borosLongImUsd,
       'bg-info/45',
       'Boros long IM',
-      `Boros initial margin · ${pair.longLeg.venue} (long) +${fmtUsd(cap.borosLongImUsd ?? 0)}`,
+      `Boros initial margin · ${prettyVenue(pair.longLeg.venue)} (long) +${fmtUsd(cap.borosLongImUsd ?? 0)}`,
     ],
     [
       'cap-perp-short',
       cap.perpShortImUsd,
       'bg-ink-300/30',
       `Perp short IM${lev(cap.shortLeverageMax)}`,
-      `Perp initial margin · ${pair.shortLeg.venue} (short) — notional over the venue's max leverage${lev(cap.shortLeverageMax)} +${fmtUsd(cap.perpShortImUsd ?? 0)}`,
+      `Perp initial margin · ${prettyVenue(pair.shortLeg.venue)} (short) — notional over the venue's max leverage${lev(cap.shortLeverageMax)} +${fmtUsd(cap.perpShortImUsd ?? 0)}`,
     ],
     [
       'cap-perp-long',
       cap.perpLongImUsd,
       'bg-ink-300/30',
       `Perp long IM${lev(cap.longLeverageMax)}`,
-      `Perp initial margin · ${pair.longLeg.venue} (long) — notional over the venue's max leverage${lev(cap.longLeverageMax)} +${fmtUsd(cap.perpLongImUsd ?? 0)}`,
+      `Perp initial margin · ${prettyVenue(pair.longLeg.venue)} (long) — notional over the venue's max leverage${lev(cap.longLeverageMax)} +${fmtUsd(cap.perpLongImUsd ?? 0)}`,
     ],
   ];
 

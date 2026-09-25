@@ -1,12 +1,26 @@
 # User guide
 
 In this guide, we will cover:
-1. How the strategy works
-2. The recommended flow for using CrossEx Boros Terminal
-3. How to maximise return
-4. Risk Disclosure
+1. How to set up Gate and create an API key
+2. How the strategy works
+3. The recommended flow for using CrossEx Boros Terminal
+4. How to maximise return
+5. Risk Disclosure
 
-## 1. How the strategy works
+## 1. How to set up Gate and create an API key
+
+1. **Fund Gate** - sign up at [gate.com/signup](https://www.gate.com/signup) and deposit the capital you'll deploy.
+2. **Enable CrossEx** - switch on the CrossEx feature at [gate.com/crossex](https://www.gate.com/crossex). The API key permission and the transfer step both need it enabled first.
+3. **Fund CrossEx** - move funds into [CrossEx](https://www.gate.com/crossex), Gate's cross-exchange margin account.
+4. **Create an API key** - in [API Management](https://www.gate.com/myaccount/api_key_manage), create an APIv4 key for your Trading account. Set IP Permissions to "Later" unless your machine has a consistent IP. Under Permissions, turn on:
+   - **Cross-Exchange**: Read and Write - trade and transfer
+   - **Spot Trading**: Read Only - see spot balances
+   - Leave all others off, including Withdrawal
+
+   Keys stay on this machine.
+5. Paste the key into the terminal's **Gate API key** step.
+
+## 2. How the strategy works
 
 Perp traders pay (or earn) a floating funding rate. On [Boros](https://boros.pendle.finance), that funding rate is itself tradable - and the same coin's funding often carries **different implied fixed rates on different venues**: say ETH funding priced at 8% APR on Hyperliquid but 5% on Binance. The strategy locks in that gap.
 
@@ -19,9 +33,9 @@ Once everything nets out there is no price exposure and no floating-rate exposur
 
 Boros Academy walks through this strategy in more depth: [Fixed-Return Funding Arbitrage](https://docs.pendle.finance/boros-academy/advanced-strategies/fixed-return-funding-arbitrage).
 
-**Fixed does not mean risk-free** - see section 4.
+**Fixed does not mean risk-free** - see section 5.
 
-## 2. The recommended flow for using CrossEx Boros Terminal
+## 3. The recommended flow for using CrossEx Boros Terminal
 You will use the tool for 3 things, in order:
 
 ### A. Discover and understand opportunities
@@ -125,7 +139,7 @@ The borrow costs two things. Gate holds 20% of it as initial margin and 10% as m
 
 A Lighter borrow of $50 pays interest on all $50. A Hyperliquid borrow of $50 pays nothing.
 
-A hedged pair is delta-neutral, but not margin-neutral. Gate liquidates the account when the margin balance falls to the maintenance margin, and the maintenance margin grows with a move against a USDC leg on Hyperliquid or Lighter: each leg's maintenance margin scales with its notional, and the losing leg drives its wallet negative, a borrow that adds 10% of itself to the maintenance margin. Each card on the Positions tab carries a chip like `Liquidates if ETH hits ~$3,150 (+37%)`: the price of the coin at which the account liquidates if only that coin moves and every other coin holds still. It turns amber inside 30% and red inside 15%. A pair that the model priced to a 10x pump and a 98% dump without finding a line reads `Safe through a 10x HYPE pump or 98% dump`. If Gate's margin figures are missing, the chip reads `No liquidation estimate` rather than claiming safety. The same nearest line sits in the hover of the IM and MM gauges in the header.
+A hedged pair is delta-neutral, but not margin-neutral. Gate liquidates the account when the margin balance falls to the maintenance margin, and the maintenance margin grows with a move against a USDC leg on Hyperliquid or Lighter: each leg's maintenance margin scales with its notional, and the losing leg drives its wallet negative, a borrow that adds 10% of itself to the maintenance margin. Each card on the Positions tab carries a chip like `Liquidation: ETH @ ~$3,150 (+37%)`: the price of the coin at which the account liquidates if only that coin moves and every other coin holds still. It turns amber inside 30% and red inside 15%. A coin that can fall to $0 or rise without limit and never liquidate the account reads `No HYPE price liquidates the account`. If Gate's margin figures are missing, the chip reads `No liquidation estimate` rather than claiming safety. The same nearest line sits in the hover of the IM and MM gauges in the header.
 
 The Balances tab shows the margin card, then the Assets table. Under the table are your borrow, its interest now and the interest paid, then **Rebalance** and **Manual Transfer**. Hover a figure to see each wallet. Rebalance splits your CrossEx equity across the three wallets by position size. Each wallet's share is its legs at mark price, divided by all legs. Equity is cash plus unrealized profit or loss.
 
@@ -191,7 +205,7 @@ Transfers wait while a rebalance runs or is stopped, or while a deal is still wo
 
 A deal waits a few seconds after a transfer starts, until Gate has taken the money.
 
-## 3. How to maximise return
+## 4. How to maximise return
 These few factors move the needle the most in maximising your return on the 4-legged Funding Rate Arbitrage
 1. Reduce perp fees with a **higher VIP tier** in Gate.
    * Play around with the VIP tier assumption in https://boros.pendle.finance/arbitrage-crossex, and you will see the immediate impact of your VIP tier on the potential returns.
@@ -209,7 +223,7 @@ These few factors move the needle the most in maximising your return on the 4-le
    * To optimise for the spread you are locking, try to use **limit orders** to fill at least one Boros leg, and do a **market order** on the other leg. Sometimes, it can give you a much higher spread.
    * That said, sometimes when a decent opportunity are there that you can just market order, you could just take it (otherwise, some other users might take it before you)
 
-## 4. Risk Disclosure
+## 5. Risk Disclosure
 - **CEX risk** - your funds custody with Gate.
 - **Cross-margin risk** - CrossEx manages margin across exchanges for you.
 - **Spread risk** - rare, but the perp legs could diverge enough to trigger liquidation.

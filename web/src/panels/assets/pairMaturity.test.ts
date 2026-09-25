@@ -43,6 +43,7 @@ const yu = (o: Partial<AssetBorosOpen> & { venue: string; side: 'LONG' | 'SHORT'
 
 const group = (o: Partial<AssetGroup>): AssetGroup => ({
   base: 'ETH',
+  supported: true,
   priceUsd: 2500,
   earliestSec: NOW - 10 * DAY,
   perpOpen: [],
@@ -70,6 +71,40 @@ describe('settlement fees are netted out of the locked rate', () => {
     // fee is a cost to the holder regardless of side.
     const expected = ((0.08 - 0.04) * notional - 2 * 0.001 * notional) / cap;
     expect(d.pairs[0].lockedAprFwd).toBeCloseTo(expected, 9);
+  });
+
+  it('a current rebate discounts the settle fee in BOTH the pair and asset locked rates', () => {
+    mid = 1;
+    const g = group({
+      perpOpen: [perp({ venue: 'GATE', side: 'LONG', qty: 100 }), perp({ venue: 'HYPERLIQUID', side: 'SHORT', qty: 100 })],
+      borosOpen: [
+        yu({ venue: 'GATE', side: 'LONG', sizeToken: 100, maturity: SEP, entryApr: 0.04, settleFeeApr: 0.001 }),
+        yu({ venue: 'HYPERLIQUID', side: 'SHORT', sizeToken: 100, maturity: SEP, entryApr: 0.08, settleFeeApr: 0.001 }),
+      ],
+    });
+    // 20% rebate ⇒ the settle fee costs 0.0008 per leg instead of 0.001.
+    const rebate = {
+      mode: 'relative' as const,
+      settlementFeePercentage: 0.8,
+      rebateBps: 2000,
+      startTimestamp: null,
+      endTimestamp: null,
+      marketIds: null,
+      active: true,
+    };
+    const d = deriveAsset(g, {}, 0, NOW, undefined, rebate);
+    const notional = 100 * 2500;
+    const cap = d.pairs[0].capitalUsd;
+    const expectedPair = ((0.08 - 0.04) * notional - 2 * 0.0008 * notional) / cap;
+    expect(d.pairs[0].lockedAprFwd).toBeCloseTo(expectedPair, 9);
+    // Asset-level locked carry uses the same discount.
+    const noRebate = deriveAsset(g, {}, 0, NOW);
+    expect(d.lockedCarryPerYearUsd as number).toBeGreaterThan(noRebate.lockedCarryPerYearUsd as number);
+    expect((d.lockedCarryPerYearUsd as number) - (noRebate.lockedCarryPerYearUsd as number)).toBeCloseTo(
+      2 * 0.2 * 0.001 * notional,
+      6,
+    );
+    expect(d.rebate).toEqual(rebate);
   });
 
   it('a missing settleFeeApr (older server) leaves the rate unchanged', () => {
@@ -324,5 +359,38 @@ describe('ungrouped legs: what no 4-leg unit claimed', () => {
     expect(d.pendingLegs[0].share).toBeCloseTo(0.4, 9);
     // Both perps are 60% paired; the other 40% of each is ungrouped.
     expect(d.unpairedPerps.map((l) => l.share)).toEqual([0.4, 0.4].map((v) => expect.closeTo(v, 9)));
+  });
+});
+
+describe('a Boros leg with no entry rate yet', () => {
+  const perps = () => [perp({ venue: 'GATE', side: 'LONG', qty: 100 }), perp({ venue: 'HYPERLIQUID', side: 'SHORT', qty: 100 })];
+  const sepPair = (gateEntry: number | null) => [
+    yu({ venue: 'GATE', side: 'LONG', sizeToken: 100, maturity: SEP, entryApr: gateEntry }),
+    yu({ venue: 'HYPERLIQUID', side: 'SHORT', sizeToken: 100, maturity: SEP, entryApr: 0.08 }),
+  ];
+
+  it('leaves the locked rate unknown instead of reading the leg as 0%', () => {
+    mid = 1;
+    const known = deriveAsset(group({ perpOpen: perps(), borosOpen: sepPair(0.04) }), {}, 0, NOW);
+    expect(known.pairs[0].lockedAprFwd).not.toBeNull();
+    expect(known.lockedAprFwd).not.toBeNull();
+
+    mid = 1;
+    const d = deriveAsset(group({ perpOpen: perps(), borosOpen: sepPair(null) }), {}, 0, NOW);
+    expect(d.pairs[0].lockedAprFwd).toBeNull();
+    expect(d.pairs[0].legs.find((l) => l.kind === 'yu' && l.venue === 'GATE')?.lockedApr).toBeNull();
+    expect(d.pairs[0].legs.find((l) => l.kind === 'yu' && l.venue === 'HYPERLIQUID')?.lockedApr).toBeCloseTo(0.08, 9);
+    expect(d.lockedAprFwd).toBeNull();
+    expect(d.lockedCarryPerYearUsd).toBeNull();
+    expect(d.lockedToMaturityUsd).toBeNull();
+  });
+
+  it('a pending leg with no entry rate shows no locked rate', () => {
+    mid = 1;
+    const orphan = yu({ venue: 'HYPERLIQUID', side: 'SHORT', sizeToken: 40, maturity: OCT, entryApr: null });
+    const d = deriveAsset(group({ perpOpen: perps(), borosOpen: [...sepPair(0.04), orphan] }), {}, 0, NOW);
+    expect(d.pendingLegs).toHaveLength(1);
+    expect(d.pendingLegs[0].lockedApr).toBeNull();
+    expect(d.pairs[0].lockedAprFwd).not.toBeNull();
   });
 });

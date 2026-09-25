@@ -4,7 +4,7 @@ import { http, HttpResponse } from 'msw';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useRebalance } from '../api/queries';
-import type { PositionsResponse, RebalanceView, RoutePlan, TransferView } from '../api/types';
+import type { PositionsResponse, RebalanceJob, RebalanceView, RoutePlan, TransferView } from '../api/types';
 import {
   plansOf,
   accountBodies,
@@ -272,7 +272,7 @@ describe('RebalanceSection card', () => {
     await waitFor(() => expect(cardButtons().length).toBeGreaterThan(0));
     await user.click(cardButtons()[0]);
     const dialog = await screen.findByRole('dialog');
-    await user.click(await within(dialog).findByRole('button', { name: 'Transfer ▸' }));
+    await user.click(await within(dialog).findByRole('button', { name: 'Transfer' }));
     expect(onTransfer).toHaveBeenCalledWith('USDT', 'CROSSEX');
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
@@ -380,19 +380,23 @@ describe('RebalanceSection verdict', () => {
     expect(cardButtons()[0]).toBeEnabled();
   });
 
-  it('balanced by cash names the amount stuck', async () => {
+  it('stuck by margin is a warning with no amount, and no chip: never "Balanced"', async () => {
     await show(CASH_LIMITED_EVEN);
-    expect(line('$203.64 cannot move. It is margin for open positions.')).toBeInTheDocument();
+    expect(line('Equity unbalanced but no available cash to move.')).toHaveClass('text-gold');
+    expect(within(region()).queryByText(/\$203\.64/)).toBeNull();
     expect(line('Wallets match their position share. Nothing to move.')).toBeNull();
-    expect(within(region()).getByText('Balanced')).toBeInTheDocument();
+    // Nothing moves, but the wallets do not match: the chip must not say so.
+    expect(within(region()).queryByText('Balanced')).toBeNull();
+    expect(within(region()).queryByText('Uneven')).toBeNull();
     expect(cardButtons()[0]).toBeEnabled();
   });
 
   it('balanced short under 1 keeps Balanced', async () => {
     await show({ ...CASH_LIMITED_EVEN, plans: plansOf({ ...CASH_LIMITED_EVEN.plans.even, shortOfEven: 0.99 }) });
     expect(line('Wallets match their position share. Nothing to move.')).toBeInTheDocument();
-    expect(within(region()).queryByText(/cannot move/)).toBeNull();
+    expect(line('Equity unbalanced but no available cash to move.')).toBeNull();
     expect(within(region()).getByText('Balanced')).toBeInTheDocument();
+    expect(within(region()).queryByText('Uneven')).toBeNull();
   });
 
   it('the button says it waits for the transfer, with no chip', async () => {
@@ -463,6 +467,18 @@ describe('RebalanceSection facts rows', () => {
   });
 });
 
+const verdictLine = (): string =>
+  region().querySelector('.alert-blue span:not([aria-hidden]) span')?.textContent ?? '';
+
+const slowJob = (job: RebalanceJob, rounds: number): RebalanceJob => ({
+  ...job,
+  createdAt: REBALANCE_NOW,
+  stepIndex: 0,
+  steps: Array.from({ length: rounds }, (_, i) => ({
+    ...job.steps[0], round: i + 1, from: 'HYPERLIQUID' as const, to: 'CROSSEX' as const,
+  })),
+});
+
 describe('RebalanceSection run states', () => {
   beforeEach(() => {
     vi.setSystemTime(REBALANCE_NOW);
@@ -478,9 +494,21 @@ describe('RebalanceSection run states', () => {
     expect(within(region()).getByRole('button', { name: 'Running · round 3 of 5' })).toBeEnabled();
     // The job line rides the same VerdictAlert as every other verdict now, so
     // it is the box's sentence rather than a bare <p>.
-    const verdict = region().querySelector('.alert-blue span:not([aria-hidden]) span')?.textContent ?? '';
+    const verdict = verdictLine();
     expect(verdict).toMatch(/^Rebalance running, about .+ left\.$/);
     expect(verdict).not.toMatch(/repays|would move/);
+  });
+
+  it('past an hour the running line says hours and minutes in the same words as the minutes form', async () => {
+    const running = rebalanceViews.accountARunning;
+    await show({ ...running, job: slowJob(running.job, 10) });
+    expect(verdictLine()).toBe('Rebalance running, about 1 hour 7 minutes left.');
+  });
+
+  it('a whole hour left says the hour and no zero minutes', async () => {
+    const running = rebalanceViews.accountARunning;
+    await show({ ...running, job: slowJob(running.job, 9) });
+    expect(verdictLine()).toBe('Rebalance running, about 1 hour left.');
   });
 
   it('halted chip and button', async () => {
@@ -551,10 +579,10 @@ describe('RebalanceSection gate spot and freshness', () => {
     );
     await user.click(screen.getByRole('button', { name: 'switch tab' }));
     expect(facts().Borrowing).toBe('244.00 USDC');
-    expect(within(region()).getByText(/^⟳ \d+s ago$/)).toBeInTheDocument();
+    expect(within(region()).getByText(/^\d+s ago$/)).toBeInTheDocument();
     await waitFor(() => expect(pending.land).toBeDefined());
     pending.land?.();
-    await waitFor(() => expect(within(region()).queryByText(/^⟳ \d+s ago$/)).toBeNull());
+    await waitFor(() => expect(within(region()).queryByText(/^\d+s ago$/)).toBeNull());
   });
 
   it('load error shows the message and Retry reads again', async () => {

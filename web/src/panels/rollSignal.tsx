@@ -13,6 +13,13 @@
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
 
 /** What one pair is offering, as the card worked it out. */
+export interface RollChance {
+  maturity: number;
+  rate: number;
+  current: number;
+  currentMaturity: number;
+}
+
 export interface RollSignal {
   /** Stable per pair: asset + the two venues + the maturity held. */
   key: string;
@@ -23,7 +30,8 @@ export interface RollSignal {
   maturity: number;
   /** A better rate is available at a later maturity; null when the only
    * reason to act is that this pair is about to settle. */
-  opportunity: { maturity: number; rate: number; current: number; currentMaturity: number } | null;
+  opportunity: RollChance | null;
+  opportunities: RollChance[];
 }
 
 interface RollSignalApi {
@@ -66,18 +74,16 @@ export function RollSignalProvider({ children }: { children: ReactNode }) {
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
+const sameChance = (a: RollChance, b: RollChance): boolean =>
+  a.maturity === b.maturity && a.rate === b.rate && a.current === b.current && a.currentMaturity === b.currentMaturity;
+
 const same = (a: RollSignal, b: RollSignal): boolean =>
   a.maturity === b.maturity &&
   a.asset === b.asset &&
   a.longVenue === b.longVenue &&
   a.shortVenue === b.shortVenue &&
-  (a.opportunity === b.opportunity ||
-    (a.opportunity !== null &&
-      b.opportunity !== null &&
-      a.opportunity.maturity === b.opportunity.maturity &&
-      a.opportunity.rate === b.opportunity.rate &&
-      a.opportunity.current === b.opportunity.current &&
-      a.opportunity.currentMaturity === b.opportunity.currentMaturity));
+  a.opportunities.length === b.opportunities.length &&
+  a.opportunities.every((o, i) => sameChance(o, b.opportunities[i]));
 
 /** Null outside the provider (unit tests render panels bare). */
 export function useRollSignalsOptional(): RollSignalApi | null {

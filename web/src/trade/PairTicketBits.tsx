@@ -11,6 +11,7 @@ import { bpsOf, fmtAge, fmtUsd, parseSymbol, prettyVenue, sig } from '../lib/fmt
 import { useNow } from '../lib/useNow';
 import { estFeeOf, PreviewFallback, SlippageBadge, ViolationList } from './previewBits';
 import { FieldLabel } from './SymbolCombobox';
+import { ChevronDown, RotateCw } from 'lucide-react';
 
 export type ExecMode = 'market' | 'maker';
 export const TIMEOUT_CHOICES = [
@@ -127,7 +128,11 @@ export function EstimateCard({
         </span>
         <span className="flex items-center gap-2 text-[11px] text-ink-400">
           <span className="num">
-            {isError ? 'preview failed' : estimating ? 'estimating…' : age !== null ? `⟳ ${age} ago` : '⟳ —'}
+            {isError ? 'preview failed' : estimating ? 'estimating…' : (
+              <>
+                <RotateCw size={12} aria-hidden className="inline" /> {age !== null ? `${age} ago` : '—'}
+              </>
+            )}
           </span>
           {aside}
         </span>
@@ -330,9 +335,7 @@ function VenueSelect({
           ))}
         </select>
         <span aria-hidden className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-ink-400">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <path d="M2.5 4.5 6 8l3.5-3.5" />
-          </svg>
+          <ChevronDown size={14} aria-hidden />
         </span>
       </div>
     </div>

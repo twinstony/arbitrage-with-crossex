@@ -27,13 +27,16 @@ import type {
 } from '../../api/types';
 import { TokenIcon, VenueIcon } from '../../components/AssetIcon';
 import { Chip } from '../../components/Chip';
+import { HoverCard } from '../../components/HoverCard';
+import { Spinner } from '../../components/Spinner';
 import { microLabelClass } from '../../components/Th';
 import { SharePositionModal } from '../SharePositionModal';
 import { ClosePairForm } from '../PerpOnlyBox';
+import { BorosLogInButton } from '../../trade/BorosAgentSetup';
 import { CloseBorosForm } from '../../trade/CloseBorosForm';
 import { ClosePopover } from '../../trade/ClosePopover';
 import { useTradeFlowOptional } from '../../trade/TradeFlow';
-import { useTrackedAddressOptional } from '../trackedAddress';
+import { useActiveWallet, useTrackedAddressOptional } from '../trackedAddress';
 import {
   useBorosAgent,
   useBorosCancelAndClose,
@@ -53,8 +56,18 @@ import { useNow } from '../../lib/useNow';
 import { pairSharePayload } from '../sharePayload';
 import type { SharePayloadV1 } from '../../lib/shareCodec';
 import { SignedNumber } from '../../components/SignedNumber';
-import { fmtDateLocal, fmtPct, fmtTokenQty, fmtUsd, fmtUsdCompact, num, prettyVenue } from '../../lib/fmt';
-import { describeLine, lineLabel, type LiquidationLine } from '../../lib/liquidation';
+import {
+  fmtDateLocal,
+  fmtDateShort,
+  fmtPct,
+  fmtTokenQty,
+  fmtUsd,
+  fmtUsdCompact,
+  num,
+  parseDateLocal,
+  prettyVenue,
+} from '../../lib/fmt';
+import { lineDetail, lineLabel, unknownLabel, type LiquidationLine } from '../../lib/liquidation';
 import {
   type AssetDerived,
   type ExclusionEntry,
@@ -80,15 +93,19 @@ import {
   pairCanRoll,
   pairLockedSpread,
   pairPerpCloseLegs,
+  entryAprOf,
   perpOnlyCloseLegs,
   perpOnlyPairs,
   sizeIn,
 } from './assetModel';
 import { knownRate } from '../../lib/boros';
+import { rebatedSettleApr } from '../../lib/rebate';
 import { useDebounced } from '../../lib/useDebounced';
 import { AssetBars } from './AssetBars';
-import { fitAcross, maxRollSize, planBatch, suggestedRollSize, type BatchLimit } from './rollSizing';
+import { SinceChip } from './SinceChip';
+import { fitAtBand, maxRollSize, planBatch, suggestedRollSize, type BatchLimit } from './rollSizing';
 import { useRollPublisher, useRollSignalsOptional } from '../rollSignal';
+import { ArrowLeft, ArrowRight, ChartColumnDecreasing, ChartPie, Check, ChevronDown, RotateCw, Share } from 'lucide-react';
 
 interface Props {
   group: AssetGroup;
@@ -98,7 +115,11 @@ interface Props {
   /** True while a newly-chosen window's fetch is still in flight (the
    * all-time numbers stand in meanwhile). */
   windowPending: boolean;
-  onChangeSince: (sec: number) => void;
+  storedSinceSec: number | undefined;
+  defaultSinceSec: number | null;
+  onChangeSince: (sec: number | undefined) => void;
+  backfilling: boolean;
+  supportedCoins: string[];
   exclusions: Exclusions;
   /** value: the excluded slice ({qty, at?} in the leg's unit), 'all', or
    * undefined to include the whole leg again. */
@@ -107,48 +128,69 @@ interface Props {
    * is an earlier use of the market, not this farm's. */
   legSince?: Record<string, number>;
   onLegSince?: (key: string, sec: number | undefined) => void;
-  /** Where the ACCOUNT liquidates if only this coin moves. 'far' = no line
-   * within 10x, 'unknown' = Gate sent no margin figures, null = not loaded
+  /** Where the ACCOUNT liquidates if only this coin moves. 'far' = no price
+   * liquidates it, 'unknown' = Gate sent no margin figures, null = not loaded
    * or this coin has no priced leg in the connected account. */
-  liquidation?: LiquidationLine | 'far' | 'unknown' | null;
+  liquidation?: LiquidationLine | StaleLeg | 'far' | 'unknown' | null;
+  gateHidden?: boolean;
 }
+
+type StaleLeg = { base: string; venue: string; sinceMs: number };
 
 /** Where this coin's move liquidates the account. Red inside 15%, amber
  * inside 30%: a hedged asset is delta-neutral but not margin-neutral — the
  * losing Hyperliquid leg drives its USDC wallet into a borrow, and Gate
  * charges maintenance margin on that. */
-function LiquidationChip({ line, base }: { line: LiquidationLine | 'far' | 'unknown'; base: string }) {
+/** Header chips share the price's 12px, so the row reads as two sizes: the coin, then everything else. */
+const HEAD_CHIP = '!px-1.5 !py-[3px] !text-[12px] !font-medium';
+
+function LiquidationChip({ line, base }: { line: LiquidationLine | StaleLeg | 'far' | 'unknown'; base: string }) {
+  const now = useNow(60_000);
+  if (typeof line !== 'string' && 'sinceMs' in line) {
+    return (
+      <HoverCard underline={false} icon={false} widthPx={320} label={<Chip className={HEAD_CHIP}>No liquidation estimate</Chip>}>
+        {unknownLabel(line, now)}
+      </HoverCard>
+    );
+  }
   if (line === 'unknown') {
     return (
-      <Chip sm title="Gate did not send the account's margin figures.">
-        No liquidation estimate
-      </Chip>
+      <HoverCard underline={false} icon={false} widthPx={320} label={<Chip className={HEAD_CHIP}>No liquidation estimate</Chip>}>
+        No margin data from Gate.
+      </HoverCard>
     );
   }
   if (line === 'far') {
     return (
-      <Chip
-        sm
-        title={`Estimate: the account is not liquidated if ${base} rises 10x or falls 98% and every other coin holds still.`}
+      <HoverCard
+        underline={false}
+        icon={false}
+        widthPx={320}
+        label={<Chip className={HEAD_CHIP}>No liquidation price</Chip>}
       >
-        {`Safe through a 10x ${base} pump or 98% dump`}
-      </Chip>
+        {`No ${base} price liquidates the Gate account. Assumes other coins do not move.`}
+      </HoverCard>
     );
   }
   const near = Math.abs(line.move);
   return (
-    <Chip sm tone={near < 0.15 ? 'red' : near < 0.3 ? 'amber' : 'neutral'} className="num" title={describeLine(line)}>
-      {lineLabel(line)}
-    </Chip>
+    <HoverCard
+      underline={false}
+      icon={false}
+      widthPx={320}
+      label={
+        <Chip tone={near < 0.15 ? 'red' : near < 0.3 ? 'amber' : 'neutral'} className={`num ${HEAD_CHIP}`}>
+          {lineLabel(line)}
+        </Chip>
+      }
+    >
+      {lineDetail(line)}
+    </HoverCard>
   );
 }
 
-/** Unix seconds → the value an <input type="date"> wants (local). */
-const toDateInput = (sec: number): string => {
-  const d = new Date(sec * 1000);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-};
+const listCoins = (coins: string[]): string =>
+  coins.length > 1 ? `${coins.slice(0, -1).join(', ')} and ${coins[coins.length - 1]}` : (coins[0] ?? '');
 
 const sizeLabel = (size: number, unit: 'base' | 'usd', base: string): string =>
   unit === 'base' ? fmtTokenQty(size, base) : fmtUsdCompact(size);
@@ -278,26 +320,7 @@ function PairListHeader() {
   );
 }
 
-/** ↻ — the roll-over pill's mark. */
-function RollIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
-      <path d="M13.5 2.5v3h-3" />
-    </svg>
-  );
-}
 
-/** ⤴ — the share pill's mark. */
-function ShareIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M8 10V2.5" />
-      <path d="M5 5.5 8 2.5l3 3" />
-      <path d="M3 9v4h10V9" />
-    </svg>
-  );
-}
 
 /**
  * The card's two projections of one book, as tabs under the hero: the
@@ -394,7 +417,7 @@ function PairCard({
   /** The card's roll signal for the asset's banner: the best maturity a
    * fifth of this pair could roll into at a better rate than it earns now,
    * or null. Reported whenever it changes. */
-  onRollSignal?: (opportunity: RollOpportunity | null) => void;
+  onRollSignal?: (opportunities: RollOpportunity[]) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const canRoll = pairCanRoll(pair, nowSec);
@@ -488,15 +511,16 @@ function PairCard({
   );
   const { yuLegs: rollYuLegs, heldSize: rollHeldSize, pairPerpImUsd: rollPerpImUsd } = pairRollGeometry(pair);
   const [probes, setProbes] = useState<Record<number, RollProbeResult>>({});
-  const opportunity = useMemo(
-    () => bestRollOpportunity(probes, probeTargets, netApr, soonest),
+  const opportunities = useMemo(
+    () => rollOpportunities(probes, probeTargets, netApr, soonest),
     [probes, probeTargets, netApr, soonest],
   );
+  const opportunity = opportunities[0] ?? null;
   const signalRef = useRef(onRollSignal);
   signalRef.current = onRollSignal;
-  const oppKey = opportunity ? `${opportunity.maturity}:${opportunity.rate}:${opportunity.current}:${opportunity.currentMaturity}` : '';
+  const oppKey = opportunities.map((o) => `${o.maturity}:${o.rate}:${o.current}:${o.currentMaturity}`).join('|');
   useEffect(() => {
-    signalRef.current?.(opportunity);
+    signalRef.current?.(opportunities);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oppKey]);
   // The spread on notional — the cross-farm comparison basis, and the number
@@ -679,7 +703,7 @@ function PairCard({
             </td>
             <td className="whitespace-nowrap pl-3 pr-4 text-right">
               <span aria-hidden className={`pp-chevron transition-transform ${open ? 'rotate-180' : ''}`}>
-                <ChevronIcon />
+                <ChevronDown size={14} aria-hidden />
               </span>
             </td>
           </tr>
@@ -780,7 +804,7 @@ function PairCard({
                     )
                   }
                 >
-                  <ShareIcon />
+                  <Share size={12} aria-hidden />
                   Share
                 </button>
               )}
@@ -814,7 +838,7 @@ function PairCard({
                   title="Move the Boros legs to a later maturity."
                   onClick={onRollOver}
                 >
-                  <RollIcon />
+                  <RotateCw size={13} aria-hidden />
                   Roll over
                 </button>
               )}
@@ -1048,30 +1072,30 @@ export interface RollOpportunity {
   size: number;
 }
 
-function bestRollOpportunity(
+function rollOpportunities(
   probes: Record<number, RollProbeResult>,
   targets: RollTarget[],
   current: number | null,
   currentMaturity: number,
-): RollOpportunity | null {
-  if (current === null) return null;
-  let best: RollOpportunity | null = null;
+): RollOpportunity[] {
+  if (current === null) return [];
+  const found: RollOpportunity[] = [];
   for (const t of targets) {
     const r = probes[t.maturity];
     if (!r || !r.ok || r.rate === null || !(r.rate > current)) continue;
-    if (best === null || r.rate > best.rate) best = { maturity: t.maturity, rate: r.rate, current, currentMaturity, size: r.size };
+    found.push({ maturity: t.maturity, rate: r.rate, current, currentMaturity, size: r.size });
   }
-  return best;
+  return found.sort((a, b) => b.rate - a.rate);
 }
 
 /**
  * One maturity, priced for the banner EXACTLY as the modal will price it.
  * Renders nothing; slow poll — it is a signal, the modal re-prices live.
  *
- * Two stages. First a quote at a FIFTH of the position: it says how much the
- * books take inside tolerance (`sizeWithinTolerance`, size-independent), and
- * so what size the modal will DEFAULT to — the smaller of that and the
- * position. A default under a fifth is no opportunity: the market cannot
+ * Two stages. First a quote at a FIFTH of the position: its ladders say how
+ * much the books take at the widest tolerance each batch may carry
+ * (`fitAtBand`, size-independent), and so what size the modal will DEFAULT
+ * to — the smaller of that and the position. A default under a fifth is no opportunity: the market cannot
  * take a meaningful slice. Then a quote AT that default size, both batches,
  * through the same `rollFigures` the option card uses, so the banner's rate
  * is the modal's opening headline to the decimal.
@@ -1101,22 +1125,26 @@ function RollProbe({
 }) {
   const longLeg = yuLegs.find((l) => l.venue === pair.longVenue);
   const shortLeg = yuLegs.find((l) => l.venue === pair.shortVenue);
-  const reqs = (size: number): { exit: BorosPairRequest | null; entry: BorosPairRequest | null } => {
+  const reqs = (
+    size: number,
+    exitSlip: number,
+    entrySlip: number,
+  ): { exit: BorosPairRequest | null; entry: BorosPairRequest | null } => {
     if (address === null || !(size > 0) || longLeg?.marketId === undefined || shortLeg?.marketId === undefined) {
       return { exit: null, entry: null };
     }
     return {
       exit: {
         address,
-        legA: { marketId: longLeg.marketId, direction: longLeg.side === 'LONG' ? 'short' : 'long', slippageApr: exitSlippageApr },
-        legB: { marketId: shortLeg.marketId, direction: shortLeg.side === 'LONG' ? 'short' : 'long', slippageApr: exitSlippageApr },
+        legA: { marketId: longLeg.marketId, direction: longLeg.side === 'LONG' ? 'short' : 'long', slippageApr: exitSlip },
+        legB: { marketId: shortLeg.marketId, direction: shortLeg.side === 'LONG' ? 'short' : 'long', slippageApr: exitSlip },
         size,
         intent: 'close',
       },
       entry: {
         address,
-        legA: { marketId: target.longMarketId, direction: longLeg.side === 'LONG' ? 'long' : 'short', slippageApr: entrySlippageApr },
-        legB: { marketId: target.shortMarketId, direction: shortLeg.side === 'LONG' ? 'long' : 'short', slippageApr: entrySlippageApr },
+        legA: { marketId: target.longMarketId, direction: longLeg.side === 'LONG' ? 'long' : 'short', slippageApr: entrySlip },
+        legB: { marketId: target.shortMarketId, direction: shortLeg.side === 'LONG' ? 'long' : 'short', slippageApr: entrySlip },
         size,
         intent: 'open',
       },
@@ -1124,9 +1152,10 @@ function RollProbe({
   };
   const opts = { refetchInterval: ROLL_PROBE_POLL_MS };
 
-  // Stage 1: a fifth, for the fit.
+  // Stage 1: a fifth, for the fit. The ladders it returns are the whole book,
+  // whatever size or tolerance asked for them.
   const fifth = heldSize * ROLL_OPPORTUNITY_SHARE;
-  const r1 = reqs(fifth);
+  const r1 = reqs(fifth, exitSlippageApr, entrySlippageApr);
   const exit1 = useBorosPairSimulation(r1.exit, r1.exit !== null, opts);
   const entry1 = useBorosPairSimulation(r1.entry, r1.entry !== null, opts);
   const legs1 = [exit1.data?.simulation, entry1.data?.simulation].flatMap((x) => (x ? [x.legA, x.legB] : []));
@@ -1135,14 +1164,20 @@ function RollProbe({
   const fit =
     legs1.length === 4
       ? // An older server reports no ladder; the modal then opens on the whole position.
-        (fitAcross(legs1.slice(0, 2), legs1.slice(2), exitSlippageApr, entrySlippageApr, ROLL_MAX_SLIP_PCT / 100) ?? Infinity)
+        (fitAtBand(legs1.slice(0, 2), legs1.slice(2), ROLL_MAX_SLIP_PCT / 100) ?? Infinity)
       : null;
   const size = fit === null ? null : suggestedRollSize(fit, heldSize);
   const enough = size !== null && size >= fifth - 1e-9;
 
-  // Stage 2: the modal's default size. When that IS the fifth, stage 1
-  // already holds the quote and the same keys are served from cache.
-  const r2 = enough ? reqs(size) : { exit: null, entry: null };
+  // Stage 2: the modal's default size, at the tolerance the modal gives each
+  // batch for it (`planBatch`, off the same ladders) — so both quote one
+  // request. When that IS the fifth at the seed, stage 1 already holds the
+  // quote and the same keys are served from cache.
+  const exitPlan = enough ? planBatch(legs1.slice(0, 2), size, exitSlippageApr, ROLL_MAX_SLIP_PCT / 100) : null;
+  const entryPlan = enough ? planBatch(legs1.slice(2), size, entrySlippageApr, ROLL_MAX_SLIP_PCT / 100) : null;
+  const r2 = enough
+    ? reqs(size, exitPlan?.toleranceApr ?? exitSlippageApr, entryPlan?.toleranceApr ?? entrySlippageApr)
+    : { exit: null, entry: null };
   const exit2 = useBorosPairSimulation(r2.exit, r2.exit !== null, opts);
   const entry2 = useBorosPairSimulation(r2.entry, r2.entry !== null, opts);
   const exitSim = exit2.data?.simulation;
@@ -1334,6 +1369,7 @@ function addedMarginOf(sim: BorosPairSimulation | null | undefined): number | nu
 interface ExitPnlLeg {
   venue: string;
   side: 'LONG' | 'SHORT';
+  /** The rate the leg was entered at, sign included. */
   lockedApr: number;
   execApr: number | null;
   /** Collateral units, before fees — null without an execution rate. */
@@ -1346,7 +1382,9 @@ interface ExitPnlLeg {
  * maturity, signed by the side held (a LONG gains when rates rose, a SHORT
  * when they fell), in COLLATERAL units and BEFORE fees — the fee is in
  * costToCrossSize, charged once. `PairLegDetail.lockedApr` is signed by
- * side (SHORT +, LONG −); the rate itself is its magnitude.
+ * side (SHORT +, LONG −); `entryAprOf` recovers the rate the leg was entered
+ * at, sign included — never its magnitude, or a leg entered at a negative
+ * rate would be priced against the wrong number.
  */
 function exitPnlOf(
   sim: BorosPairSimulation | null | undefined,
@@ -1360,7 +1398,7 @@ function exitPnlOf(
 ): { legs: ExitPnlLeg[]; total: number | null } {
   const one = (s: BorosSimulatedLeg | undefined, l: PairLegDetail | undefined): ExitPnlLeg | null => {
     if (!s || !l || l.lockedApr === null) return null;
-    const locked = Math.abs(l.lockedApr);
+    const locked = entryAprOf(l.side, l.lockedApr);
     const years = Math.max(0, l.maturity - nowSec) / SECONDS_IN_YEAR;
     const rate = at === 'worst' ? s.worstApr : s.execApr;
     const pnl = rate !== null ? (l.side === 'LONG' ? rate - locked : locked - rate) * s.estFillSize * years : null;
@@ -1448,16 +1486,16 @@ export function RollOverModal({
   const capApr = ROLL_MAX_SLIP_PCT / 100;
   const entrySeedFor = (t: RollTarget): number => seedSlipPctFor(markets ?? [], [t.longMarketId, t.shortMarketId]) / 100;
   /**
-   * The default size: what fills on all four legs AT THE SEED tolerance, less
-   * a buffer (`suggestedRollSize`) — the books move between this quote and
-   * the order, and a size equal to the capacity is refused by one cancelled
-   * lot. The whole position whenever the books hold it with that to spare.
+   * The default size: what fills on all four legs at the WIDEST tolerance
+   * each batch may carry (`fitAtBand`) — `planBatch` widens to it for any
+   * size, so the seed is not the limit — less a buffer (`suggestedRollSize`):
+   * the books move between this quote and the order, and a size equal to the
+   * capacity is refused by one cancelled lot. The whole position whenever the
+   * books hold it with that to spare.
    */
   const selectedQuote = selected !== null ? legsBy[selected] : undefined;
   const selectedFit =
-    selectedQuote && target
-      ? (fitAcross(selectedQuote.exit, selectedQuote.entry, exitSlippageApr, entrySeedFor(target), capApr) ?? undefined)
-      : undefined;
+    selectedQuote && target ? (fitAtBand(selectedQuote.exit, selectedQuote.entry, capApr) ?? undefined) : undefined;
   useEffect(() => {
     if (touched || selected === null || selectedFit === undefined || appliedFor === selected) return;
     setSizeStr(fmtSize(suggestedRollSize(selectedFit, heldSize)));
@@ -1637,7 +1675,8 @@ export function RollOverModal({
               title={target === null ? 'Pick a maturity to roll into' : 'Review the two batches, the tolerance and the margin before confirming'}
               onClick={() => setStep('review')}
             >
-              Roll over →
+              Roll over
+              <ArrowRight size={14} aria-hidden />
             </button>
           </div>
         </>
@@ -1925,6 +1964,7 @@ function RollReview({
   onClose: () => void;
 }) {
   const agent = useBorosAgent();
+  const { canTrade, loginLabel } = useActiveWallet();
   const executeRoll = useExecuteBorosRoll();
   const cancelClose = useBorosCancelAndClose();
   const topUpGas = useTopUpGas();
@@ -2038,7 +2078,7 @@ function RollReview({
         ? [{ code: 'stale-simulation', message: 'The quote is out of date — waiting for a fresh one.' }]
         : []),
     ...(agent.data?.expired
-      ? [{ code: 'agent-expired', message: 'The Boros agent approval has expired — approve a new agent key before trading.' }]
+      ? [{ code: 'agent-expired', message: 'Boros login expired.' }]
       : []),
   ];
 
@@ -2061,7 +2101,7 @@ function RollReview({
     entryA: `ea-${uuid()}`,
     entryB: `eb-${uuid()}`,
   });
-  const canConfirm = rollReq !== null && blockers.length === 0 && !busy && out === null;
+  const canConfirm = rollReq !== null && blockers.length === 0 && !busy && out === null && canTrade;
 
   const run = async () => {
     if (!rollReq) return;
@@ -2237,7 +2277,8 @@ function RollReview({
       >
         <span className="flex items-center gap-2 text-[12px] font-normal leading-[14.52px] text-ink-300">
           <StepBadge n={3} />
-          Can it fund? {marginOk ? '✓' : ''}
+          Can it fund?
+          {marginOk && <Check size={12} aria-hidden className="text-emerald-300" />}
         </span>
         <EstimateRow
           label="Required margin"
@@ -2314,13 +2355,13 @@ function RollReview({
         // it — a second, red copy here explained nothing new.
         blockers={blockers.filter((b) => b.code !== 'slippage-exceeds-max')}
         busyMarketId={cancelClose.isPending ? (cancelClose.variables?.marketId ?? null) : null}
-        onCancelAndClose={(marketId) => cancelClose.mutate({ marketId })}
+        onCancelAndClose={canTrade ? (marketId) => cancelClose.mutate({ marketId }) : undefined}
       />
       <GasTopUp
         gasBalanceUsd={roll.data?.gasBalanceUsd}
         amount={gasTopUpStr}
         onAmountChange={setGasTopUpStr}
-        onTopUp={() => topUpGas.mutate(Number(gasTopUpStr))}
+        onTopUp={canTrade ? () => topUpGas.mutate({ amountUsd: Number(gasTopUpStr), address }) : undefined}
         busy={topUpGas.isPending}
       />
       {topUpGas.isSuccess && (
@@ -2332,8 +2373,12 @@ function RollReview({
 
       <div className="mt-1 flex items-center justify-between gap-2">
         <button type="button" className="btn" onClick={onBack} disabled={busy}>
-          ← Back
+          <ArrowLeft size={14} aria-hidden />
+          Back
         </button>
+        {loginLabel ? (
+          <BorosLogInButton />
+        ) : (
         <HoldToConfirmButton
           tone="cyan"
           disabled={!canConfirm}
@@ -2342,6 +2387,7 @@ function RollReview({
         >
           {busy ? 'Rolling…' : 'Roll over'}
         </HoldToConfirmButton>
+        )}
       </div>
     </div>
   );
@@ -2640,7 +2686,11 @@ function PerpOnlyPairCard({
         <td className={`${cell} whitespace-nowrap`}>{legName(venue, 'yu', side)}</td>
         <td className={`${cell} num whitespace-nowrap text-right text-ink-100`}>{sizeText(sizeIn(yu, yu.unit))}</td>
         <td className={`${cell} num whitespace-nowrap text-right`}>
-          <SignedNumber value={yu.lockedApr} format={fmtPct} />
+          {yu.lockedApr !== null ? (
+            <SignedNumber value={yu.lockedApr} format={fmtPct} />
+          ) : (
+            <span className="text-ink-500">pending</span>
+          )}
         </td>
         <td className={`${cell} num whitespace-nowrap text-right text-ink-100`}>{fmtUsdCompact(yu.imUsd)}</td>
       </tr>
@@ -2728,7 +2778,7 @@ function PerpOnlyPairCard({
             <td className="px-3 text-right text-[13px] text-ink-600" title="No rate is locked.">—</td>
             <td className="whitespace-nowrap pl-3 pr-4 text-right">
               <span aria-hidden className={`pp-chevron transition-transform ${open ? 'rotate-180' : ''}`}>
-                <ChevronIcon />
+                <ChevronDown size={14} aria-hidden />
               </span>
             </td>
           </tr>
@@ -2890,7 +2940,7 @@ function UngroupedCard({
             <td className="px-3 text-right text-[13px] text-ink-600" title="Not in a pair.">—</td>
             <td className="pl-3 pr-4 text-right">
               <span aria-hidden className={`pp-chevron transition-transform ${open ? 'rotate-180' : ''}`}>
-                <ChevronIcon />
+                <ChevronDown size={14} aria-hidden />
               </span>
             </td>
           </tr>
@@ -2989,7 +3039,11 @@ function UngroupedCard({
                       )}
                     </td>
                     <td className="num text-right font-semibold" title="The fixed rate this leg locks, net of settlement fees. + receives, − pays.">
-                      <SignedNumber value={l.lockedApr} format={fmtPct} />
+                      {l.lockedApr !== null ? (
+                        <SignedNumber value={l.lockedApr} format={fmtPct} />
+                      ) : (
+                        <span className="font-normal text-ink-500">pending</span>
+                      )}
                     </td>
                     <td className="num text-right text-ink-100" title={exactUsd(l.imUsd)}>
                       {fmtUsdCompact(l.imUsd)}
@@ -3068,7 +3122,8 @@ function MissingRow({ gap, base, onOpen, asPair }: { gap: HedgeGapRow; base: str
           title={onOpen ? (asPair ? 'Opens the pair ticket with both missing legs.' : `Opens the order ticket with ${gapAsk(gap, base)}.`) : 'Order ticket unavailable here'}
           onClick={onOpen}
         >
-          {asPair ? `open both ${boros ? 'Boros' : 'perp'} legs →` : `open ${boros ? 'Boros' : 'perp'} leg →`}
+          {asPair ? `open both ${boros ? 'Boros' : 'perp'} legs` : `open ${boros ? 'Boros' : 'perp'} leg`}
+          <ArrowRight size={12} aria-hidden />
         </button>
       </td>
     </tr>
@@ -3100,7 +3155,7 @@ export function LegEditModal({
   label: string;
   unit: string;
   legQty: number;
-  entry: number;
+  entry: number | null;
   entryKind: 'price' | 'rate';
   current: ExclusionEntry | undefined;
   onExclude: Props['onExclude'];
@@ -3109,32 +3164,33 @@ export function LegEditModal({
   legSince?: number;
   onLegSince?: (sec: number | undefined) => void;
 }) {
-  const [sinceStr, setSinceStr] = useState(legSince && legSince > 0 ? toDateInput(legSince) : '');
+  const [sinceStr, setSinceStr] = useState(legSince && legSince > 0 ? fmtDateLocal(legSince) : '');
   const curQty = current === 'all' ? legQty : exclusionQty(current);
   const curAt = exclusionAt(current);
   const [mode, setMode] = useState<'all' | 'portion'>(current === undefined ? 'all' : 'portion');
   const [qtyStr, setQtyStr] = useState(curQty !== null ? String(curQty) : '');
   const fmtAt = (v: number) => (entryKind === 'rate' ? String(+(v * 100).toFixed(4)) : String(+v.toFixed(2)));
-  const [atStr, setAtStr] = useState(fmtAt(curAt ?? entry));
+  const startAt = curAt ?? entry;
+  const [atStr, setAtStr] = useState(startAt !== null ? fmtAt(startAt) : '');
   const qty = Number(qtyStr);
   const qtyOk = Number.isFinite(qty) && qty > 0;
   const atRaw = Number(atStr);
   // A rate may be negative (negative funding); a price may not.
-  const at = Number.isFinite(atRaw) && (entryKind === 'rate' || atRaw >= 0) ? (entryKind === 'rate' ? atRaw / 100 : atRaw) : null;
+  const at = atStr.trim() !== '' && Number.isFinite(atRaw) && (entryKind === 'rate' || atRaw >= 0) ? (entryKind === 'rate' ? atRaw / 100 : atRaw) : null;
   const whole = mode === 'all' ? false : qtyOk && qty >= legQty;
   // Live preview of what the farm keeps.
   const preview =
     mode === 'portion' && qtyOk && !whole
       ? keptSlice({ [exKey]: at !== null ? { qty, at } : qty }, exKey, legQty, entry)
       : null;
-  const showEntry = (v: number) => (entryKind === 'rate' ? fmtPct(v) : fmtUsd(v));
+  const showEntry = (v: number | null) => (v === null ? 'pending' : entryKind === 'rate' ? fmtPct(v) : fmtUsd(v));
   const save = () => {
     if (mode === 'all') onExclude(exKey, undefined);
     else if (!qtyOk) return;
     else if (whole) onExclude(exKey, 'all');
     else onExclude(exKey, at !== null ? { qty, at } : qty);
     if (onLegSince) {
-      const sec = sinceStr ? Math.floor(new Date(`${sinceStr}T00:00`).getTime() / 1000) : 0;
+      const sec = sinceStr ? parseDateLocal(sinceStr) : 0;
       onLegSince(Number.isFinite(sec) && sec > 0 ? sec : undefined);
     }
     onClose();
@@ -3217,7 +3273,7 @@ export function LegEditModal({
               type="date"
               className="input !w-[170px]"
               value={sinceStr}
-              max={toDateInput(Math.floor(Date.now() / 1000))}
+              max={fmtDateLocal(Math.floor(Date.now() / 1000))}
               onChange={(e) => setSinceStr(e.target.value)}
               aria-label="Date this position is counted from"
               title="History before this date is left out. Empty = the asset's start date."
@@ -3233,15 +3289,28 @@ export function LegEditModal({
       <div className="mb-5 rounded bg-wash/[0.05] px-4 py-3 text-[12px] leading-[1.5]">
         {mode === 'all' ? (
           <span className="num text-ink-100">
-            The farm keeps the whole leg — <span className="font-semibold text-ink-50">{fmtTokenQty(legQty, unit)}</span> at{' '}
-            <span className="font-semibold text-ink-50">{showEntry(entry)}</span>.
+            The farm keeps the whole leg — <span className="font-semibold text-ink-50">{fmtTokenQty(legQty, unit)}</span>
+            {entry === null ? (
+              ' · entry pending'
+            ) : (
+              <>
+                {' '}at <span className="font-semibold text-ink-50">{showEntry(entry)}</span>
+              </>
+            )}
+            .
           </span>
         ) : whole ? (
           <span className="text-gold">The whole leg is excluded — it moves to the Excluded section.</span>
         ) : preview ? (
           <span className="num text-ink-100">
-            Farm keeps <span className="font-semibold text-ink-50">{fmtTokenQty(legQty * preview.keep, unit)}</span> at{' '}
-            <span className="font-semibold text-ink-50">{showEntry(preview.entry)}</span>
+            Farm keeps <span className="font-semibold text-ink-50">{fmtTokenQty(legQty * preview.keep, unit)}</span>
+            {preview.entry === null ? (
+              ' · entry pending'
+            ) : (
+              <>
+                {' '}at <span className="font-semibold text-ink-50">{showEntry(preview.entry)}</span>
+              </>
+            )}
             {preview.at !== null && preview.entry !== entry && (
               <span className="text-ink-400"> (was {showEntry(entry)})</span>
             )}
@@ -3351,13 +3420,24 @@ function LegIdentity({
   const named = Boolean(name);
   return (
     <span className="inline-flex items-center gap-3 leading-none">
-      {/* The mock's leg-kind marker is a NEUTRAL grey pill — it says which
-          kind of leg this row is, it is not a status, so it carries no tone.
-          A leg that isn't there yet gets the dashed outline instead of a
-          fill, which is how the mock draws an absent thing. */}
+      {/* The leg-kind marker carries the VENUE's colour, so a mixed list reads
+          as two kinds at a glance instead of one grey column. Boros takes the
+          `info` blue this file's other leg tables already give it (the
+          `bg-info/[0.16] text-pastel-blue` badge above); the perp takes the
+          `crossex` cyan, the one token that means "via CrossEx" — the same
+          one VenueChip's ·CX and Chip's `crossex` tone use.
+          It is still NOT a status: the tone names which venue, never how the
+          leg is doing, so it stays off the grass/guava axis that means
+          good/bad everywhere else. A leg that isn't there yet keeps the
+          dashed outline instead of a fill, which is how the mock draws an
+          absent thing — absence outranks venue, so `dim` drops the colour. */}
       <span
         className={`pp-pill w-[52px] shrink-0 justify-center ${
-          dim ? 'border border-dashed border-ink-300/50 bg-transparent text-ink-400' : ''
+          dim
+            ? 'border border-dashed border-ink-300/50 bg-transparent text-ink-400'
+            : boros
+              ? 'bg-info/[0.16] text-pastel-blue'
+              : 'bg-crossex/[0.15] text-crossex'
         }`}
       >
         {boros ? 'Boros' : 'Perp'}
@@ -3424,25 +3504,7 @@ function BundleColGroup() {
 }
 
 
-/** Four bars of falling height — the waterfall, at 12px. */
-function WaterfallIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden className="text-ink-400">
-      <rect x="1" y="2" width="3" height="12" rx="0.5" />
-      <rect x="5.5" y="5" width="3" height="9" rx="0.5" />
-      <rect x="10" y="8" width="3" height="6" rx="0.5" />
-      <rect x="14" y="11" width="1.5" height="3" rx="0.5" />
-    </svg>
-  );
-}
 
-function ChevronIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M4 6l4 4 4-4" />
-    </svg>
-  );
-}
 function PerpRow({
   leg,
   base,
@@ -3523,6 +3585,7 @@ function BorosRow({
   leg,
   windowedGrossUsd,
   windowedFeesUsd,
+  windowedRebateUsd,
   exclusions,
   onExclude,
   onClose,
@@ -3540,6 +3603,9 @@ function BorosRow({
   /** This market's settle + trade fees inside the window — a MEMO on the row
    * (Boros fees are attributable per market); charged once, in COST. */
   windowedFeesUsd: number | null;
+  /** This market's settlement-fee rebate inside the window — a credit added
+   * back to PnL. 0/null when the account is not rebated. */
+  windowedRebateUsd?: number | null;
   exclusions: Exclusions;
   onExclude: Props['onExclude'];
   onClose: () => void;
@@ -3580,8 +3646,8 @@ function BorosRow({
         <span className="ml-1 text-ink-500">({fmtUsdCompact(leg.notionalUsd * slice.keep)})</span>
         {exFrac > 0 && <span className="ml-1 text-gold" title="Part of this leg is excluded from the farm">of {fmtTokenQty(leg.sizeToken, leg.collateral)}</span>}
       </td>
-      <td className="num text-right text-ink-100" title={slice.at !== null && slice.entry !== leg.entryApr ? `Venue average\t${fmtPct(leg.entryApr)}\nExcluded\t${fmtTokenQty(exFrac * leg.sizeToken, leg.collateral)} at ${fmtPct(slice.at)}` : undefined}>
-        {fmtPct(slice.entry)} → {fmtPct(leg.markApr)}
+      <td className="num text-right text-ink-100" title={leg.entryApr !== null && slice.at !== null && slice.entry !== leg.entryApr ? `Venue average\t${fmtPct(leg.entryApr)}\nExcluded\t${fmtTokenQty(exFrac * leg.sizeToken, leg.collateral)} at ${fmtPct(slice.at)}` : undefined}>
+        {slice.entry !== null ? fmtPct(slice.entry) : <span className="text-ink-500">pending</span>} → {fmtPct(leg.markApr)}
 
       </td>
       <td
@@ -3603,6 +3669,14 @@ function BorosRow({
             title="Settlement fees charged in your window. Already taken out of the figure above."
           >
             settle fees −{fmtUsd(windowedFeesUsd)}
+          </div>
+        )}
+        {windowedRebateUsd != null && windowedRebateUsd > 0 && (
+          <div
+            className="text-[10px] text-grass"
+            title="CrossEx settlement-fee rebate credited back in your window. Added into PnL."
+          >
+            rebate +{fmtUsd(windowedRebateUsd)}
           </div>
         )}
       </td>
@@ -3710,6 +3784,9 @@ function InactiveBorosRow({
         {h.settleFeeUsd * keep > 0 && (
           <div className="text-[10px] text-ink-500">settle fees −{fmtUsd(h.settleFeeUsd * keep)}</div>
         )}
+        {(h.rebateUsd ?? 0) * keep > 0 && (
+          <div className="text-[10px] text-grass">rebate +{fmtUsd((h.rebateUsd ?? 0) * keep)}</div>
+        )}
       </td>
       <td className="num text-right" title="Realised rate PnL from closing early, before its trade fee.">
         {Math.abs((h.tradePnlUsd + h.tradeFeeUsd) * keep) >= 0.005 ? (
@@ -3726,7 +3803,7 @@ function InactiveBorosRow({
           label={`${prettyVenue(h.venue)} YU · ${fmtDateLocal(h.maturity)}`}
           unit={base}
           legQty={h.peakSizeToken ?? 0}
-          entry={entryApr ?? 0}
+          entry={entryApr}
           entryKind="rate"
           current={exclusions[key]}
           onExclude={onExclude}
@@ -3792,6 +3869,7 @@ interface Bundle {
   /** Signed blended fixed rate on the live YU legs, net of settle fees;
    * + receives, − pays. Null without YU. */
   fixedApr: number | null;
+  ratePending: boolean;
   /** Perp funding + Boros settlements, live and finished — this venue's
    * share of the Fixed funding bar. */
   settleUsd: number;
@@ -3931,7 +4009,10 @@ function BundleCard({
                 </button>
               </div>
             </td>
-            <td className="px-3 text-right" title="Notional of the live perp, or of the Boros legs when there is no perp.">
+            <td
+              className="px-3 text-right"
+              title={`Notional of the live perp, or of the Boros legs when there is no perp.${b.notionalUsd > 0 ? `\n${exactUsd(b.notionalUsd)}${b.sizeToken > 0 ? ` on ${exactQty(b.sizeToken, b.sizeUnit)}` : ''}` : ''}`}
+            >
               <div className="num text-[14px] font-medium leading-none text-ink-50">
                 {b.notionalUsd > 0 ? fmtUsdCompact(b.notionalUsd) : <span className="text-ink-600">—</span>}
               </div>
@@ -3946,6 +4027,8 @@ function BundleCard({
                     {b.fixedApr >= 0 ? 'receive ' : 'pay '}
                     {fmtPct(Math.abs(b.fixedApr))}
                   </span>
+                ) : b.ratePending ? (
+                  <span className="text-ink-500">pending</span>
                 ) : (
                   <span className="text-ink-600">—</span>
                 )}
@@ -3975,7 +4058,7 @@ function BundleCard({
             </td>
             <td className="pl-3 pr-4 text-right">
               <span aria-hidden className={`pp-chevron transition-transform ${open ? 'rotate-180' : ''}`}>
-                <ChevronIcon />
+                <ChevronDown size={14} aria-hidden />
               </span>
             </td>
           </tr>
@@ -4039,6 +4122,10 @@ function BundleCard({
                     const h = histByMarket.get(l.marketId);
                     return h ? h.settleFeeUsd * histKeep(h) : null;
                   })()}
+                  windowedRebateUsd={(() => {
+                    const h = histByMarket.get(l.marketId);
+                    return h ? (h.rebateUsd ?? 0) * histKeep(h) : null;
+                  })()}
                   legSince={legSince?.[borosKey(l.marketId)]}
                   onLegSince={onLegSince ? (sec) => onLegSince(borosKey(l.marketId), sec) : undefined}
                   exclusions={exclusions}
@@ -4088,7 +4175,23 @@ function BundleCard({
 }
 
 
-export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSince, exclusions, onExclude, legSince, onLegSince, liquidation = null }: Props) {
+export function AssetCard({
+  group,
+  derived,
+  sinceSec,
+  windowPending,
+  storedSinceSec,
+  defaultSinceSec,
+  onChangeSince,
+  backfilling,
+  supportedCoins,
+  exclusions,
+  onExclude,
+  legSince,
+  onLegSince,
+  liquidation = null,
+  gateHidden = false,
+}: Props) {
   const { totals, gaps, venues } = derived;
   const flow = useTradeFlowOptional();
   /**
@@ -4176,7 +4279,7 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
   const [showRollNonce, setShowRollNonce] = useState(0);
   /** Each rollable pair's best roll opportunity, keyed as the cards are —
    * what the banner shouts about, when there is one. */
-  const [rollSignals, setRollSignals] = useState<Record<string, RollOpportunity | null>>({});
+  const [rollSignals, setRollSignals] = useState<Record<string, RollOpportunity[]>>({});
   /** Publish every rollable pair to the app-wide banner, and take its
    * "Show me" as the cue to open them here. */
   const publishRoll = useRollPublisher();
@@ -4268,7 +4371,7 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
    * card that stops rendering must not leave a stale line in the banner.
    */
   const rollKeys = rollable.map((p) => `${group.base}:${pairKey(p)}`).join('|');
-  const rollJson = JSON.stringify(rollable.map((p) => rollSignals[pairKey(p)] ?? null));
+  const rollJson = JSON.stringify(rollable.map((p) => rollSignals[pairKey(p)] ?? []));
   useEffect(() => {
     const live = new Set<string>();
     for (const p of rollable) {
@@ -4280,7 +4383,8 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
         longVenue: p.longVenue,
         shortVenue: p.shortVenue,
         maturity: p.soonestMaturitySec,
-        opportunity: rollSignals[pairKey(p)] ?? null,
+        opportunity: rollSignals[pairKey(p)]?.[0] ?? null,
+        opportunities: rollSignals[pairKey(p)] ?? [],
       });
     }
     return () => {
@@ -4325,10 +4429,16 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
       let apr = 0;
       let yuNotional = 0;
       let yuQty = 0;
+      let ratePending = false;
       for (const l of boros) {
         const slice = keptSlice(exclusions, borosKey(l.marketId), l.sizeToken, l.entryApr);
         const n = l.notionalUsd * slice.keep;
-        apr += ((l.side === 'SHORT' ? 1 : -1) * slice.entry - (l.settleFeeApr ?? 0)) * n;
+        if (slice.entry === null) ratePending = true;
+        else
+          apr +=
+            ((l.side === 'SHORT' ? 1 : -1) * slice.entry -
+              rebatedSettleApr(l.settleFeeApr ?? 0, derived.rebate, l.marketId)) *
+            n;
         w += n;
         yuNotional += n;
         yuQty += l.sizeToken * slice.keep;
@@ -4367,7 +4477,8 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
         sizeUnit: perpNotional > 0 ? group.base : boros[0]?.collateral ?? group.base,
         sizeKind: perpNotional > 0 ? 'perp' : 'yu',
         floatingApr,
-        fixedApr: w > 0 ? apr / w : null,
+        fixedApr: w > 0 && !ratePending ? apr / w : null,
+        ratePending,
         settleUsd,
         tradePnlUsd,
         feesUsd,
@@ -4447,67 +4558,74 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
             the card's own title — with the spot price as a quiet note beside
             it. The old bordered pill made the ticker look like a chip among
             the status chips that follow it. */}
-        <span className="flex items-center gap-2.5">
-          <TokenIcon symbol={group.base} size={32} />
+        {/* The mark matches the ticker's height: a 32px mark beside 18px text
+            outweighed the name it labels. */}
+        <span className="flex items-center gap-2">
+          <TokenIcon symbol={group.base} size={20} />
           <span className="text-[18px] font-bold leading-none text-ink-50">{group.base}</span>
         </span>
         {group.priceUsd > 0 && (
           <span className="num text-[12px] text-ink-300">{fmtUsd(group.priceUsd)}</span>
         )}
         {hasLegs &&
+          !gateHidden &&
           (derived.perfect ? (
             <Chip
-              sm
               tone="green"
+              className={HEAD_CHIP}
               title={
                 derived.grossPerp > 0 && derived.netPerp !== 0
                   ? `Every leg is covered and the perps cancel within 2%.\nResidual exposure\t${derived.netPerp > 0 ? 'LONG' : 'SHORT'} ${sizeLabel(Math.abs(derived.netPerp), venues[0]?.unit ?? 'usd', group.base)}${venues[0]?.unit === 'base' && group.priceUsd > 0 ? ` ≈ ${fmtUsdCompact(Math.abs(derived.netPerp) * group.priceUsd)}` : ''}`
                   : 'Every leg is covered and the perps cancel exactly.'
               }
             >
-              hedged ✓
+              Hedged <Check size={12} aria-hidden className="inline" />
             </Chip>
           ) : gaps.length > 0 ? (
             <Chip
-              sm
               tone="amber"
+              className={HEAD_CHIP}
               title={['To complete the hedge', ...gaps.map((g) => `${prettyVenue(g.venue)}\topen ${gapAsk(g, group.base)}`)].join('\n')}
             >
-              missing hedge
+              Missing hedge
             </Chip>
           ) : (
-            <Chip sm tone="amber" title="The perps do not cancel across venues. Price risk is live.">
-              perps don’t cancel
+            <Chip tone="amber" className={HEAD_CHIP} title="The perps do not cancel across venues. Price risk is live.">
+              Perps don’t cancel
             </Chip>
           ))}
         {hasLegs && liquidation && <LiquidationChip line={liquidation} base={group.base} />}
         <span className="ml-auto" />
         {windowPending && <span className="text-xs text-ink-600">updating window…</span>}
-        <label className="flex items-center gap-1.5 text-xs text-ink-500">
-          since
-          <input
-            type="date"
-            className="input w-32 px-2 py-1 text-xs"
-            value={sinceSec > 0 ? toDateInput(sinceSec) : ''}
-            max={toDateInput(Math.floor(Date.now() / 1000))}
-            title={`Count this asset's PnL from this date. Empty = all time.${derived.clockStartSec !== null ? `\nActivity starts\t${fmtDateLocal(derived.clockStartSec)}` : ''}`}
-            onChange={(e) => {
-              const v = e.target.value;
-              const sec = v ? Math.floor(new Date(`${v}T00:00`).getTime() / 1000) : 0;
-              onChangeSince(Number.isFinite(sec) && sec > 0 ? sec : 0);
-            }}
-          />
-          {sinceSec > 0 && (
-            <button type="button" className="btn-ghost-xs" onClick={() => onChangeSince(0)}>
-              all time
-            </button>
-          )}
-        </label>
+        <SinceChip base={group.base} storedSec={storedSinceSec} defaultSec={defaultSinceSec} onChange={onChangeSince} />
       </div>
+
+      {!group.supported && (
+        <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-400">
+          <span className="font-semibold">
+            {group.base} is{' '}
+            <HoverCard label="not supported">{`The terminal supports ${listCoins(supportedCoins)}.`}</HoverCard>
+          </span>
+        </div>
+      )}
 
       {/* The hero in its own panel, bordered in the accent so it reads as
           the ONE set of numbers; the ledgers below wear the plain hairline. */}
-      <div className="mb-4 rounded border border-wash/[0.07] bg-ink-950/40 px-5 py-[18px]">
+      <div
+        className="relative mb-4 rounded border border-wash/[0.07] bg-ink-950/40 px-5 py-[18px]"
+        aria-busy={backfilling || undefined}
+      >
+        {/* While the Boros payments load, the totals are partial, so the
+            overlay covers them. Positions, hedge and liquidation below are
+            already right and stay in view. */}
+        {backfilling && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center gap-2.5 rounded bg-ink-950/90 text-sm text-ink-100">
+            <Spinner />
+            <span>
+              {sinceSec > 0 ? `Reading Boros payments since ${fmtDateShort(sinceSec)}…` : 'Reading all Boros payments…'}
+            </span>
+          </div>
+        )}
         {/* Hero — exactly what he asked to know: PnL (ROI in brackets),
             the CURRENT locked APR, and capital. Carry lives on the stats
             strip below; nothing else competes up here. */}
@@ -4536,15 +4654,7 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
                 aria-hidden="true"
                 className="ml-2 inline-flex h-7 w-7 items-center justify-center rounded-full align-middle text-ink-500 transition-colors group-hover/pnl:bg-wash/10 group-hover/pnl:text-ink-300"
               >
-                <svg viewBox="0 0 14 14" width="16" height="16" fill="none">
-                  <path
-                    transform="translate(.5 0)"
-                    fillRule="evenodd"
-                    clipRule="evenodd"
-                    d="M5.889,0.75L5.889,7.611L12.75,7.611C12.436,10.777 9.764,13.25 6.515,13.25C3.055,13.25 0.25,10.445 0.25,6.985C0.25,3.736 2.723,1.064 5.889,0.75ZM7.142,0.75C10.102,1.044 12.456,3.398 12.75,6.358L7.142,6.358L7.142,0.75Z"
-                    fill="currentColor"
-                  />
-                </svg>
+                <ChartPie size={16} strokeWidth={1.8} aria-hidden />
               </span>
             </button>
             {/* Cost is a COMPONENT of PnL (PnL = carry − cost), not a peer of
@@ -4610,7 +4720,7 @@ export function AssetCard({ group, derived, sinceSec, windowPending, onChangeSin
           aria-expanded={wfOpen}
           onClick={() => setWfOpen((v) => !v)}
         >
-          <WaterfallIcon />
+          <ChartColumnDecreasing size={13} aria-hidden className="text-ink-400" />
           {wfOpen ? 'Hide waterfall' : 'PnL waterfall'}
         </button>
         </div>
@@ -4696,7 +4806,7 @@ null
                 b={b}
                 base={group.base}
                 nowSec={nowSec}
-                defaultOpen={false}
+                defaultOpen={!group.supported}
                 histByMarket={histByMarket}
                 chainLegs={chainLegs}
                 histKeep={histKeep}
@@ -4749,7 +4859,7 @@ null
                           </span>
                         ) : (
                           <span className="text-ink-500" title="Split at the leg's average.">
-                            at avg {show(r.entry)}
+                            at avg {r.entry !== null ? show(r.entry) : 'pending'}
                           </span>
                         )}
                       </td>
@@ -4875,13 +4985,14 @@ null
                 onClosePerps={() => setClosePerps(p)}
                 onCloseBoros={() => setCloseBoros(p)}
                 onRollOver={() => setRollOver(p)}
-                onRollSignal={(opp) =>
+                onRollSignal={(opps) =>
                   setRollSignals((prev) => {
                     const k = pairKey(p);
-                    const cur = prev[k] ?? null;
+                    const cur = prev[k] ?? [];
                     const same =
-                      cur === opp || (cur !== null && opp !== null && cur.maturity === opp.maturity && cur.rate === opp.rate && cur.current === opp.current);
-                    return same ? prev : { ...prev, [k]: opp };
+                      cur.length === opps.length &&
+                      cur.every((c, i) => c.maturity === opps[i].maturity && c.rate === opps[i].rate && c.current === opps[i].current);
+                    return same ? prev : { ...prev, [k]: opps };
                   })
                 }
               />
@@ -4999,7 +5110,7 @@ null
                 collateral: closeLeg.leg.collateral,
                 notionalToken: closeLeg.leg.sizeToken,
                 marketId: closeLeg.leg.marketId,
-                entryApr: closeLeg.leg.entryApr,
+                entryApr: closeLeg.leg.entryApr ?? undefined,
                 markApr: closeLeg.leg.markApr,
                 maturity: closeLeg.leg.maturity,
                 share: 1,
@@ -5043,7 +5154,7 @@ null
       )}
 
       {feesOpen && (
-        <Modal title={`${group.base} — PnL breakdown`} onClose={() => setFeesOpen(false)} widthClass="w-[640px]">
+        <Modal title={`${group.base} — PnL breakdown`} onClose={() => setFeesOpen(false)} widthClass="w-[760px]">
           {(() => {
             const cell = 'px-2 py-1.5';
             const th = 'px-2 pb-1 text-[11px] font-normal text-ink-500';
@@ -5094,15 +5205,24 @@ null
               settleUsd: h.settleUsd * histKeep(h),
               tradeUsd: (h.tradePnlUsd + h.tradeFeeUsd) * histKeep(h),
               feesUsd: h.tradeFeeUsd * histKeep(h),
+              rebateUsd: (h.rebateUsd ?? 0) * histKeep(h),
               excluded: exclusions[borosKey(h.marketId)] === 'all',
             }));
             const borosTotals = borosRows.reduce(
               (t, r) =>
                 r.excluded
                   ? t
-                  : { settle: t.settle + r.settleUsd, trade: t.trade + r.tradeUsd, fees: t.fees + r.feesUsd },
-              { settle: 0, trade: 0, fees: 0 },
+                  : {
+                      settle: t.settle + r.settleUsd,
+                      trade: t.trade + r.tradeUsd,
+                      fees: t.fees + r.feesUsd,
+                      rebate: t.rebate + r.rebateUsd,
+                    },
+              { settle: 0, trade: 0, fees: 0, rebate: 0 },
             );
+            // The rebate column only exists for a rebated account — a non-rebated
+            // user sees the table exactly as before.
+            const showRebate = borosRows.some((r) => !r.excluded && r.rebateUsd > 0);
             const dim = (ex: boolean) => (ex ? 'opacity-40' : '');
             return (
               <>
@@ -5122,6 +5242,14 @@ null
                       <SignedNumber value={totals.priceResidualUsd} format={fmtUsd} />
                     </span>
                   </span>
+                  {totals.breakdown.borosRebateUsd > 0 && (
+                    <span title="CrossEx settlement-fee rebate credited back, included in PnL.">
+                      settlement rebate{' '}
+                      <span className="num">
+                        <SignedNumber value={totals.breakdown.borosRebateUsd} format={fmtUsd} className="!text-grass" />
+                      </span>
+                    </span>
+                  )}
                   <span
                     className="text-ink-600"
                     title="Mark value of the open Boros legs. Not counted in PnL."
@@ -5242,6 +5370,7 @@ null
                         <th className={`${th} text-right`}>Settlement</th>
                         <th className={`${th} text-right`}>Trade PnL</th>
                         <th className={`${th} text-right`}>Fees</th>
+                        {showRebate && <th className={`${th} text-right`}>Rebates</th>}
                       </tr>
                     </thead>
                     <tbody className="num">
@@ -5259,6 +5388,11 @@ null
                             <SignedNumber value={r.tradeUsd} format={fmtUsd} />
                           </td>
                           <td className={`${cell} text-right text-ink-300`}>{fmtUsd(r.feesUsd)}</td>
+                          {showRebate && (
+                            <td className={`${cell} text-right ${r.rebateUsd > 0 ? 'text-grass' : 'text-ink-500'}`}>
+                              {r.rebateUsd > 0 ? `+${fmtUsd(r.rebateUsd)}` : '—'}
+                            </td>
+                          )}
                         </tr>
                       ))}
                       <tr className="border-t border-ink-700 font-semibold">
@@ -5272,6 +5406,9 @@ null
                           <SignedNumber value={borosTotals.trade} format={fmtUsd} />
                         </td>
                         <td className={`${cell} text-right text-ink-200`}>{fmtUsd(borosTotals.fees)}</td>
+                        {showRebate && (
+                          <td className={`${cell} text-right text-grass`}>+{fmtUsd(borosTotals.rebate)}</td>
+                        )}
                       </tr>
                     </tbody>
                   </table>
@@ -5279,7 +5416,21 @@ null
                   <p className="text-sm text-ink-600">No Boros activity in this window.</p>
                 )}
                 <p className="mt-3 text-[11px] text-ink-600">
-                  Settlement is net of its own fee (unavoidable, and already in the locked rate); the fee column is the TRADE fee, which subtracts. Dimmed = excluded.
+                  Settlement is net of its fee, already in the locked rate. Fees are trade fees.
+                  {showRebate && (
+                    <>
+                      {' '}Rebates are settlement-fee rebates added into PnL, claimable on your Boros account page{' '}
+                      <a
+                        href="https://boros.pendle.finance/portfolio?info=myAccount"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-ink-300 underline hover:text-ink-100"
+                      >
+                        here
+                      </a>
+                      .
+                    </>
+                  )}
                 </p>
               </>
             );

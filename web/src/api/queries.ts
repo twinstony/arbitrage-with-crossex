@@ -2,6 +2,7 @@
  * `placeholderData: keepPreviousData` so background refetches never blank tables. */
 import {
   keepPreviousData,
+  type QueryClient,
   useInfiniteQuery,
   useMutation,
   useQueries,
@@ -9,7 +10,8 @@ import {
   useQueryClient,
 } from '@tanstack/react-query';
 import { useEffect, useRef } from 'react';
-import { del, fetchJson, postJson, putJson } from './client';
+import { del, fetchJson, patchJson, postJson, putJson } from './client';
+import { useTabActive } from '../components/TabBar';
 import { uuid } from '../lib/uuid';
 import type {
   AssetViewResponse,
@@ -36,6 +38,7 @@ import type {
   OpenOrder,
   OpportunitiesResult,
   PositionsResponse,
+  Rebate,
   GoalKind,
   Pool,
   RebalanceJob,
@@ -44,6 +47,9 @@ import type {
   StartTransferBody,
   SymbolDetail,
   SymbolRule,
+  TelegramInfo,
+  TelegramLinkStart,
+  TelegramLinkStatus,
   TradesResponse,
   TransferView,
   VenueFees,
@@ -65,23 +71,25 @@ export const qk = {
   symbols: (q: string) => ['symbols', q] as const,
   symbolsByBase: (base: string) => ['symbols', 'base', base] as const,
   symbolDetail: (symbol: string) => ['symbolDetail', symbol] as const,
-  assetView: (address: string, since: number, legSince = '') =>
+  assetView: (address: string, since: number | undefined, legSince = '') =>
     ['assetView', address, since, legSince] as const,
   borosAgent: ['boros', 'agent'] as const,
+  rebate: ['boros', 'rebate'] as const,
   borosPairContext: (address: string) => ['boros', 'pair', 'context', address] as const,
-  opportunities: (
-    notionalUsd: number,
-    borosEntry: BorosEntryMode,
-    entryMode: EntryMode,
-    exitMode: ExitMode,
-    feeTier: string | undefined,
-  ) => ['opportunities', notionalUsd, borosEntry, entryMode, exitMode, feeTier ?? ''] as const,
+  opportunities: (notionalUsd: number, borosEntry: BorosEntryMode, entryMode: EntryMode, exitMode: ExitMode) =>
+    ['opportunities', notionalUsd, borosEntry, entryMode, exitMode] as const,
   deal: (id: string) => ['deal', id] as const,
   activeDeals: ['deals', 'active'] as const,
   alerts: ['alerts'] as const,
   rebalance: ['rebalance'] as const,
   transfer: ['transfer'] as const,
+  telegram: ['telegram'] as const,
+  telegramLink: ['telegram', 'link'] as const,
 };
+
+export function canFetch(shown: boolean, query: { state: { data: unknown } }): boolean {
+  return shown || query.state.data === undefined;
+}
 
 export function useCredentials() {
   return useQuery({
@@ -98,42 +106,49 @@ export function useCredentials() {
 }
 
 export function useAccount() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.account,
     queryFn: () => fetchJson<CrossexAccount>('/account'),
-    refetchInterval: 5_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 5_000 : false,
     placeholderData: keepPreviousData,
   });
 }
 
 export function usePositions(enabled = true) {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.positions,
     queryFn: () => fetchJson<PositionsResponse>('/positions'),
-    enabled,
-    refetchInterval: 4_000,
+    enabled: (query) => enabled && canFetch(shown, query),
+    refetchInterval: shown ? 4_000 : false,
     placeholderData: keepPreviousData,
   });
 }
 
 export function useOpenOrders(symbol?: string) {
   const search = symbol ? `?symbol=${encodeURIComponent(symbol)}` : '';
+  const shown = useTabActive();
   return useQuery({
     queryKey: [...qk.openOrders, symbol ?? ''] as const,
     queryFn: () => fetchJson<OpenOrder[]>(`/orders/open${search}`),
-    refetchInterval: 4_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 4_000 : false,
     placeholderData: keepPreviousData,
   });
 }
 
 export function useTrades(limit = 100) {
+  const shown = useTabActive();
   return useInfiniteQuery({
     queryKey: [...qk.trades, limit] as const,
     queryFn: ({ pageParam }) =>
       fetchJson<TradesResponse>(`/trades?limit=${limit}&page=${pageParam}&join=1`),
     initialPageParam: 1,
     getNextPageParam: (last) => (last.hasMore ? last.page + 1 : undefined),
-    refetchInterval: 30_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 30_000 : false,
     placeholderData: keepPreviousData,
   });
 }
@@ -141,9 +156,9 @@ export function useTrades(limit = 100) {
 /** 4-leg strategy returns for the tracked EVM address (Boros legs + perp overlay).
 /** `?since=…&legSince=…` for the asset view; `legSince` is the encoded
  * per-market "counted from" list (see assetPrefsStore.legSinceParam). */
-function assetViewSearch(since: number, legSince: string): string {
+function assetViewSearch(since: number | undefined, legSince: string): string {
   const p = new URLSearchParams();
-  if (since > 0) p.set('since', String(since));
+  if (since !== undefined) p.set('since', String(since));
   if (legSince) p.set('legSince', legSince);
   const s = p.toString();
   return s ? `?${s}` : '';
@@ -152,23 +167,32 @@ function assetViewSearch(since: number, legSince: string): string {
 /** Asset-grouped tracking view: venue-reported lifetime sums per asset since
  * `since` (0 = all time). Same address-switch doctrine as useStrategy:
  * deliberately NO keepPreviousData across keys. */
-export function useAssetView(address: string | null, since = 0, legSince = '') {
+export function useAssetView(address: string | null, since?: number, legSince = '') {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.assetView(address ?? '', since, legSince),
     queryFn: () =>
       fetchJson<AssetViewResponse>(
         `/asset-view/${encodeURIComponent(address ?? '')}${assetViewSearch(since, legSince)}`,
       ),
-    enabled: Boolean(address),
-    refetchInterval: 30_000,
+    enabled: (query) => Boolean(address) && canFetch(shown, query),
+    refetchInterval: shown ? 30_000 : false,
   });
 }
 
 /** One asset-view fetch per DISTINCT window — the start date is per asset,
  * but the server windows a whole response at once, so assets sharing a date
  * share a request (usually one or two in practice). Returns since → data. */
-export function useAssetViewWindows(address: string | null, sinces: readonly number[], legSince = '') {
-  const distinct = [...new Set(sinces)].sort((a, b) => a - b);
+export function useAssetViewWindows(
+  address: string | null,
+  sinces: readonly (number | undefined)[],
+  legSince = '',
+) {
+  const shown = useTabActive();
+  const refetchInterval: number | false = shown ? 30_000 : false;
+  const distinct = [...new Set(sinces)].sort((a, b) =>
+    a === undefined ? -1 : b === undefined ? 1 : a - b,
+  );
   const results = useQueries({
     queries: distinct.map((since) => ({
       queryKey: qk.assetView(address ?? '', since, legSince),
@@ -176,14 +200,14 @@ export function useAssetViewWindows(address: string | null, sinces: readonly num
         fetchJson<AssetViewResponse>(
           `/asset-view/${encodeURIComponent(address ?? '')}${assetViewSearch(since, legSince)}`,
         ),
-      enabled: Boolean(address),
-      refetchInterval: 30_000,
+      enabled: (query: { state: { data: unknown } }) => Boolean(address) && canFetch(shown, query),
+      refetchInterval,
     })),
   });
-  const bySince = new Map<number, AssetViewResponse>();
+  const bySince = new Map<number | undefined, AssetViewResponse>();
   // A window whose fetch FAILED (no data, not loading). Without this the
   // caller cannot tell "still fetching" from "never coming".
-  const errorBySince = new Map<number, unknown>();
+  const errorBySince = new Map<number | undefined, unknown>();
   distinct.forEach((since, i) => {
     const r = results[i];
     const d = r?.data;
@@ -198,9 +222,6 @@ export interface OpportunitiesParams {
   borosEntry: BorosEntryMode;
   entryMode: EntryMode;
   exitMode: ExitMode;
-  /** Simulate a Gate CrossEx VIP fee tier (e.g. 'vip0') instead of the
-   * account's live schedule — the unconfigured view always sends one. */
-  feeTier?: string;
 }
 
 /** Route bounds (src/server/routes/opportunities.ts): anything outside them is
@@ -231,23 +252,24 @@ export function isValidOpportunityNotional(notionalUsd: number): boolean {
  * `isPlaceholderData` to dim them). */
 export function useOpportunities(p: OpportunitiesParams) {
   const search =
-    `?notionalUsd=${p.notionalUsd}&borosEntry=${p.borosEntry}` +
-    `&entryMode=${p.entryMode}&exitMode=${p.exitMode}` +
-    (p.feeTier ? `&feeTier=${p.feeTier}` : '');
+    `?notionalUsd=${p.notionalUsd}&borosEntry=${p.borosEntry}` + `&entryMode=${p.entryMode}&exitMode=${p.exitMode}`;
+  const shown = useTabActive();
   return useQuery({
-    queryKey: qk.opportunities(p.notionalUsd, p.borosEntry, p.entryMode, p.exitMode, p.feeTier),
+    queryKey: qk.opportunities(p.notionalUsd, p.borosEntry, p.entryMode, p.exitMode),
     queryFn: () => fetchJson<OpportunitiesResult>(`/opportunities${search}`),
-    enabled: isValidOpportunityNotional(p.notionalUsd),
-    refetchInterval: 12_000,
+    enabled: (query) => isValidOpportunityNotional(p.notionalUsd) && canFetch(shown, query),
+    refetchInterval: shown ? 12_000 : false,
     placeholderData: keepPreviousData,
   });
 }
 
 export function useFees() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.fees,
     queryFn: () => fetchJson<VenueFees[]>('/fees'),
-    refetchInterval: 600_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 600_000 : false,
     placeholderData: keepPreviousData,
   });
 }
@@ -277,11 +299,13 @@ export function useDisclaimer() {
  * (an errored query leaves data undefined, so the update pill simply doesn't
  * render). */
 export function useVersion() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.version,
     queryFn: () => fetchJson<UpdateStatus>('/version'),
     staleTime: 21_600_000,
-    refetchInterval: 21_600_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 21_600_000 : false,
     retry: false,
     retryOnMount: false,
   });
@@ -306,11 +330,12 @@ export function useVersion() {
  * and 11.
  */
 export function useInstallWatch(enabled: boolean) {
+  const shown = useTabActive();
   return useQuery({
     queryKey: [...qk.version, 'watch'] as const,
     queryFn: () => fetchJson<UpdateStatus>('/version'),
-    enabled,
-    refetchInterval: 2_500,
+    enabled: (query) => enabled && canFetch(shown, query),
+    refetchInterval: shown ? 2_500 : false,
     refetchIntervalInBackground: true,
     staleTime: 0,
     retry: false,
@@ -354,11 +379,12 @@ export function useSymbolDetail(symbol: string | null) {
 export function useDealView(id: string | null) {
   const qc = useQueryClient();
   const settled = useRef<string | null>(null);
+  const shown = useTabActive();
   const query = useQuery({
     queryKey: qk.deal(id ?? ''),
     queryFn: () => fetchJson<DealView>(`/deals/${encodeURIComponent(id ?? '')}`),
-    enabled: Boolean(id),
-    refetchInterval: (q) => (q.state.data?.pair.mode === 'DONE' ? false : 1_000),
+    enabled: (q) => Boolean(id) && canFetch(shown, q),
+    refetchInterval: shown ? (q) => (q.state.data?.pair.mode === 'DONE' ? false : 1_000) : false,
     refetchIntervalInBackground: true,
   });
 
@@ -387,11 +413,12 @@ export function useDealView(id: string | null) {
 
 /** Venue touch for the re-peg decision UI — polls only while enabled. */
 export function useVenueBook(symbol: string | null, enabled: boolean) {
+  const shown = useTabActive();
   return useQuery({
     queryKey: ['book', symbol ?? ''] as const,
     queryFn: () => fetchJson<BookTouch>(`/books/${encodeURIComponent(symbol ?? '')}`),
-    enabled: enabled && Boolean(symbol),
-    refetchInterval: 2_500,
+    enabled: (query) => enabled && Boolean(symbol) && canFetch(shown, query),
+    refetchInterval: shown ? 2_500 : false,
     placeholderData: keepPreviousData,
   });
 }
@@ -408,32 +435,38 @@ export function useDealCommand(command: 'convert' | 'repeg' | 'stop' | 'resume')
 
 /** Deals still working (the recovery banner + a tab-reload's way back in). */
 export function useActiveDeals() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.activeDeals,
     queryFn: () => fetchJson<DealView[]>('/deals?active=1'),
-    refetchInterval: 5_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 5_000 : false,
     refetchIntervalInBackground: true,
   });
 }
 
 /** Standing engine alerts (walls, quarantines, unresolved orders). */
 export function useAlerts() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.alerts,
     queryFn: async () => {
       const rows = await fetchJson<(DealAlert & { pair_id?: string | null })[]>('/alerts?unacked=1');
       return rows.map((row) => ({ ...row, pairId: row.pairId ?? row.pair_id ?? null }));
     },
-    refetchInterval: 10_000,
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 10_000 : false,
     refetchIntervalInBackground: true,
   });
 }
 
 export function useRebalance() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.rebalance,
     queryFn: () => fetchJson<RebalanceView>('/rebalance'),
-    refetchInterval: (q) => (q.state.data?.job?.status === 'running' ? 1_000 : 4_000),
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? (q) => (q.state.data?.job?.status === 'running' ? 1_000 : 4_000) : false,
     refetchIntervalInBackground: true,
   });
 }
@@ -493,10 +526,12 @@ export function useRebalanceCommand(cmd: 'resume' | 'abandon') {
 }
 
 export function useTransfer() {
+  const shown = useTabActive();
   return useQuery({
     queryKey: qk.transfer,
     queryFn: () => fetchJson<TransferView>('/transfer'),
-    refetchInterval: (q) => (q.state.data?.transfer?.status === 'moving' ? 1_000 : 4_000),
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? (q) => (q.state.data?.transfer?.status === 'moving' ? 1_000 : 4_000) : false,
     refetchIntervalInBackground: true,
   });
 }
@@ -550,13 +585,15 @@ export function usePutCredentials() {
 
 /** The pairable Boros universe plus this address's per-market state. Keyed by
  * address: two addresses must never share positions or margin buckets. */
-export function useBorosPairContext(address: string | null) {
+export function useBorosPairContext(address: string | null, active = true) {
+  const tabShown = useTabActive();
+  const shown = tabShown && active;
   return useQuery({
     queryKey: qk.borosPairContext(address ?? ''),
     queryFn: () => fetchJson<BorosPairContext>(`/boros/pair/context?address=${address}`),
-    enabled: Boolean(address),
+    enabled: (query) => Boolean(address) && canFetch(shown, query),
     placeholderData: keepPreviousData,
-    refetchInterval: 15_000,
+    refetchInterval: shown ? 15_000 : false,
   });
 }
 
@@ -575,13 +612,14 @@ export function useBorosPairSimulation(
    * confirm (the asset card's roll probes). */
   opts: { refetchInterval?: number } = {},
 ) {
+  const shown = useTabActive();
   return useQuery({
     // The whole request is the key: any field change is a different quote.
     queryKey: ['boros', 'pair', 'simulate', JSON.stringify(req)] as const,
     queryFn: () => postJson<BorosPairSimulateResponse>('/boros/pair/simulate', req),
-    enabled: Boolean(req) && enabled,
+    enabled: (query) => Boolean(req) && enabled && canFetch(shown, query),
     placeholderData: keepPreviousData,
-    refetchInterval: opts.refetchInterval ?? 4_000,
+    refetchInterval: shown ? (opts.refetchInterval ?? 4_000) : false,
     // A stale quote must never back a confirm, so don't serve one from cache
     // across a remount.
     gcTime: 0,
@@ -645,9 +683,9 @@ export function useTopUpGas() {
   // again. A success mints a fresh id for the next top-up.
   const idRef = useRef<string | null>(null);
   return useMutation({
-    mutationFn: (amountUsd: number) => {
+    mutationFn: ({ amountUsd, address }: { amountUsd: number; address: string }) => {
       idRef.current ??= `gas-${uuid()}`.slice(0, 64);
-      return postJson<TopUpGasResponse>('/boros/pair/top-up-gas', { amountUsd, clientOrderId: idRef.current });
+      return postJson<TopUpGasResponse>('/boros/pair/top-up-gas', { amountUsd, address, clientOrderId: idRef.current });
     },
     onSuccess: () => {
       idRef.current = null;
@@ -672,11 +710,12 @@ export function useRunUpdate() {
  * needs it: nobody keeps the tab in front of them for a whole install.
  */
 export function useUpdateLog(enabled: boolean) {
+  const shown = useTabActive();
   return useQuery({
     queryKey: [...qk.version, 'log'] as const,
     queryFn: () => fetchJson<UpdateProgress>('/version/update/log'),
-    enabled,
-    refetchInterval: 1_500,
+    enabled: (query) => enabled && canFetch(shown, query),
+    refetchInterval: shown ? 1_500 : false,
     refetchIntervalInBackground: true,
     staleTime: 0,
     retry: false,
@@ -737,6 +776,17 @@ export function useBorosAgent() {
   });
 }
 
+/** The logged-in account's settlement-fee rebate config — null when this install
+ * holds no agent key or the account is not rebated. Drives the forward rate math
+ * and the opportunity badge/toggle; the realized amounts ride on the asset view. */
+export function useRebate() {
+  return useQuery({
+    queryKey: qk.rebate,
+    queryFn: () => fetchJson<Rebate | null>('/boros/rebate'),
+    staleTime: 30_000,
+  });
+}
+
 export function useProvisionBorosAgent() {
   const qc = useQueryClient();
   return useMutation({
@@ -752,5 +802,80 @@ export function useForgetBorosAgent() {
   return useMutation({
     mutationFn: () => del<{ configured: boolean; note: string }>('/boros/agent'),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.borosAgent }),
+  });
+}
+
+export function useTelegram() {
+  const shown = useTabActive();
+  return useQuery({
+    queryKey: qk.telegram,
+    queryFn: () => fetchJson<TelegramInfo>('/telegram'),
+    enabled: (query) => canFetch(shown, query),
+    refetchInterval: shown ? 30_000 : false,
+  });
+}
+
+/** Asks the bot now (GET /telegram?fresh=1). The answer can take seconds, so
+ * it is dropped when the cache changed meanwhile (a toggle saved, a poll). */
+export async function refreshTelegramFresh(qc: QueryClient): Promise<void> {
+  const before = qc.getQueryState(qk.telegram)?.dataUpdatedAt;
+  const fresh = await fetchJson<TelegramInfo>('/telegram?fresh=1');
+  if (qc.getQueryState(qk.telegram)?.dataUpdatedAt === before) qc.setQueryData(qk.telegram, fresh);
+}
+
+/** Is Telegram linked? Read from the cache only, never fetched: for copy that
+ * mentions alerts when the Telegram row has already loaded them. */
+export function useTelegramLinked(): boolean {
+  const { data } = useQuery({
+    queryKey: qk.telegram,
+    queryFn: () => fetchJson<TelegramInfo>('/telegram'),
+    enabled: false,
+  });
+  return data?.connected === true;
+}
+
+export function useTelegramLink(enabled: boolean) {
+  const shown = useTabActive();
+  return useQuery({
+    queryKey: qk.telegramLink,
+    queryFn: () => fetchJson<TelegramLinkStatus>('/telegram/link'),
+    enabled: (query) => enabled && canFetch(shown, query),
+    refetchInterval: shown ? 2_000 : false,
+  });
+}
+
+export function useStartTelegramLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { addWallet?: boolean } | void) => postJson<TelegramLinkStart>('/telegram/link', body ?? {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.telegram }),
+  });
+}
+
+export function useTelegramSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { liquidation?: boolean; interest?: boolean; maturity?: boolean; rollover?: boolean }) =>
+      patchJson<TelegramInfo>('/telegram/settings', body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.telegram }),
+  });
+}
+
+export function useDisconnectTelegram() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => del<TelegramInfo>('/telegram'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.telegram }),
+  });
+}
+
+export function useCancelTelegramLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => del<TelegramLinkStatus>('/telegram/link'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.telegram });
+      qc.invalidateQueries({ queryKey: qk.telegramLink });
+    },
   });
 }

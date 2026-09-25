@@ -1,11 +1,9 @@
 {
-  "version": "1.7.0",
+  "version": "1.7.2",
   "highlights": [
-    "Roll over: move a pair into the next maturity from Positions, as one all-or-nothing batch",
-    "The banner says which pairs are ready to roll and which later maturity pays more",
-    "The venue previews the roll: a leg that cannot fill whole, or margin that runs short, blocks the hold",
-    "Can it fund? shows what the new legs need against what is spendable before and after",
-    "Every trade form shares one look: the same market picker, size box and Estimate card",
-    "A Boros order that fails names the leg and the reason; hide inactive pairs is on by default"
+    "Settlement-fee rebates: a rebated wallet sees its rebate % on every opportunity and can include it in the APR",
+    "Positions count the rebate you have earned in Total PnL, the APR, the Boros table and the PnL waterfall",
+    "Viewing a wallet you are not logged in to is one clean read-only view: only that wallet, and the header says so",
+    "Telegram setup reads done only for the wallet the alerts are linked to"
   ]
 }

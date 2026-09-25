@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -38,11 +39,13 @@ const mount = () =>
 const mountTracked = () => {
   writeJson(STRATEGY_STORAGE_KEY, { ...loadStored(), address: TRACKED });
   return render(
-    <ToastProvider>
-      <TrackedAddressProvider>
-        <SharePositionModal payload={payload} onClose={() => {}} />
-      </TrackedAddressProvider>
-    </ToastProvider>,
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <ToastProvider>
+        <TrackedAddressProvider>
+          <SharePositionModal payload={payload} onClose={() => {}} />
+        </TrackedAddressProvider>
+      </ToastProvider>
+    </QueryClientProvider>,
   );
 };
 
@@ -86,7 +89,7 @@ describe('SharePositionModal', () => {
 
   it('opens the X intent pre-filled with the tweet text and the link', async () => {
     mount();
-    const x = await screen.findByRole('link', { name: 'Share on X →' });
+    const x = await screen.findByRole('link', { name: 'Share on X' });
     const href = x.getAttribute('href') ?? '';
     expect(href.startsWith('https://x.com/intent/post?text=')).toBe(true);
     const u = new URL(href);
@@ -159,7 +162,7 @@ describe('SharePositionModal', () => {
     expect(input.value).toBe('https://boros.pendle.finance/arbitrage-crossex/position?s=Abc123_-xyz');
     // It was never the long URL on the way there.
     expect(input.value).not.toBe(buildShareUrl(payload));
-    const href = screen.getByRole('link', { name: 'Share on X →' }).getAttribute('href') ?? '';
+    const href = screen.getByRole('link', { name: 'Share on X' }).getAttribute('href') ?? '';
     expect(new URL(href).searchParams.get('url')).toBe(buildShortShareUrl('Abc123_-xyz'));
   });
 
@@ -177,7 +180,7 @@ describe('SharePositionModal', () => {
     mount();
     expect(await screen.findByText(/Image generation failed — the link below still works/)).toBeInTheDocument();
     expect(await screen.findByLabelText('Position share link')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Share on X →' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Share on X' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Download PNG' })).not.toBeInTheDocument();
     expect(screen.queryByAltText('Position share card')).not.toBeInTheDocument();
   });

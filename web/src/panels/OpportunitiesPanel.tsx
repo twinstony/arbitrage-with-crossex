@@ -13,6 +13,7 @@
  * drive. Executing only PREFILLS the pair ticket — submission stays behind its
  * hold-to-confirm control.
  */
+import { ArrowRight, ArrowUpRight } from 'lucide-react';
 import {
   memo,
   useCallback,
@@ -29,11 +30,10 @@ import {
   isValidOpportunityNotional,
   OPPORTUNITY_NOTIONAL_MAX,
   OPPORTUNITY_NOTIONAL_MIN,
-  OPPORTUNITY_FEE_TIERS,
   useBorosPairContext,
   useOpportunities,
   usePositions,
-  type OpportunityFeeTier,
+  useRebate,
 } from '../api/queries';
 import type {
   BorosEntryMode,
@@ -41,6 +41,7 @@ import type {
   ExitMode,
   OpportunityGroup,
   OpportunityPair,
+  Rebate,
 } from '../api/types';
 import { Chip, type ChipTone } from '../components/Chip';
 import { EmptyState } from '../components/EmptyState';
@@ -69,7 +70,9 @@ import { StrategyFreshness } from './HomeControls';
 import { OpportunityFilterBar } from './OpportunityFilterBar';
 import { canChartCapital, canChartProfit, OpportunityWaterfall } from './OpportunityWaterfall';
 import { heldPerpsOf, repriceHeld, type HeldBook, type HeldTag } from './heldPerps';
-import { useTrackedAddressOptional } from './trackedAddress';
+import { applyRebate } from './opportunityRebate';
+import { rebateAppliesTo, rebateChipLabel } from '../lib/rebate';
+import { useActiveWallet, useTrackedAddressOptional } from './trackedAddress';
 import {
   applyFilters,
   hasActiveFilter,
@@ -131,8 +134,10 @@ export interface StoredControls {
   borosEntry: BorosEntryMode;
   entryMode: EntryMode;
   exitMode: ExitMode;
-  /** Simulated Gate CrossEx VIP fee tier — only sent while unconfigured. */
-  feeTier: OpportunityFeeTier;
+  /** Credit the account's settlement-fee rebate into every APR. Default on —
+   * the rebate is a real, unconditional discount for a rebated account. Only
+   * ever shown/applied when the account has a rebate at all. */
+  includeRebate: boolean;
 }
 
 const DEFAULTS: StoredControls = {
@@ -143,22 +148,14 @@ const DEFAULTS: StoredControls = {
   // 'roll' by default: an assumed exit cost is a decision the user has not
   // made yet, and it understates every quote.
   exitMode: 'roll',
-  feeTier: 'vip0',
+  includeRebate: true,
 };
-
-/** 'vip3' → 'VIP 3'. */
-const feeTierLabel = (t: OpportunityFeeTier) => `VIP ${t.slice(3)}`;
 
 const validEntryMode = (v: unknown): EntryMode =>
   v === 'both-market' || v === 'maker-hedge' ? v : DEFAULTS.entryMode;
 
 const validExitMode = (v: unknown): ExitMode =>
   v === 'close' || v === 'roll' ? v : DEFAULTS.exitMode;
-
-const validFeeTier = (v: unknown): OpportunityFeeTier =>
-  (OPPORTUNITY_FEE_TIERS as readonly unknown[]).includes(v)
-    ? (v as OpportunityFeeTier)
-    : DEFAULTS.feeTier;
 
 const validSize = (v: unknown): number =>
   typeof v === 'number' && isValidOpportunityNotional(v) ? v : DEFAULTS.customNotionalUsd;
@@ -174,7 +171,7 @@ function migrateLegacy(): StoredControls | null {
   const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
   if (raw === null) return null;
   const p = JSON.parse(raw) as
-    | { choice?: unknown; customSize?: unknown; entryMode?: unknown; exitMode?: unknown; feeTier?: unknown }
+    | { choice?: unknown; customSize?: unknown; entryMode?: unknown; exitMode?: unknown }
     | null;
   const size = validSize(p?.customSize);
   const choice = p?.choice;
@@ -194,7 +191,7 @@ function migrateLegacy(): StoredControls | null {
     borosEntry: 'market',
     entryMode: validEntryMode(p?.entryMode),
     exitMode: validExitMode(p?.exitMode),
-    feeTier: validFeeTier(p?.feeTier),
+    includeRebate: DEFAULTS.includeRebate,
   };
 }
 
@@ -220,7 +217,7 @@ export function loadControls(base: StoredControls = DEFAULTS): StoredControls {
           borosEntry?: unknown;
           entryMode?: unknown;
           exitMode?: unknown;
-          feeTier?: unknown;
+          includeRebate?: unknown;
         }
       | null;
     return {
@@ -238,7 +235,7 @@ export function loadControls(base: StoredControls = DEFAULTS): StoredControls {
           ? p.entryMode
           : base.entryMode,
       exitMode: p?.exitMode === 'close' || p?.exitMode === 'roll' ? p.exitMode : base.exitMode,
-      feeTier: validFeeTier(p?.feeTier),
+      includeRebate: typeof p?.includeRebate === 'boolean' ? p.includeRebate : base.includeRebate,
     };
   });
 }
@@ -310,8 +307,8 @@ function cardChips(pair: OpportunityPair): CardChip[] {
     if (!leg.crossexSymbol) {
       chips.push({
         key: `sym:${side}`,
-        label: `no CX symbol · ${leg.venue}`,
-        title: `${leg.venue} lists no CrossEx perp for ${leg.base} — that leg won't prefill`,
+        label: `no CX symbol · ${prettyVenue(leg.venue)}`,
+        title: `${prettyVenue(leg.venue)} lists no CrossEx perp for ${leg.base} — that leg won't prefill`,
       });
     }
   }
@@ -358,7 +355,7 @@ function LegRow({
       }`}
     >
       {kind}
-      {href && <span aria-hidden="true"> ↗</span>}
+      {href && <ArrowUpRight size={12} aria-hidden className="ml-0.5 inline" />}
     </span>
   );
   return (
@@ -445,8 +442,9 @@ const OpportunityCard = memo(function OpportunityCard({
   group,
   pair: served,
   notionalUsd,
+  rebate = null,
+  includeRebate = false,
   onOpenStrategy,
-  unconfigured,
   held = null,
 }: {
   /** Set when this row is a later maturity of a hedge the reader runs: the
@@ -459,6 +457,13 @@ const OpportunityCard = memo(function OpportunityCard({
   pair: OpportunityPair;
   /** The notional the RESPONSE priced — the waterfall converts APRs with it. */
   notionalUsd: number;
+  /** The account's settlement-fee rebate config — drives the "fee rebate" chip
+   * (shown when it reaches either leg) and, with `includeRebate`, the reprice.
+   * Null = no rebate, chip hidden. */
+  rebate?: Rebate | null;
+  /** Whether to CREDIT the rebate into this card's APR (the "Include rebate in
+   * APR" toggle). The chip shows regardless; only the reprice honours this. */
+  includeRebate?: boolean;
   /** Opens the guided 2-step wizard for this pair — Boros rate legs first,
    * then the perp hedge. null when there is no trade-flow provider (the
    * landing build); the button then explains itself. `sizeBase` sizes the
@@ -467,9 +472,6 @@ const OpportunityCard = memo(function OpportunityCard({
   onOpenStrategy:
     | ((pair: OpportunityPair, maturitySec: number, sizeBase?: number) => void)
     | null;
-  /** First-run view: symbols are expectedly absent, so the CTA stays enabled
-   * and clicking it nudges the setup guide instead of dead-ending. */
-  unconfigured: boolean;
 }) {
   const [open, setOpen] = useState(false);
   /**
@@ -482,7 +484,20 @@ const OpportunityCard = memo(function OpportunityCard({
    */
   const [hasPerpsChoice, setHasPerpsChoice] = useState<boolean | null>(null);
   const hasPerps = hasPerpsChoice ?? held === 'rollover';
-  const pair = useMemo(() => (hasPerps ? repriceHeld(served, notionalUsd) : served), [hasPerps, served, notionalUsd]);
+  // repriceHeld first (drops perp entry cost), then applyRebate (credits the
+  // settlement-fee rebate) — both pure OpportunityPair → OpportunityPair, so
+  // they compose and every downstream identity still closes.
+  const pair = useMemo(() => {
+    const priced = hasPerps ? repriceHeld(served, notionalUsd) : served;
+    return rebate && includeRebate ? applyRebate(priced, rebate, notionalUsd) : priced;
+  }, [hasPerps, served, notionalUsd, rebate, includeRebate]);
+  // The chip shows whenever the rebate actually reaches one of this card's two
+  // markets (active window + market filter) — independent of the toggle.
+  const rebateChip =
+    rebate &&
+    (rebateAppliesTo(rebate, pair.shortLeg.marketId) || rebateAppliesTo(rebate, pair.longLeg.marketId))
+      ? rebate
+      : null;
   const chips = cardChips(pair);
   // Only the PAIR's own reasons — they explain this card's own numbers. The
   // group's warnings are about the other markets in the cohort ("… has no
@@ -518,14 +533,12 @@ const OpportunityCard = memo(function OpportunityCard({
   // different assets, and the ticket only takes one base.
   const basesDiffer = pair.shortLeg.base !== pair.longLeg.base;
   const noSymbols = !pair.shortLeg.crossexSymbol && !pair.longLeg.crossexSymbol;
-  const executeDisabled = (noSymbols && !unconfigured) || basesDiffer || onOpenStrategy === null;
+  const executeDisabled = noSymbols || basesDiffer || onOpenStrategy === null;
   const executeTitle = basesDiffer
     ? `The legs trade different assets (${pair.shortLeg.base} vs ${pair.longLeg.base}) — the pair ticket takes one base`
-    : unconfigured
-      ? 'Add your Gate API key in the setup guide on the right — clicking walks you through the legs'
-      : noSymbols
-        ? `Neither ${pair.shortLeg.venue} nor ${pair.longLeg.venue} lists a CrossEx perp for ${pair.base}`
-        : 'Opens this strategy step by step — lock the Boros rate first, then hedge with the perps. You confirm each order yourself.';
+    : noSymbols
+      ? `Neither ${prettyVenue(pair.shortLeg.venue)} nor ${prettyVenue(pair.longLeg.venue)} lists a CrossEx perp for ${pair.base}`
+      : 'Opens this strategy step by step — lock the Boros rate first, then hedge with the perps. You confirm each order yourself.';
   const detailsDisabled =
     !canChartProfit(pair) && !canChartCapital(pair) && pair.execSpreadApr === null;
   const detailsTitle = detailsDisabled
@@ -580,6 +593,15 @@ const OpportunityCard = memo(function OpportunityCard({
           <input type="checkbox" className="chk" checked={hasPerps} onChange={(e) => setHasPerpsChoice(e.target.checked)} />
           I have existing perp position
         </label>
+        {rebateChip && (
+          <Chip
+            sm
+            tone="green"
+            title={`Boros settlement-fee rebate on this account${rebateChip.startTimestamp ? ` since ${fmtDateLocal(rebateChip.startTimestamp)}` : ''}`}
+          >
+            {rebateChipLabel(rebateChip)}
+          </Chip>
+        )}
         {chips.map((c) => (
           <Chip key={c.key} sm tone={c.tone ?? 'amber'} title={c.title}>
             {c.label}
@@ -690,8 +712,8 @@ const OpportunityCard = memo(function OpportunityCard({
               </span>
             </Stat>
             {/* The net story needs fees/books/leverage; when those are missing
-                (Gate down or unconfigured) the raw Boros spread is still the
-                headline worth showing — it is what the trade captures. */}
+                (Gate down) the raw Boros spread is still the headline worth
+                showing — it is what the trade captures. */}
             {pair.netFixedApr === null && Number.isFinite(pair.grossSpreadApr) && (
               <Stat label="Gross spread">
                 <span
@@ -740,7 +762,7 @@ const OpportunityCard = memo(function OpportunityCard({
                 )
               }
             >
-              Open this strategy →
+              Open this strategy <ArrowRight size={14} aria-hidden className="inline" />
             </button>
           </div>
         </div>
@@ -899,7 +921,7 @@ function RateNote({ midApr, execApr }: { midApr: number; execApr: number | null 
   );
 }
 
-export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: boolean } = {}) {
+export function OpportunitiesPanel() {
   const [stored] = useState<StoredControls>(() => loadControls());
   const [notionalChoice, setNotionalChoice] = useState<NotionalChoice>(stored.notionalChoice);
   // Always market-at-size. The "at mark rate" alternative priced cards at a
@@ -908,7 +930,7 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
   const borosEntry: BorosEntryMode = 'market';
   const [entryMode, setEntryMode] = useState<EntryMode>(stored.entryMode);
   const [exitMode, setExitMode] = useState<ExitMode>(stored.exitMode);
-  const [feeTier, setFeeTier] = useState<OpportunityFeeTier>(stored.feeTier);
+  const [includeRebate, setIncludeRebate] = useState<boolean>(stored.includeRebate);
   const [sizeStr, setSizeStr] = useState(String(stored.customNotionalUsd));
   // The last VALID size: a half-typed entry must never blank the list.
   const [size, setSize] = useState(stored.customNotionalUsd);
@@ -926,7 +948,6 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
   const shownKeysRef = useRef<ReadonlySet<string>>(new Set());
   const flow = useTradeFlowOptional();
   const sizeId = useId();
-  const feeTierId = useId();
 
   const persist = (next: Partial<StoredControls>) =>
     writeJson(OPPORTUNITIES_STORAGE_KEY, {
@@ -935,7 +956,7 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
       borosEntry,
       entryMode,
       exitMode,
-      feeTier,
+      includeRebate,
       ...next,
     } satisfies StoredControls);
 
@@ -957,16 +978,19 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
       : null;
   const sizeBad = notionalChoice === 'custom' && !isValidOpportunityNotional(Number(sizeStr));
 
-  // Configured accounts price from their own live fee schedule; the simulated
-  // tier only exists where there is no account to read.
   const query = useOpportunities({
     notionalUsd,
     borosEntry,
     entryMode,
     exitMode,
-    feeTier: unconfigured ? feeTier : undefined,
   });
   const data = query.data;
+
+  // The account's settlement-fee rebate config (null when not rebated / no agent).
+  // The chip shows whenever there IS an active rebate; the toggle decides whether
+  // it lands in the APR. Every affordance stays hidden for a non-rebated account.
+  const rebate = useRebate().data ?? null;
+  const hasRebate = !!rebate && rebate.active;
 
   // Every viable PAIR, not one per group: a cohort with three markets offers
   // three venue combinations, and the two the group's best pair outranked are
@@ -981,8 +1005,10 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
   const trackedAddress = useTrackedAddressOptional()?.address ?? null;
   const exposure = usePositions(trackedAddress !== null).data?.exposure;
   const borosMarkets = useBorosPairContext(trackedAddress).data?.markets;
+  // The perp exposure is the logged-in account's: never pair it with another wallet's Boros legs.
+  const viewOnly = useActiveWallet().viewOnly;
   const held = useMemo(() => {
-    if (!exposure) return undefined;
+    if (viewOnly || !exposure) return undefined;
     const books: HeldBook[] = exposure.map((g) => ({
       base: g.base,
       perps: g.legs.map((l) => ({ venue: l.exchange, side: l.side })),
@@ -991,7 +1017,7 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
         .map((m) => ({ venue: m.venue, maturity: m.maturity })),
     }));
     return heldPerpsOf(books);
-  }, [exposure, borosMarkets]);
+  }, [viewOnly, exposure, borosMarkets]);
   const pricedAtUsd = data?.meta.notionalUsd;
   const rows = useMemo(
     () =>
@@ -999,8 +1025,14 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
         data?.groups ?? [],
         shownKeysRef.current,
         held && pricedAtUsd !== undefined ? { held, notionalUsd: pricedAtUsd } : undefined,
+        // Fold the rebate into ranking AND the viability cutoff exactly when the
+        // cards credit it, so a pair only profitable after the rebate is neither
+        // hidden nor mis-ranked against the discounted APR it displays.
+        hasRebate && includeRebate && rebate && pricedAtUsd !== undefined
+          ? { config: rebate, notionalUsd: pricedAtUsd }
+          : null,
       ),
-    [data?.groups, held, pricedAtUsd],
+    [data?.groups, held, pricedAtUsd, hasRebate, includeRebate, rebate],
   );
   const visible = useMemo(() => applyFilters(rows, filters), [rows, filters]);
 
@@ -1026,11 +1058,6 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
   // with markets that do not exist.
   const openStrategy = useCallback(
     (pair: OpportunityPair, maturitySec: number, sizeBase?: number) => {
-      // First run: there are no keys to execute with, so opening a two-step
-      // execution wizard would dead-end. Ask for setup instead — the guide
-      // answers by flashing the API-key form, the one step between this click
-      // and a wizard that can actually trade.
-      if (unconfigured) return flow?.requestSetup();
       return flow?.openWizard({
         base: pair.base,
         borosLongVenue: pair.longLeg.venue,
@@ -1049,7 +1076,7 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
         perpMode: entryMode === 'maker-hedge' ? 'maker' : 'market',
       });
     },
-    [flow, pricedNotionalUsd, entryMode, unconfigured],
+    [flow, pricedNotionalUsd, entryMode],
   );
 
   const controls = (
@@ -1118,30 +1145,6 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
           </span>
         )}
       </div>
-      {unconfigured && (
-        <div className="flex flex-col items-start gap-1.5">
-          <label htmlFor={feeTierId} className={microLabelClass}>
-            Gate VIP tier
-          </label>
-          <select
-            id={feeTierId}
-            value={feeTier}
-            onChange={(e) => {
-              const next = e.target.value as OpportunityFeeTier;
-              setFeeTier(next);
-              persist({ feeTier: next });
-            }}
-            title="Perp fees assume this Gate CrossEx VIP tier."
-            className="input num h-[30px] w-24 !py-0 text-xs"
-          >
-            {OPPORTUNITY_FEE_TIERS.map((t) => (
-              <option key={t} value={t}>
-                {feeTierLabel(t)}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
       <div className="flex flex-col items-start gap-1.5">
         <div className={microLabelClass}>Perp entry</div>
         <SegmentedToggle<EntryMode>
@@ -1175,6 +1178,27 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
           ]}
         />
       </div>
+
+      {hasRebate && (
+        <div className="flex flex-col items-start gap-1.5">
+          <div className={microLabelClass}>Settlement rebate</div>
+          <label
+            className="flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap text-[12px] text-ink-200"
+            title={`Credit this account's Boros settlement-fee rebate (${rebateChipLabel(rebate as Rebate)}) into every APR, Return and profit.`}
+          >
+            <input
+              type="checkbox"
+              className="chk"
+              checked={includeRebate}
+              onChange={(e) => {
+                setIncludeRebate(e.target.checked);
+                persist({ includeRebate: e.target.checked });
+              }}
+            />
+            Include rebate in APR
+          </label>
+        </div>
+      )}
 
         <span className="ml-auto flex items-center gap-2">
           {query.isPlaceholderData && <span className="text-xs text-ink-400">recomputing…</span>}
@@ -1266,8 +1290,9 @@ export function OpportunitiesPanel({ unconfigured = false }: { unconfigured?: bo
               pair={row.pair}
               held={row.held}
               notionalUsd={pricedNotionalUsd}
+              rebate={hasRebate ? rebate : null}
+              includeRebate={includeRebate}
               onOpenStrategy={flow ? openStrategy : null}
-              unconfigured={unconfigured}
             />
           ))}
         </div>

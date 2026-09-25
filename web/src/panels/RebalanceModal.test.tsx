@@ -183,6 +183,12 @@ function withMixCost(costUsd: number): RebalanceView {
   return { ...view, plans: plansOf({ ...view.plans.even, routes: { ...view.plans.even.routes, mix: { ...view.plans.even.routes.mix!, costUsd } } }) };
 }
 
+function withLoopTime(seconds: number): RebalanceView {
+  const view = rebalanceViews.twoBorrows;
+  const loop = { ...view.plans.even.routes.mix!, seconds, costUsd: 3.41 };
+  return { ...view, plans: plansOf({ ...view.plans.even, recommended: 'loop', routes: { ...view.plans.even.routes, loop } }) };
+}
+
 function withConvertAfter(hyperliquidEquity: number, marginFreedUsd: number): RebalanceView {
   const view = rebalanceViews.twoBorrows;
   const convert = view.plans.even.routes.convert!;
@@ -226,6 +232,21 @@ describe('RebalanceModal plan state', () => {
     expect(within(pickedRow()).getByText('Recommended')).toBeInTheDocument();
     expect(pickedRow()).toHaveTextContent('about 2 min');
     expect(pickedRow()).toHaveTextContent('Fee $0.46');
+  });
+
+  it.each([
+    [30, 'about 30s'],
+    [900, 'about 15 min'],
+    [62520, 'about 17 h 22 m'],
+  ])('the picked route row carries the fee and the %i second estimate', (seconds, time) => {
+    show(withLoopTime(seconds));
+    expect(pickedRow()).toHaveTextContent('Fee $3.41');
+    expect(pickedRow()).toHaveTextContent(time);
+  });
+
+  it('says the route once: no summary line above the hold', () => {
+    show(withLoopTime(62520));
+    expect(within(dialog()).queryByText(/^Spot loop · Fee/)).toBeNull();
   });
 
   it('clicking the selected route row opens every route', async () => {
@@ -1049,7 +1070,7 @@ describe('RebalanceModal where the money is', () => {
     const user = userEvent.setup();
     const { onTransfer } = show(rebalanceViews.accountAAbandoned, { transfer: transferViews.noSpot });
     await waitFor(() => expect(line('Last run left 36.58 USDC in Gate spot.')).toBeInTheDocument());
-    await user.click(within(dialog()).getByRole('button', { name: 'Transfer ▸' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Transfer' }));
     expect(onTransfer).toHaveBeenCalledWith('USDC', 'CROSSEX_HYPERLIQUID');
   });
 
@@ -1062,7 +1083,7 @@ describe('RebalanceModal where the money is', () => {
       { transfer: transferViews.noSpot },
     );
     await waitFor(() => expect(line('Last run left 745.44 USDC in Gate spot.')).toBeInTheDocument());
-    await user.click(within(dialog()).getByRole('button', { name: 'Transfer ▸' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Transfer' }));
     expect(onTransfer).toHaveBeenCalledWith('USDC', 'CROSSEX_GATE');
     cleanup();
 
@@ -1086,7 +1107,7 @@ describe('RebalanceModal where the money is', () => {
     const user = userEvent.setup();
     const { onTransfer } = show(rebalanceViews.lighterAcrossAbandoned, { transfer: transferViews.noSpot });
     await waitFor(() => expect(line('Last run left 499.00 USDC in Gate spot.')).toBeInTheDocument());
-    await user.click(within(dialog()).getByRole('button', { name: 'Transfer ▸' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Transfer' }));
     expect(onTransfer).toHaveBeenCalledWith('USDC', 'CROSSEX_LIGHTER');
   });
 
@@ -1354,7 +1375,7 @@ describe('RebalanceModal hovers and facts', () => {
     };
 
     show(rebalanceViews.accountA, { transfer: transferViews.accountB });
-    await within(dialog()).findByRole('button', { name: 'Transfer ▸' });
+    await within(dialog()).findByRole('button', { name: 'Transfer' });
     await check([
       ['Route', 'How the money moves. The fee includes Gate fees and the spot spread. Spot loop runs until the move is done, however many rounds that takes.'],
       ['Recommended', 'Cheapest route that takes 15 min or less.'],
@@ -1449,7 +1470,7 @@ describe('RebalanceModal Gate spot lines', () => {
   it('one spot line per coin', async () => {
     const user = userEvent.setup();
     const { onTransfer } = show(rebalanceViews.accountB, { transfer: transferViews.spotBoth });
-    await waitFor(() => expect(within(dialog()).getAllByRole('button', { name: 'Transfer ▸' })).toHaveLength(2));
+    await waitFor(() => expect(within(dialog()).getAllByRole('button', { name: 'Transfer' })).toHaveLength(2));
     const lines = [...dialog().querySelectorAll('p')]
       .map((p) => p.textContent)
       .filter((text) => text?.startsWith('Gate spot has'));
@@ -1457,7 +1478,7 @@ describe('RebalanceModal Gate spot lines', () => {
       'Gate spot has 318.42 USDT. Move it in to use it.',
       'Gate spot has 25.00 USDC. Move it in to use it.',
     ]);
-    await user.click(within(dialog()).getAllByRole('button', { name: 'Transfer ▸' })[1]);
+    await user.click(within(dialog()).getAllByRole('button', { name: 'Transfer' })[1]);
     expect(onTransfer).toHaveBeenCalledWith('USDC', 'CROSSEX_HYPERLIQUID');
   });
 
@@ -1465,7 +1486,7 @@ describe('RebalanceModal Gate spot lines', () => {
     const user = userEvent.setup();
     const { onTransfer } = show(rebalanceViews.accountB, { transfer: transferViews.accountB });
     await waitFor(() => expect(line('Gate spot has 318.42 USDT. Move it in to use it.')).toBeInTheDocument());
-    await user.click(within(dialog()).getByRole('button', { name: 'Transfer ▸' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Transfer' }));
     expect(onTransfer).toHaveBeenCalledWith('USDT', 'CROSSEX');
   });
 
@@ -1478,7 +1499,7 @@ describe('RebalanceModal Gate spot lines', () => {
       </>,
     );
     await screen.findByText('reads loaded');
-    expect(within(dialog()).queryByRole('button', { name: 'Transfer ▸' })).toBeNull();
+    expect(within(dialog()).queryByRole('button', { name: 'Transfer' })).toBeNull();
     expect(within(dialog()).queryByText(/Gate spot has/)).toBeNull();
   });
 });
@@ -1520,6 +1541,22 @@ describe('RebalanceModal presets and custom amount', () => {
     expect(within(dialog()).getByText('Clear debt recommended.')).toBeInTheDocument();
     expect(within(dialog()).getByText('Debt prevents you from withdrawing your cash.')).toBeInTheDocument();
     expect(within(dialog()).queryByText('Position share')).toBeNull();
+  });
+
+  it('stuck by margin with legs: the dialog names the cause the card names, never a short wallet', () => {
+    // The even split is off and nothing moves, but the wallets are not
+    // short: what would move is margin for open positions. The card says
+    // so; the preset hover and the body must not say "$203.64 more than the
+    // wallet holds." (audit 2026-09-24).
+    show({
+      ...rebalanceViews.balancedNoJob,
+      plans: plansOf({ ...rebalanceViews.balancedNoJob.plans.even, shortOfEven: 203.64 }),
+    });
+    const even = within(presets()).getByRole('radio', { name: 'Balance positions' });
+    expect(even).toBeDisabled();
+    expect(even).toHaveAttribute('title', 'Equity unbalanced but no available cash to move.');
+    expect(within(dialog()).queryByText(/more than the wallet holds/)).toBeNull();
+    expect(within(dialog()).queryByText(/\$203\.64/)).toBeNull();
   });
 
   it('with legs, opens on Balance positions', () => {

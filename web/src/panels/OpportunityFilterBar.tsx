@@ -34,6 +34,7 @@ import {
   type OpportunityFilters,
   type OpportunityRow,
 } from './opportunityFilters';
+import { Check, Funnel, X } from 'lucide-react';
 
 function FilterChip<T extends string | number>({
   option,
@@ -70,8 +71,8 @@ function FilterChip<T extends string | number>({
       {/* Shape marks the selection alongside the cyan; hidden from the
           accessible name — aria-pressed already says it. */}
       {selected && (
-        <span aria-hidden="true" className="mr-1 text-[9px] text-cyan-400">
-          ✓
+        <span aria-hidden="true" className="mr-1 text-cyan-400">
+          <Check size={12} aria-hidden className="inline" />
         </span>
       )}
       {label}{' '}
@@ -199,7 +200,7 @@ function FilterPopover({
         <div className="mb-2.5 flex items-center justify-between gap-2">
           <span className="text-xs font-semibold text-ink-100">Filters</span>
           <button type="button" aria-label="dismiss" className="btn-ghost-xs px-1.5" onClick={onDismiss}>
-            ✕
+            <X size={12} aria-hidden />
           </button>
         </div>
         <div className="flex flex-col gap-3">{children}</div>
@@ -301,9 +302,7 @@ export function OpportunityFilterBar({
                 : 'border-ink-700 bg-ink-900 text-ink-300 hover:border-ink-500 hover:text-ink-100'
             }`}
           >
-            <svg viewBox="0 0 16 16" className="h-3 w-3" fill="currentColor" aria-hidden="true">
-              <path d="M2 3h12L9.5 8.6V14L6.5 12.4V8.6z" />
-            </svg>
+            <Funnel size={12} aria-hidden />
             Filters
             {hiddenActive > 0 && (
               <span className="num rounded bg-cyan-500/20 px-1 text-[10px] leading-4 text-cyan-200">

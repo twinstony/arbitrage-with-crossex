@@ -23,7 +23,8 @@ import { Chip } from '../components/Chip';
 import { VenueIcon } from '../components/AssetIcon';
 import { HoldToConfirmButton } from '../components/HoldToConfirmButton';
 import { amountError } from '../lib/amount';
-import { fmtDateLocal, fmtPct, fmtTokenQty, fmtUsd } from '../lib/fmt';
+import { fmtDateLocal, fmtPct, fmtUsd, sigGrouped } from '../lib/fmt';
+import { ChevronDown } from 'lucide-react';
 
 /** Was this leg actually sent to the venue? A not-submitted sentinel is
  * all-zero with no failure (orders.ts `notSubmitted`); a REJECTED leg has
@@ -269,9 +270,7 @@ export function MarketSelect({
           ))}
         </select>
         <span aria-hidden className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-ink-400">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <path d="M2.5 4.5 6 8l3.5-3.5" />
-          </svg>
+          <ChevronDown size={14} aria-hidden />
         </span>
       </div>
     </div>
@@ -460,7 +459,7 @@ export function PositionArithmetic({
    * short), so a sign beside it says the same thing twice. The two legs of
    * a spread still read as opposite because they are coloured opposite.
    */
-  const mag = (n: number) => fmtTokenQty(Math.abs(n), sim.collateral);
+  const mag = (n: number) => `${sigGrouped(Math.abs(n))} ${sim.collateral}`;
   const sideOf = (leg: BorosSimulatedLeg): BorosLegDirection =>
     leg.sizing.resultingSize > 0 ? 'long' : leg.sizing.resultingSize < 0 ? 'short' : leg.direction;
   return (

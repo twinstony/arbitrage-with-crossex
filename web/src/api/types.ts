@@ -20,6 +20,8 @@
 // Envelope
 // ---------------------------------------------------------------------------
 
+import type { MarginTiers } from '../lib/liquidation';
+
 export interface ApiMeta {
   ts: number;
   stale?: boolean;
@@ -331,6 +333,8 @@ export interface StartTransferBody {
 
 export interface CrossexPosition {
   symbol: string;
+  markStaleSinceMs?: number;
+  markHeldSinceMs?: number;
   positionSide: string;
   positionQty: string;
   positionValue: string;
@@ -373,6 +377,7 @@ export interface ExposureGroup {
 export interface PositionsResponse {
   positions: CrossexPosition[];
   exposure: ExposureGroup[];
+  marginTiers?: MarginTiers;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +511,10 @@ export interface OpportunityCostBreakdown {
   borosTakerFeeUsd: number;
   /** (settleFeeAprA + settleFeeAprB) × N × T, accrued to maturity. */
   borosSettleFeeUsd: number;
+  /** CLIENT-ONLY: the settlement-fee rebate credited back at the account's
+   * current rate, when the "include rebate in APR" toggle is on. Set by
+   * `applyRebate` (never by the server), which also reduces `totalUsd` by it. */
+  borosSettleRebateUsd?: number;
   perpEntryFeesUsd: number | null;
   perpEntrySlippageUsd: number | null;
   /** 0 under `roll` — nothing is closed. */
@@ -541,6 +550,9 @@ export interface OpportunityLeg {
   /** The rate this leg actually locks (receive-fixed on the short, pay-fixed on
    * the long); null when the book can't support the size. */
   execApr: number | null;
+  /** This market's settlement-fee APR (a cost to either side). Exposed per leg
+   * so the rebate overlay can discount it per market. */
+  settleFeeApr: number;
 }
 
 export interface OpportunityPair {
@@ -1034,6 +1046,7 @@ export interface BorosPairMarketRow {
   /** Signed netted position on this market, collateral units (+ long fixed). */
   currentSize: number;
   collateralPriceUsd: number | null;
+  closeOnly: boolean;
 }
 
 /** GET /api/boros/pair/context */
@@ -1379,6 +1392,10 @@ export interface BorosAgentStatus {
    * every order fails with AuthAgentExpired(). */
   expiry: number | null;
   expired: boolean;
+  /** What the chain says about the stored key. 'not-approved' covers a
+   * rejected wallet prompt and a revoke in the Boros app. 'unknown' when Boros
+   * could not be read. null when no key is stored. Absent on older servers. */
+  approval?: 'approved' | 'expired' | 'not-approved' | 'unknown' | null;
   /** False on an install with no agent service (e.g. public mode). */
   canProvision: boolean;
 }
@@ -1391,6 +1408,32 @@ export interface BorosAgentInput {
   agentPrivateKey: string;
   /** Absolute unix seconds the approval was signed until. */
   expiry?: number;
+}
+
+/** How the account's settlement-fee rebate is priced. RELATIVE keeps a fraction
+ * of the fee (`settlementFeePercentage` = fee still paid); ABSOLUTE caps the fee
+ * at an annualized rate (`settlementFeePercentage` = the cap APR on notional). */
+export type RebateMode = 'relative' | 'absolute';
+
+/** GET /api/boros/rebate — the logged-in account's settlement-fee rebate config,
+ * for the FORWARD numbers the terminal reprices client-side. null when this
+ * install holds no agent key or the account is not rebated. One rate at a time
+ * (no history — the config is the account's ActorAddress doc). */
+export interface Rebate {
+  mode: RebateMode;
+  /** RELATIVE: the fraction of the settlement fee still PAID, in [0, 1).
+   * ABSOLUTE: the cap APR on notional (> 0). */
+  settlementFeePercentage: number;
+  /** RELATIVE only: the rebated share as integer bps, round((1 − pct) × 1e4). */
+  rebateBps: number | null;
+  /** Window start (unix sec), null = from the beginning. */
+  startTimestamp: number | null;
+  /** Window end (unix sec, exclusive), null = still active. */
+  endTimestamp: number | null;
+  /** Covered markets, null = all markets. */
+  marketIds: number[] | null;
+  /** Whether the window contains now (the backend's own reading). */
+  active: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,7 +1499,7 @@ export interface AssetBorosOpen {
   /** |notionalSize| in the collateral token. */
   sizeToken: number;
   notionalUsd: number;
-  entryApr: number;
+  entryApr: number | null;
   markApr: number;
   floatingApr: number;
   /** Cumulative settlement of the CURRENT position (display only — totals
@@ -1481,6 +1524,10 @@ export interface AssetBorosHistory {
   settleUsd: number;
   /** Fees inside that net, positive (display; never re-subtract). */
   settleFeeUsd: number;
+  /** Σ CrossEx settlement-fee rebate the backend attributed to this market's
+   * windowed settlements — a positive credit ADDED to PnL. 0/absent when the
+   * account is not rebated or on an older server. */
+  rebateUsd?: number;
   /** Σ realized trade PnL, net of trade fees. */
   tradePnlUsd: number;
   /** Fees inside that net, positive (display; never re-subtract). */
@@ -1502,6 +1549,7 @@ export interface AssetBorosHistory {
 
 export interface AssetGroup {
   base: string;
+  supported: boolean;
   /** USD price of the underlying (0 = unknown). */
   priceUsd: number;
   /** Earliest activity instant in THIS asset's sums (APR clock floor). */
@@ -1515,7 +1563,9 @@ export interface AssetGroup {
 export interface AssetViewResponse {
   sinceSec: number;
   nowSec: number;
+  defaultSinceSec: number | null;
   assets: AssetGroup[];
+  supportedCoins: string[];
   /** Earliest activity instant in any sum — the APR clock floor. */
   earliestSec: number | null;
   coverage: {
@@ -1524,6 +1574,7 @@ export interface AssetViewResponse {
     /** Oldest closed-position row read when capped; 0 = complete. */
     perpClosedFromSec: number;
     borosTxnsComplete: boolean;
+    backfilling: boolean;
   };
   /** Margin-borrow interest paid by the CrossEx account inside the window —
    * account-level, so it is charged on the total and not on any card.
@@ -1535,4 +1586,33 @@ export interface AssetViewResponse {
     available: boolean;
   };
   warnings: string[];
+}
+
+export interface InterestFloor {
+  wallet: 'USDT' | 'HYPERLIQUID' | 'LIGHTER';
+  coin: string;
+  floorUsd: number;
+}
+
+export interface TelegramInfo {
+  connected: boolean;
+  state: 'none' | 'connected' | 'replaced' | 'removed';
+  settings: { liquidation: boolean; interest: boolean; maturity: boolean; rollover: boolean } | null;
+  lastSyncAt: number | null;
+  lastSyncError: { at: number; message: string } | null;
+  alertWallet?: string | null;
+  unlinkedWallet?: string | null;
+  alertsPageUrl?: string;
+  floors?: InterestFloor[];
+}
+
+export interface TelegramLinkStart {
+  url: string;
+  expiresAt: number;
+}
+
+export interface TelegramLinkStatus {
+  status: 'none' | 'pending' | 'confirmed' | 'expired';
+  url: string | null;
+  expiresAt: number | null;
 }

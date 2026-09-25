@@ -21,13 +21,14 @@
  * Each leg is its own request: the route takes one marketId, and a partial
  * failure must leave the other leg's outcome legible.
  */
+import { Check, ChevronRight } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { BorosPairRequest, BorosSimulatedLeg, StrategyLeg } from '../api/types';
 import { VenueIcon } from '../components/AssetIcon';
 import { SignedNumber } from '../components/SignedNumber';
 import { QueryError } from '../components/QueryError';
 import { knownRate } from '../lib/boros';
-import { fieldValue, fmtDateLocal, fmtPct, fmtTokenQty, fmtUsd, prettyVenue } from '../lib/fmt';
+import { fieldValue, fmtDateLocal, fmtPct, fmtTokenQty, fmtUsd, prettyVenue, sigGrouped } from '../lib/fmt';
 import { AffixedInput, EstimateCard, EstimateRow, LegCard, SlippageLine } from './PairTicketBits';
 import { FieldLabel } from './SymbolCombobox';
 import {
@@ -37,7 +38,8 @@ import {
   useBorosPairSimulation,
 } from '../api/queries';
 import { HoldToConfirmButton } from '../components/HoldToConfirmButton';
-import { useTrackedAddress } from '../panels/trackedAddress';
+import { useActiveWallet } from '../panels/trackedAddress';
+import { BorosLogInButton } from './BorosAgentSetup';
 
 /** Used until the market's own deviation cap is known, or if it is degenerate. */
 const FALLBACK_SLIPPAGE_PCT = 1;
@@ -71,7 +73,7 @@ export function CloseBorosForm({
 }) {
   const close = useBorosCancelAndClose();
   const agent = useBorosAgent();
-  const { address } = useTrackedAddress();
+  const { address, canTrade, loginLabel } = useActiveWallet();
   /**
    * Legs whose close filled everything it ASKED for, with whatever the venue
    * still holds afterwards.
@@ -274,23 +276,8 @@ export function CloseBorosForm({
   })();
 
 
-  const agentReady = agent.data?.configured === true && agent.data.expired === false;
-  /**
-   * ⚠ The legs on this form belong to the TRACKED address; the server closes
-   * the account the agent key signs for. Those are the same account for a
-   * user watching their own book and DIFFERENT ones for someone tracking
-   * another wallet — and a close from that card would act on the agent's
-   * own position, sized off the other book. Refused here (and again server
-   * side, which is why the request names the address).
-   */
-  const agentRoot = agent.data?.configured ? agent.data.root : null;
-  const addressMismatch = Boolean(agentRoot && address && agentRoot.toLowerCase() !== address.toLowerCase());
-  const agentBlocked = agent.isSuccess && (!agentReady || addressMismatch);
-  const agentReason = !agent.data?.configured
-    ? 'No Boros wallet is connected on this install — connect one and approve an agent key before closing Boros legs.'
-    : agent.data.expired
-      ? 'The Boros agent approval has expired — approve a new agent key before closing Boros legs.'
-      : `These legs belong to ${address} — a different account from the one your agent key signs for (${agentRoot}). Track that address to close its legs.`;
+  const agentBlocked = agent.isSuccess && !canTrade;
+  const agentReason = 'This build cannot close Boros legs. Close them in the Boros app.';
 
   const allDone = closable.length > 0 && done.length === closable.length;
   /**
@@ -420,13 +407,13 @@ export function CloseBorosForm({
             like, the other is not theirs at all. */}
         {residualYours > 0 && (
           <p className="text-[11px] leading-relaxed text-ink-400">
-            {fmtTokenQty(residualYours, unit)} of this position is still open — you closed part of
+            {`${sigGrouped(residualYours)} ${unit}`} of this position is still open — you closed part of
             it. Close the rest whenever you like.
           </p>
         )}
         {residualOthers > 0 && (
           <p className="text-[11px] leading-relaxed text-ink-400">
-            {fmtTokenQty(residualOthers, unit)} more is open on the venue — that is another
+            {`${sigGrouped(residualOthers)} ${unit}`} more is open on the venue — that is another
             position's share of the same leg, not yours.
           </p>
         )}
@@ -464,7 +451,7 @@ export function CloseBorosForm({
 
   return (
     <div className="flex flex-col gap-4">
-      {agentBlocked && (
+      {agentBlocked && !loginLabel && (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] leading-relaxed text-amber-300/90">
           {agentReason}
         </p>
@@ -487,7 +474,7 @@ export function CloseBorosForm({
               venue={prettyVenue(l.venue)}
               side={l.side}
               sub={`${l.base}${l.maturity ? ` · ${fmtDateLocal(l.maturity)}` : ''}${days !== null ? ` · ${days}d` : ''}`}
-              value={fmtTokenQty(l.notionalToken ?? 0, l.collateral ?? '')}
+              value={`${sigGrouped(l.notionalToken ?? 0)} ${l.collateral ?? ''}`}
               valueSub={
                 l.entryApr !== undefined || knownRate(l.markApr) ? (
                   <>
@@ -518,7 +505,7 @@ export function CloseBorosForm({
           >
             max{' '}
             <span className="text-link underline decoration-link/40 underline-offset-2">
-              {fmtTokenQty(maxCloseSize, unit0)}
+              {`${sigGrouped(maxCloseSize)} ${unit0}`}
             </span>
           </button>
         </div>
@@ -534,7 +521,7 @@ export function CloseBorosForm({
         </AffixedInput>
         {anySizeInvalid ? (
           <span className="text-[11px] text-rose-300">
-            size must be above 0 and at most {fmtTokenQty(maxCloseSize, unit0)}
+            size must be above 0 and at most {sigGrouped(maxCloseSize)} {unit0}
           </span>
         ) : (
           <span className="text-[11px] text-ink-400">
@@ -603,7 +590,7 @@ export function CloseBorosForm({
                 {finished && (
                   <span className="text-[11px] text-ink-400">
                     {prefix}This leg is closed; it will not be sent again.
-                    {finished.yours > 0 && ` ${fmtTokenQty(finished.yours, unit)} of it is still open — you closed part.`}
+                    {finished.yours > 0 && ` ${sigGrouped(finished.yours)} ${unit} of it is still open — you closed part.`}
                   </span>
                 )}
                 {/* The server's own words — a copy here could disagree at the boundary. */}
@@ -614,7 +601,7 @@ export function CloseBorosForm({
                     plenty. */}
                 {!finished && q && q.shortfallSize > Math.max(1e-6, f.value * 1e-6) && (
                   <span className="text-[11px] text-amber-400/90">
-                    {prefix}the book only supports {fmtTokenQty(q.estFillSize, unit)} of this size — it
+                    {prefix}the book only supports {sigGrouped(q.estFillSize)} {unit} of this size — it
                     will fill short
                   </span>
                 )}
@@ -625,7 +612,7 @@ export function CloseBorosForm({
                 )}
                 {part && (
                   <span className="text-[11px] text-amber-400/90">
-                    {prefix}filled {fmtTokenQty(part.filled, unit)} — {fmtTokenQty(part.left, unit)} of what
+                    {prefix}filled {sigGrouped(part.filled)} {unit} — {sigGrouped(part.left)} {unit} of what
                     you asked for is still open. The size above is set to what is left; close again
                     to finish it.
                   </span>
@@ -687,7 +674,7 @@ export function CloseBorosForm({
                             <VenueIcon venue={f.l.venue} size={14} />
                             {prettyVenue(f.l.venue)}
                           </span>
-                          {finished && <span className="ml-1.5 text-[11px] text-emerald-300">closed ✓</span>}
+                          {finished && <span className="ml-1.5 inline-flex items-center gap-1 text-[11px] text-emerald-300">closed<Check size={12} aria-hidden /></span>}
                         </td>
                         <td className="num py-1.5 text-right text-[12.5px] text-ink-50">{rateOf(f.q)}</td>
                         <td className="num py-1.5 text-right text-[12px]">
@@ -731,6 +718,9 @@ export function CloseBorosForm({
       </EstimateCard>
 
       <div className="flex flex-col gap-1.5">
+        {loginLabel ? (
+          <BorosLogInButton />
+        ) : (
         <HoldToConfirmButton
           tone="red"
           // No quote, no close: a hold with the numbers blank sends a bound
@@ -739,15 +729,23 @@ export function CloseBorosForm({
           onConfirm={run}
           className="w-full"
         >
-          {close.isPending
-            ? 'Closing…'
-            : `Close ${closable.length === 1 ? 'leg' : `${closable.length} legs`} ▸`}
+          {close.isPending ? (
+            'Closing…'
+          ) : (
+            <>
+              {`Close ${closable.length === 1 ? 'leg' : `${closable.length} legs`}`}
+              <ChevronRight size={14} aria-hidden />
+            </>
+          )}
         </HoldToConfirmButton>
-        <p className="text-[11px] leading-relaxed text-ink-400">
-          {closable.length === 1
-            ? 'Cancels any resting orders on this market first, then sends one market order. The perp leg stays open.'
-            : `Cancels resting orders on both markets, then ${closable.length === 2 ? 'two' : closable.length} market orders. Size is capped at what is open once the cancel lands.`}
-        </p>
+        )}
+        {!loginLabel && (
+          <p className="text-[11px] leading-relaxed text-ink-400">
+            {closable.length === 1
+              ? 'Cancels resting orders, then sends 1 market order. The perp stays open.'
+              : `Cancels resting orders, then sends ${closable.length} market orders. Size is capped at the open size.`}
+          </p>
+        )}
       </div>
     </div>
   );

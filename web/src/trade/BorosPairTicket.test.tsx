@@ -5,11 +5,12 @@
  * §4 acknowledgement gates confirm and retracts when the trade changes, and a
  * partial fill is reported as a residual rather than a success.
  */
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { HttpResponse, http } from 'msw';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { STRATEGY_STORAGE_KEY } from '../panels/HomeControls';
+import { installFakeWallet, removeFakeWallet } from '../test/fakeWallet';
 import { server } from '../test/server';
 import { renderWithClient } from '../test/utils';
 import { BorosPairTicket } from './BorosPairTicket';
@@ -243,13 +244,11 @@ describe('BorosPairTicket', () => {
     expect((bodies[0] as { address: string }).address).toBe(ADDRESS);
   });
 
-  it('prices the AGENT\'s account, not a different tracked address', async () => {
-    // The dangerous case: tracking A while the agent trades B would show A's
-    // positions, margin and blockers for orders that hit B.
+  it('a view-only wallet prices itself and asks to log in', async () => {
     const other = '0x2222222222222222222222222222222222222222';
     window.localStorage.setItem(
       STRATEGY_STORAGE_KEY,
-      JSON.stringify({ address: other }),
+      JSON.stringify({ address: other, walletUpgraded: true }),
     );
     const bodies: Record<string, unknown>[] = [];
     server.use(...handlers({ onSimulate: (b) => bodies.push(b) }));
@@ -258,9 +257,73 @@ describe('BorosPairTicket', () => {
 
     await fillTicket(user);
     await waitFor(() => expect(bodies.length).toBeGreaterThan(0));
-    expect((bodies[0] as { address: string }).address).toBe(ADDRESS);
-    // And the divergence is stated, because the Positions view shows the other.
-    expect(screen.getByText(/the account your agent key signs for/i)).toBeInTheDocument();
+    expect((bodies[0] as { address: string }).address).toBe(other);
+    expect(screen.getByRole('button', { name: 'Log in to trade 0x2222…2222' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Confirm/ })).toBeNull();
+  });
+
+  it('a view-only wallet: no wallet card, the Log in button is the one action', async () => {
+    const other = '0x2222222222222222222222222222222222222222';
+    window.localStorage.setItem(
+      STRATEGY_STORAGE_KEY,
+      JSON.stringify({ address: other, walletUpgraded: true }),
+    );
+    server.use(...handlers({ agent: { expiry: 1_900_000_000 } }));
+    renderWithClient(<BorosPairTicket />);
+
+    expect(await screen.findByRole('button', { name: 'Log in to trade 0x2222…2222' })).toBeInTheDocument();
+    // The header chip says View only; the ticket does not repeat it.
+    expect(screen.queryByText('View only')).toBeNull();
+    expect(screen.queryByText('Logged in')).toBeNull();
+    expect(screen.queryByText('0x1111…1111')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Connect wallet' })).toBeNull();
+    expect(screen.getAllByRole('button', { name: /Log in to trade/ })).toHaveLength(1);
+  });
+
+  it('a wallet with no agent: the Log in button is the one action, no card', async () => {
+    const other = '0x2222222222222222222222222222222222222222';
+    window.localStorage.setItem(
+      STRATEGY_STORAGE_KEY,
+      JSON.stringify({ address: other, walletUpgraded: true }),
+    );
+    server.use(...handlers({ agent: { configured: false, root: null, rootMasked: null } }));
+    renderWithClient(<BorosPairTicket />);
+
+    expect(await screen.findByRole('button', { name: 'Log in to trade 0x2222…2222' })).toBeInTheDocument();
+    expect(screen.queryByText(/Log in once/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Connect wallet' })).toBeNull();
+    expect(screen.getAllByRole('button', { name: /Log in to trade/ })).toHaveLength(1);
+  });
+
+  it('a browser wallet switch with no agent turns the ticket to Log in', async () => {
+    const other = '0x2222222222222222222222222222222222222222';
+    window.localStorage.setItem(
+      STRATEGY_STORAGE_KEY,
+      JSON.stringify({ address: ADDRESS, walletUpgraded: true, followWallet: true }),
+    );
+    const wallet = installFakeWallet({ accounts: [ADDRESS] });
+    server.use(...handlers({ agent: { expiry: 1_900_000_000 } }));
+    renderWithClient(<BorosPairTicket />);
+
+    expect(await screen.findByRole('button', { name: /Confirm/ })).toBeInTheDocument();
+    await waitFor(() => expect(wallet.listenerCount()).toBe(1));
+    act(() => wallet.emitAccounts([other]));
+
+    expect(await screen.findByRole('button', { name: 'Log in to trade 0x2222…2222' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Confirm/ })).toBeNull();
+    removeFakeWallet();
+  });
+
+  it('the wallet that trades shows no wallet card: Confirm is the action', async () => {
+    server.use(...handlers({ agent: { expiry: 1_900_000_000 } }));
+    renderWithClient(<BorosPairTicket />);
+
+    expect(await screen.findByRole('button', { name: /Confirm/ })).toBeInTheDocument();
+    expect(screen.queryByText('Logged in')).toBeNull();
+    expect(screen.queryByText('0x1111…1111')).toBeNull();
+    // Log out lives in Settings, not in the ticket.
+    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Log in to trade/ })).toBeNull();
   });
 
   it('falls back to the tracked address when no agent is configured', async () => {
@@ -283,7 +346,8 @@ describe('BorosPairTicket', () => {
     window.localStorage.clear();
     server.use(...handlers({ agent: { configured: false, root: null, rootMasked: null } }));
     renderWithClient(<BorosPairTicket />);
-    expect(await screen.findByText(/Connect a wallet above, or set a Boros address/i)).toBeInTheDocument();
+    // No browser wallet in this test, so the card says how to get one.
+    expect(await screen.findByText('Install Rabby or MetaMask, then reload.')).toBeInTheDocument();
     expect(screen.queryByLabelText('Leg A')).not.toBeInTheDocument();
   });
 
@@ -465,13 +529,9 @@ describe('BorosPairTicket', () => {
     // rule is still stated somewhere the user can reach it.
     expect((await screen.findAllByTitle(/whole exposure there/i)).length).toBe(2);
     expect(screen.getAllByText(/→/).length).toBeGreaterThan(0);
-    // Current and resulting share one line, "150k USDT → 50k USDT". The TRADE
-    // column is deliberately gone: it was the reader doing the addition to
-    // reach the resulting figure, which the arrow states outright. Signs are
-    // gone too — direction is the colour now — but BOTH figures must show.
     const netted = (await screen.findAllByTitle(/whole exposure there/i))[0];
-    expect(netted).toHaveTextContent(/150k/);
-    expect(netted).toHaveTextContent(/50k/);
+    expect(netted).toHaveTextContent(/150,000/);
+    expect(netted).toHaveTextContent(/50,000/);
   });
 
   it('blocks confirm behind the acknowledgement, and retracts it when the trade changes', async () => {
@@ -598,6 +658,100 @@ describe('BorosPairTicket', () => {
     const short = document.querySelectorAll('.text-rose-300');
     expect(long.length).toBeGreaterThan(0);
     expect(short.length).toBeGreaterThan(0);
+  });
+
+  it('groups whale-scale sizes with thousands commas, never bare or compact', async () => {
+    const user = userEvent.setup();
+    server.use(
+      ...handlers({
+        sim: {
+          collateral: 'ETH',
+          collateralPriceUsd: 3_000,
+          legA: simLeg({
+            sizing: {
+              currentSize: 0,
+              deltaSize: -4_100,
+              resultingSize: -4_100,
+              opposing: false,
+              flips: false,
+              clampedToClose: false,
+              orderSide: 'short',
+            },
+          }),
+          legB: simLeg({
+            marketId: BN,
+            marketName: 'Binance ETHUSDT 31 Aug 2026',
+            venue: 'Binance',
+            direction: 'long',
+            sizing: {
+              currentSize: 0,
+              deltaSize: 4_100,
+              resultingSize: 4_100,
+              opposing: false,
+              flips: false,
+              clampedToClose: false,
+              orderSide: 'long',
+            },
+          }),
+          hedgedSize: 4_100,
+        },
+      }),
+    );
+    const { container } = renderWithClient(<BorosPairTicket />);
+    await fillTicket(user);
+
+    await screen.findByText('Estimated spread');
+    expect(screen.getAllByText(/4,100/).length).toBeGreaterThan(0);
+    expect(container.textContent).not.toContain('4100');
+    expect(container.textContent).not.toContain('4.1k');
+  });
+
+  it('groups a 12,345,678.9 ETH size in full, never scientific or compact', async () => {
+    const user = userEvent.setup();
+    server.use(
+      ...handlers({
+        sim: {
+          collateral: 'ETH',
+          collateralPriceUsd: 3_000,
+          legA: simLeg({
+            sizing: {
+              currentSize: 0,
+              deltaSize: -12_345_678.9,
+              resultingSize: -12_345_678.9,
+              opposing: false,
+              flips: false,
+              clampedToClose: false,
+              orderSide: 'short',
+            },
+          }),
+          legB: simLeg({
+            marketId: BN,
+            marketName: 'Binance ETHUSDT 31 Aug 2026',
+            venue: 'Binance',
+            direction: 'long',
+            sizing: {
+              currentSize: 0,
+              deltaSize: 12_345_678.9,
+              resultingSize: 12_345_678.9,
+              opposing: false,
+              flips: false,
+              clampedToClose: false,
+              orderSide: 'long',
+            },
+          }),
+          hedgedSize: 12_345_678.9,
+        },
+      }),
+    );
+    const { container } = renderWithClient(<BorosPairTicket />);
+    await fillTicket(user);
+
+    await screen.findByText('Estimated spread');
+    expect(screen.getAllByText(/12,345,678\.9/).length).toBeGreaterThan(0);
+    expect(container.textContent).not.toMatch(/e\+/i);
+    expect(container.textContent).not.toContain('12345678.9');
+    expect(container.textContent).not.toContain('12,345,679');
+    expect(container.textContent).not.toMatch(/12M\b/);
   });
 
   it('shows the venue’s own words when a leg is rejected outright', async () => {
@@ -793,7 +947,7 @@ describe('BorosPairTicket', () => {
     // A hold, not a click: it moves margin.
     await user.pointer({ keys: '[MouseLeft>]', target: button });
     await waitFor(() => expect(bodies.length).toBe(1), { timeout: 3_000 });
-    expect(bodies[0]).toMatchObject({ amountUsd: 20, clientOrderId: expect.stringMatching(/^gas-/) });
+    expect(bodies[0]).toMatchObject({ amountUsd: 20, address: ADDRESS, clientOrderId: expect.stringMatching(/^gas-/) });
   });
 
   it('says reduce-only is enforced by sizing, not by the venue', async () => {
@@ -1159,6 +1313,38 @@ describe('BorosPairTicket', () => {
   });
 });
 
+describe('BorosPairTicket — market list', () => {
+  it('keeps a held position on an unsupported coin, for closing', async () => {
+    server.use(
+      ...handlers({
+        ctx: context({
+          markets: [
+            marketRow(),
+            marketRow({ marketId: BN, name: 'Binance ETHUSDT 31 Aug 2026', venue: 'Binance', midApr: 0.045 }),
+            marketRow({
+              marketId: 500,
+              name: 'Hyperliquid SOL 31 Aug 2026',
+              venue: 'Hyperliquid',
+              base: 'SOL',
+              tokenId: 9,
+              collateral: 'SOL',
+              currentSize: 250,
+            }),
+          ],
+        }),
+      }),
+    );
+    renderWithClient(<BorosPairTicket />);
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Leg A') as HTMLSelectElement).options.length).toBeGreaterThan(1),
+    );
+    expect(
+      within(screen.getByLabelText('Leg A')).getByRole('option', { name: 'Hyperliquid SOL 31 Aug 2026' }),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('BorosPairTicket — the size unit', () => {
   it('names the collateral as soon as a leg is picked, before any simulation', async () => {
     // There is no simulation until a size is typed, and a size field labelled
@@ -1192,14 +1378,20 @@ describe('BorosPairTicket — the size unit', () => {
 // Card cue prefill ("Open the Boros legs") — maturity agreement
 // ---------------------------------------------------------------------------
 
-function BorosPrefillHarness({ prefill }: { prefill: Omit<BorosOpenPrefill, 'nonce'> }) {
+function BorosPrefillHarness({
+  prefill,
+  guided,
+}: {
+  prefill: Omit<BorosOpenPrefill, 'nonce'>;
+  guided?: boolean;
+}) {
   const flow = useTradeFlow();
   return (
     <>
       <button type="button" onClick={() => flow.prefillBorosOpen(prefill)}>
         fire
       </button>
-      <BorosPairTicket />
+      <BorosPairTicket guided={guided} />
     </>
   );
 }
@@ -1268,6 +1460,34 @@ describe('BorosPairTicket — the cue prefill lands both legs on ONE maturity', 
 
     await waitFor(() => expect(screen.getByLabelText('Leg A')).toHaveValue(''));
     expect(screen.getByLabelText('Leg B')).toHaveValue('');
+  });
+});
+
+describe('BorosPairTicket — target mode and a close-only market', () => {
+  it('disables Confirm when the target would grow a close-only leg', async () => {
+    server.use(
+      ...handlers({
+        ctx: context({
+          markets: [
+            marketRow({ closeOnly: true }),
+            marketRow({ marketId: BN, name: 'Binance ETHUSDT 31 Aug 2026', venue: 'Binance' }),
+          ],
+        }),
+      }),
+    );
+    const user = userEvent.setup();
+    renderWithClient(
+      <BorosPrefillHarness
+        guided
+        prefill={{ base: 'ETH', longVenue: 'Hyperliquid', shortVenue: 'Binance', size: 1000 }}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'fire' }));
+
+    const btn = await screen.findByRole('button', {
+      name: 'Market A takes closes only. Tick Reduce-only.',
+    });
+    expect(btn).toBeDisabled();
   });
 });
 
