@@ -20,12 +20,10 @@ import { SignedNumber } from '../../components/SignedNumber';
 import { fmtPct, fmtUsd, num } from '../../lib/fmt';
 import { lineFor as lineIn, liquidationLines } from '../../lib/liquidation';
 import { useBookId } from '../bookId';
-import { AddressForm, short } from '../HomeControls';
-import { useTrackedAddress } from '../trackedAddress';
-import { assetIsActive, deriveAsset, portfolioTotals, SECONDS_IN_YEAR, type AssetDerived } from './assetModel';
+import { short } from '../HomeControls';
 import { ConnectWalletButton } from '../../components/ConnectWalletButton';
 import { isSameAddress, useActiveWallet, useTrackedAddress } from '../trackedAddress';
-
+import { assetIsActive, deriveAsset, portfolioTotals, type AssetDerived } from './assetModel';
 import { legSinceParam, loadPrefs, savePrefs, type AssetViewPrefs } from './assetPrefsStore';
 import { AssetCard } from './AssetCard';
 
@@ -76,7 +74,7 @@ export function AssetsHome() {
   );
   const windows = useAssetViewWindows(address, extraSinces, legSince);
 
-  const derived = useMemo(
+  const allDerived = useMemo(
     () =>
       (data?.assets ?? [])
         .map((g) => {
@@ -102,7 +100,8 @@ export function AssetsHome() {
     [data, windows.bySince, windows.errorBySince, prefs.exclusions, prefs.sinceByAsset, feeRows, rebate, gateHidden],
   );
   const interestUsd = data?.interest?.available === true ? data!.interest!.paidUsd : 0;
-  const { carded: derived, dust, totalPnlUsd: totalPnl, totalCapitalUsd: totalCapital, blendedApr } =
+  const interestAvailable = data?.interest?.available === true;
+  const { carded: derived, totalPnlUsd: totalPnl, totalCapitalUsd: totalCapital, blendedApr } =
     portfolioTotals(allDerived, interestUsd, data?.nowSec ?? 0);
 
   /**
@@ -144,27 +143,7 @@ export function AssetsHome() {
     return lineIn(liquidation, base);
   };
 
-  const interestAvailable = data?.interest?.available === true;
-  const interestUsd = !gateHidden && interestAvailable ? data!.interest!.paidUsd : 0;
-  const totalPnl = derived.reduce((s, a) => s + a.derived.totals.pnlUsd, 0) - interestUsd;
-  const totalCapital = derived.reduce((s, a) => s + a.derived.totals.capitalUsd, 0);
-  // Blended APR: Σpnl over Σ(capital · its own elapsed clock) — each asset
-  // keeps its clock, so a young asset doesn't dilute an old one's rate.
-  // Both sums cover the SAME assets: one with history but no capital would
-  // add PnL to the numerator while contributing zero capital-years, which
-  // silently inflates the rate.
-  const aprAgg = derived.reduce(
-    (s, a) => {
-      const d = a.derived;
-      if (d.clockStartSec === null || !data || !(d.totals.capitalUsd > 0)) return s;
-      return {
-        pnl: s.pnl + d.totals.pnlUsd,
-        capYears: s.capYears + d.totals.capitalUsd * ((data.nowSec - d.clockStartSec) / SECONDS_IN_YEAR),
-      };
-    },
-    { pnl: 0, capYears: 0 },
-  );
-  const blendedApr = aprAgg.capYears > 0 ? (aprAgg.pnl - interestUsd) / aprAgg.capYears : null;
+
 
   const header = (
     <div className="mb-4 flex flex-wrap items-baseline gap-2">

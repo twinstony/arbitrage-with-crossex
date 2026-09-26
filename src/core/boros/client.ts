@@ -300,14 +300,20 @@ async function oneBorosGet(
   timeoutMs: number,
 ): Promise<BorosRead> {
   let resp: Awaited<ReturnType<FetchLike>>;
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
-    resp = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+    resp = await fetchImpl(url, { signal });
   } catch (err) {
     // No response arrived, so the venue cannot have acted on anything — and
     // every call here is an idempotent GET regardless.
+    //
+    // EXCEPT when our own budget elapsed: a slow venue is not a flaky path,
+    // and asking again only doubles the caller's latency. The measured failure
+    // this ladder exists for (a cold TLS handshake reset) dies FAST; the 2 s
+    // approval read on the write routes cannot afford a second 2 s wait.
     return {
       ok: false,
-      retry: true,
+      retry: !signal.aborted,
       category: 'network',
       message: `Boros API unreachable (${label}): ${(err as Error)?.message ?? String(err)}`,
     };
@@ -372,13 +378,6 @@ async function borosGetJson(
   }
 }
 
-async function getJson(fetchImpl: FetchLike, path: string): Promise<unknown> {
-  const clientTag =
-    'pendle_client=boroscrossex' + clientTagState.version + (clientTagState.active ? '_active' : '');
-  const url = `${BOROS_GATEWAY_BASE_URL}${path}${path.includes('?') ? '&' : '?'}${clientTag}`;
-  return borosGetJson(fetchImpl, url, path);
-}
-
 async function requestJson(
   fetchImpl: FetchLike,
   path: string,
@@ -388,6 +387,13 @@ async function requestJson(
   const clientTag =
     'pendle_client=boroscrossex' + clientTagState.version + (clientTagState.active ? '_active' : '');
   const url = `${path}${path.includes('?') ? '&' : '?'}${clientTag}`;
+  // A READ goes through the retry ladder — the ONE place the retry policy
+  // lives — so every read in this module gets the same single 300ms retry for
+  // failures where no verdict arrived. A write must never be repeated, so it
+  // keeps the single-attempt path below.
+  if (fetchInit.method === undefined || fetchInit.method === 'GET') {
+    return borosGetJson(fetchImpl, url, url, timeoutMs);
+  }
   let resp: Awaited<ReturnType<FetchLike>>;
   try {
     resp = await fetchImpl(url, { ...fetchInit, signal: AbortSignal.timeout(timeoutMs) });
@@ -946,22 +952,9 @@ async function fetchSettlementPage(
     `&accountId=${accountId}&limit=200` +
     (resumeToken ? `&resumeToken=${encodeURIComponent(resumeToken)}` : '') +
     `&${clientTag}`;
-  let resp: Awaited<ReturnType<FetchLike>>;
-  try {
-    resp = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
-  } catch (err) {
-    throw new CoreError(
-      `Boros API unreachable (settlement-events): ${(err as Error)?.message ?? String(err)}`,
-      'network',
-    );
-  }
-  if (!resp.ok) {
-    throw new CoreError(
-      `Boros API settlement-events returned HTTP ${resp.status}`,
-      resp.status === 429 ? 'rate-limited' : 'network',
-    );
-  }
-  const body = (await resp.json()) as {
+  // The ledger read shares the ladder every other read uses (the ledger is
+  // read-only, so repeating is safe); without it one reset failed the sweep.
+  const body = (await borosGetJson(fetchImpl, url, 'settlement-events', 15_000)) as {
     results?: Array<Record<string, unknown>>;
     resumeToken?: string | null;
   };

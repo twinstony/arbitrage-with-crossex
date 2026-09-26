@@ -19,7 +19,7 @@ import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { makePositionsReader } from '../../src/server/notify/positions';
-import { raw } from '../helpers/boros-fixtures';
+import { marketAcc, raw } from '../helpers/boros-fixtures';
 import { borosStub } from '../helpers/boros-stub';
 import { makeTestApp, mockGateGet, TEST_TOKEN } from './helpers/gate-nock';
 
@@ -35,45 +35,52 @@ function borosBodies(): Record<string, unknown> {
     tokenId: 3,
     imData: { name: `${platformName} ETH 31 Jul 2026`, maturity: NOW + 15 * DAY },
     extConfig: { settleFeeRate: '1000000000000000', paymentPeriod: 3600 },
-    metadata: { platformName, assetSymbol: 'ETH' },
+    config: { status: 2 },
+    platform: { platformId: platformName },
+    metadata: { underlyingSymbol: 'ETH' },
     data: { markApr: 0.076, floatingApr: 0.075, assetMarkPrice: 1880 },
   });
   return {
-    '/core/v1/markets': { results: [market(201, 'Hyperliquid'), market(205, 'Gate')], total: 2, skip: 0 },
-    '/core/v1/collaterals/summary': {
-      collaterals: [
+    '/apis/v1/markets': { results: [market(201, 'Hyperliquid'), market(205, 'Gate')], total: 2, skip: 0 },
+    '/apis/v1/markets/by-ids': { results: [market(201, 'Hyperliquid'), market(205, 'Gate')], total: 2, skip: 0 },
+    '/apis/v1/accounts/market-acc-infos-by-root': {
+      results: [
         {
-          tokenId: 3,
-          crossPosition: {
-            isCross: true,
-            netBalance: raw(20_000),
-            marketPositions: [
-              {
-                marketId: 201,
-                side: 1,
-                notionalSize: raw(-17_442),
-                fixedApr: 0.083,
-                markApr: 0.076,
-                pnl: { rateSettlementPnl: raw(120), unrealisedPnl: raw(28) },
-                positionInitialMargin: raw(207),
-              },
-              {
-                marketId: 205,
-                side: 0,
-                notionalSize: raw(17_442),
-                fixedApr: 0.053,
-                markApr: 0.051,
-                pnl: { rateSettlementPnl: raw(-12), unrealisedPnl: raw(-7) },
-                positionInitialMargin: raw(155),
-              },
-            ],
-          },
-          isolatedPositions: [],
+          marketAcc: marketAcc(ADDR, 3),
+          netBalance: raw(20_000),
+          initialMargin: raw(10_000),
+          positions: [
+            { marketId: 201, signedSize: raw(-17_442), initialMargin: raw(207), orders: [] },
+            { marketId: 205, signedSize: raw(17_442), initialMargin: raw(155), orders: [] },
+          ],
         },
       ],
     },
-    '/core/v1/pnl/transactions': { results: [], total: 0, skip: 0 },
-    '/apis/v1/accounts/settlement-events': { results: [], total: 0, skip: 0 },
+    '/apis/v1/accounts/active-positions': {
+      results: [
+        {
+          marketAcc: marketAcc(ADDR, 3),
+          marketId: 201,
+          side: 1,
+          fixedApr: 0.083,
+          signedSize: raw(-17_442),
+          unrealisedPnl: raw(28),
+          settlementPnl: raw(120),
+        },
+        {
+          marketAcc: marketAcc(ADDR, 3),
+          marketId: 205,
+          side: 0,
+          fixedApr: 0.053,
+          signedSize: raw(17_442),
+          unrealisedPnl: raw(-7),
+          settlementPnl: raw(-12),
+        },
+      ],
+    },
+    '/apis/v1/accounts/market-acc-infos': { results: [] },
+    '/apis/v1/accounts/position-update-events': { results: [], resumeToken: null },
+    '/apis/v1/accounts/settlement-events': { results: [], resumeToken: null },
   };
 }
 
