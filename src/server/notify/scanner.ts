@@ -102,7 +102,9 @@ export const panelExitMode = (): 'roll' => PANEL_EXIT_MODE;
 
 /** Stable per-pair identity — the same key the web panel's rows use. */
 export function pairKey(group: OpportunityGroup, pair: OpportunityPair): string {
-  return `${group.tokenId}:${group.maturity}:${pair.shortLeg.marketId}:${pair.longLeg.marketId}`;
+  const shortBoros = pair.borosLegs.find((l) => l.side === 'SHORT');
+  const longBoros = pair.borosLegs.find((l) => l.side === 'LONG');
+  return `${group.tokenId}:${group.maturity}:${shortBoros?.marketId}:${longBoros?.marketId}`;
 }
 
 /** One ranked row — the TG twin of the web panel's OpportunityRow. */
@@ -219,9 +221,11 @@ function pairLines(row: RankedPair, notionalUsd: number): string[] {
     pair.netFixedApr === null
       ? '名义年化 —'
       : `名义年化 ${(pair.netFixedApr * 100).toFixed(2)}%`;
-  if (pair.execSpreadApr !== null && pair.shortLeg.execApr !== null && pair.longLeg.execApr !== null) {
+  const shortBoros = pair.borosLegs.find((l) => l.side === 'SHORT');
+  const longBoros = pair.borosLegs.find((l) => l.side === 'LONG');
+  if (pair.execSpreadApr !== null && shortBoros?.execApr != null && longBoros?.execApr != null) {
     extra += ` ｜ 锁定价差 ${(pair.execSpreadApr * 100).toFixed(2)}%` +
-      `（空 ${(pair.shortLeg.execApr * 100).toFixed(2)}% ／ 多 ${(pair.longLeg.execApr * 100).toFixed(2)}%）`;
+      `（空 ${(shortBoros.execApr * 100).toFixed(2)}% ／ 多 ${(longBoros.execApr * 100).toFixed(2)}%）`;
   }
   lines.push(extra);
   return lines;

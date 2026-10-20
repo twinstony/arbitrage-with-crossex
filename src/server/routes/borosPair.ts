@@ -34,28 +34,31 @@ import {
   type BorosOrderBook,
   type FetchLike,
 } from '../../core/boros/client';
-import { USD_TOKEN_ID } from '../../core/boros/borosApi';
-import { normalizeUnderlying } from '../../core/boros/opportunities';
+import { borosInitialMarginUsd, normalizeUnderlying } from '../../core/boros/opportunities';
 import { COIN_NOT_SUPPORTED_TEXT, isSupportedCoin } from '../../core/coins';
-import { knownRate } from '../../core/boros/venue';
+import { normalizeVenue } from '../../core/boros/venue';
+import { isSpreadMarket, knownRateOf } from '../../core/boros/spread';
 import { readAgentApproval } from '../borosAgentApproval';
-import { maskAddress } from './borosAgent';
 import { isUpdating } from '../updater';
 import {
+  classifyLegFailure,
   describeLegFailure,
   limitAprFor,
   submitBorosPair,
   type BorosMarketOrderRequest,
+  type BorosOrderClient,
 } from '../../core/boros/orders';
 import {
   evaluateRollGate,
-  rollLegsFor,
+  rollFillKeys,
+  rollPlanFor,
   submitBorosRoll,
   type BorosRollResult,
   type RollGate,
   type RollOrderIds,
 } from '../../core/boros/rollover';
 import {
+  chooseGasTopUpZone,
   evaluatePairGate,
   pairEligibility,
   reducingOrderSize,
@@ -78,6 +81,7 @@ const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 const CLOSE_RUNNING = 'A close on this market is already running.';
 const ORDER_RUNNING = 'An order on this market is already running.';
+const MAY_HAVE_FILLED = ' — Boros gave no answer, so the orders may have filled. Check your positions on Boros before sending again.';
 const CLOSE_ISOLATED = 'This position is on isolated margin. Close it on Boros.';
 const READS_LIMITED_NOTHING_SENT = 'Boros is limiting reads. Nothing was sent. Try again in a minute.';
 const READS_LIMITED_AFTER_CANCEL =
@@ -106,45 +110,35 @@ const CLOSE_SLIPPAGE_APR = 0.01;
  */
 const EXECUTION_MEMO_MS = 10 * 60_000;
 
-const MIN_TOP_UP_USD = 2;
-const MAX_TOP_UP_USD = 100;
-
 /** Wire shape of one leg, as the panel sends it. */
 interface LegBody {
   marketId?: unknown;
   direction?: unknown;
   slippageApr?: unknown;
-}
-
-interface PairBody {
-  address?: unknown;
-  legA?: LegBody;
-  legB?: LegBody;
   size?: unknown;
-  intent?: unknown;
-  /** §4 acknowledgement, required whenever a leg opposes an existing position. */
-  opposingAcknowledged?: unknown;
-  /** Trade one leg only — what "complete now at market" needs after a partial
-   * fill. The other leg is sized to zero and never submitted. */
-  onlyLeg?: unknown;
   /**
    * Replay keys, one per leg.
    *
    * ⚠ NOT venue-enforced. Boros's order DTO carries no client order id, so
-   * these are deduped HERE (see `recentExecutions`) — a resend of the same pair
-   * of ids returns the first result instead of trading again. That covers the
-   * lost-response retry this panel actually produces; it cannot protect against
-   * a different process or a restart.
+   * these are deduped HERE (see `recentExecutions`) — a resend of the same
+   * ids returns the first result instead of trading again. That covers the
+   * lost-response retry this panel actually produces; it cannot protect
+   * against a different process or a restart.
    */
-  clientOrderIdA?: unknown;
-  clientOrderIdB?: unknown;
+  clientOrderId?: unknown;
 }
 
-/** One step of a roll, as the panel sends it: the pair and its size. */
+interface PairBody {
+  address?: unknown;
+  legs?: unknown;
+  intent?: unknown;
+  /** §4 acknowledgement, required whenever a leg opposes an existing position. */
+  opposingAcknowledged?: unknown;
+  onlyLeg?: unknown;
+}
+
 interface RollStepBody {
-  legA?: LegBody;
-  legB?: LegBody;
-  size?: unknown;
+  legs?: unknown;
 }
 
 interface RollBody {
@@ -158,13 +152,13 @@ interface RollBody {
    * already held at the new maturity. */
   opposingAcknowledged?: unknown;
   /** Replay keys, one per leg, deduped as one (see `recentRolls`). */
-  clientOrderIds?: Partial<Record<keyof RollOrderIds, unknown>>;
+  clientOrderIds?: unknown;
 }
 
-function parseOnlyLeg(raw: unknown): 'A' | 'B' | undefined {
+function parseOnlyLeg(raw: unknown, count: number): number | undefined {
   if (raw === undefined || raw === null) return undefined;
-  if (raw === 'A' || raw === 'B') return raw;
-  throw new CoreError('onlyLeg must be "A" or "B"', 'validation');
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw < count) return raw;
+  throw new CoreError('onlyLeg must be the index of a leg', 'validation');
 }
 
 /**
@@ -207,11 +201,15 @@ function parseAddress(raw: unknown): string {
   return raw.toLowerCase();
 }
 
-function parseLeg(raw: LegBody | undefined, which: string): {
+interface ParsedLeg {
   marketId: number;
   direction: BorosLegDirection;
   slippageApr: number;
-} {
+  size: number;
+  clientOrderId: unknown;
+}
+
+function parseLeg(raw: LegBody | undefined, which: string): ParsedLeg {
   const marketId = Number(raw?.marketId);
   if (!Number.isInteger(marketId) || marketId <= 0) {
     throw new CoreError(`${which}.marketId must be a positive integer`, 'validation');
@@ -234,13 +232,20 @@ function parseLeg(raw: LegBody | undefined, which: string): {
     }
     slippageApr = n;
   }
-  return { marketId, direction, slippageApr };
+  return { marketId, direction, slippageApr, size: parseSize(raw?.size, which), clientOrderId: raw?.clientOrderId };
 }
 
-function parseSize(raw: unknown): number {
+function parseLegs(raw: unknown): ParsedLeg[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new CoreError('legs must hold at least one leg', 'validation');
+  }
+  return raw.map((leg, i) => parseLeg(leg as LegBody, `legs[${i}]`));
+}
+
+function parseSize(raw: unknown, which: string): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) {
-    throw new CoreError('size must be a positive number of collateral units', 'validation');
+    throw new CoreError(`${which}.size must be a positive number of collateral units`, 'validation');
   }
   return n;
 }
@@ -294,8 +299,37 @@ interface AccountView {
   isolatedOccupied: Set<number>;
   /** tokenId → the cross bucket for that collateral. */
   crossByToken: Map<number, BorosMarginBucket>;
+  /** tokenId → free cross margin net of resting orders' margin too, which
+   * `payTreasury`'s `_checkIMStrict` counts. Absent when a zone's order margin
+   * is unknown. */
+  crossFreeWithOrdersByToken: Map<number, number>;
   /** marketId → that market's own isolated bucket. */
   isolatedByMarket: Map<number, BorosMarginBucket>;
+  /** Markets with a resting order in the cross account — what a close or roll cancels. */
+  restingOrderMarkets: Set<number>;
+}
+
+const freeCrossOf = (account: AccountView): Map<number, number> => new Map(account.crossFreeWithOrdersByToken);
+
+/** The automatic gas top-up's zone: the traded one when it can spare the
+ * dollars, else the best-funded one; the traded one again when none can.
+ * The traded zone keeps its order-exclusive free margin (a close cancels its
+ * own orders first), or `tradedFreeAfter` (a roll's preview). */
+function gasTopUpMarketFor(markets: BorosMarket[], account: AccountView, tradedFreeAfter?: number | null) {
+  return (amountUsd: number, tradedMarketId: number): number => {
+    const freeCrossByToken = freeCrossOf(account);
+    const tokenId = markets.find((m) => m.marketId === tradedMarketId)?.tokenId;
+    const tradedFree = typeof tradedFreeAfter === 'number' ? tradedFreeAfter : account.crossByToken.get(tokenId ?? -1)?.available;
+    if (tokenId !== undefined && tradedFree !== undefined) freeCrossByToken.set(tokenId, tradedFree);
+    const zone = chooseGasTopUpZone({
+      amountUsd,
+      markets,
+      freeCrossByToken,
+      pricesUsd: resolveCollateralPricesUsd(markets),
+      preferMarketId: tradedMarketId,
+    });
+    return zone.ok ? zone.marketId : tradedMarketId;
+  };
 }
 
 function holdsPositionOrOrders(p: {
@@ -321,8 +355,12 @@ function readAccount(zones: BorosCollateralZone[]): AccountView {
     isolatedOccupied: new Set(),
     crossByToken: new Map(),
     isolatedByMarket: new Map(),
+    restingOrderMarkets: new Set(),
+    crossFreeWithOrdersByToken: new Map(),
   };
   for (const zone of zones) {
+    // Cross only: that is the account a close's cancel is sent to.
+    for (const p of zone.cross?.marketPositions ?? []) if (p.hasRestingOrders) view.restingOrderMarkets.add(p.marketId);
     if (zone.cross) {
       const used = zone.cross.marketPositions.reduce(
         (s, p) => s + norm18(p.positionInitialMargin ?? p.initialMargin),
@@ -332,6 +370,13 @@ function readAccount(zones: BorosCollateralZone[]): AccountView {
         available: norm18(zone.cross.netBalance) - used,
         hasPositionOrOrders: zone.cross.marketPositions.some(holdsPositionOrOrders),
       });
+      if (zone.cross.marketPositions.every((p) => !p.hasRestingOrders || p.initialMargin !== undefined)) {
+        const usedWithOrders = zone.cross.marketPositions.reduce(
+          (s, p) => s + Math.max(norm18(p.initialMargin ?? '0'), norm18(p.positionInitialMargin ?? p.initialMargin)),
+          0,
+        );
+        view.crossFreeWithOrdersByToken.set(zone.tokenId, norm18(zone.cross.netBalance) - usedWithOrders);
+      }
       for (const p of zone.cross.marketPositions) {
         view.positionByMarket.set(p.marketId, norm18(p.notionalSize));
         view.positionRawByMarket.set(p.marketId, String(p.notionalSize ?? '0'));
@@ -409,6 +454,16 @@ export function createPairPricer(deps: AppDeps) {
     (await deps.cache.get('boros:markets', TTL.boros, () => fetchBorosMarkets(fetchImpl), { fresh }))
       .value;
 
+  /**
+   * The markets a QUOTE is priced from, on their own short TTL (see
+   * TTL.borosQuote). A key of its own: the cache stamps an entry with the
+   * TTL of whoever fetched it, so sharing `boros:markets` would hand a quote
+   * the 30s copy the rest of the app is content with.
+   */
+  const loadQuoteMarkets = async (fresh: boolean): Promise<BorosMarket[]> =>
+    (await deps.cache.get('boros:markets:quote', TTL.borosQuote, () => fetchBorosMarkets(fetchImpl), { fresh }))
+      .value;
+
   const loadAccount = async (address: string, fresh: boolean): Promise<AccountView> => {
     // Market config only picks the IM branch; it never needs a fresh read.
     const markets = await loadMarkets(false);
@@ -419,6 +474,35 @@ export function createPairPricer(deps: AppDeps) {
       { fresh },
     );
     return readAccount(value);
+  };
+
+  const settleMaxMs = deps.borosSettle?.maxMs ?? 6_000;
+  const settleSleep = deps.borosSettle?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  /**
+   * After a Boros write: re-read the account until Boros shows the trade,
+   * keep that read cached for the cards, then drop the fills it changed.
+   * Boros shows a batch 1–2 s after the send returns, so the page's instant
+   * re-read got the old position and the cache kept it for 30 s (2026-10-16).
+   * A read that never shows the trade (nothing filled, or Boros is slow) is
+   * not kept.
+   */
+  const settleAfterWrite = async (address: string, before: AccountView, traded: readonly number[]): Promise<void> => {
+    const raw = (a: AccountView, id: number) => a.positionRawByMarket.get(id) ?? '0';
+    const deadline = Date.now() + settleMaxMs;
+    for (;;) {
+      const after = await loadAccount(address, true).catch(() => null);
+      if (after && traded.some((id) => raw(after, id) !== raw(before, id))) break;
+      if (after === null || Date.now() + 1_000 > deadline) {
+        deps.cache.bust(`boros:collaterals:${address}`);
+        break;
+      }
+      await settleSleep(1_000);
+    }
+    // After the wait, not before it: a card poll during the wait would
+    // re-read the fills before Boros shows the trade, and keep that read.
+    bustBorosFills(deps.cache, traded);
+    // A send spends gas, and a send at gas debt tops it up.
+    deps.cache.bust('boros:gas-balance');
   };
 
   /** A book fresh enough to place an order against — never the scan's entry. */
@@ -469,50 +553,41 @@ export function createPairPricer(deps: AppDeps) {
     preloaded?: { markets: BorosMarket[]; account: AccountView; gasBalanceUsd: number | null | undefined },
   ) => {
     const address = parseAddress(body.address);
-    const a = parseLeg(body.legA, 'legA');
-    const b = parseLeg(body.legB, 'legB');
-    const size = parseSize(body.size);
+    const parsed = parseLegs(body.legs);
     const intent = parseIntent(body.intent);
-    const onlyLeg = parseOnlyLeg(body.onlyLeg);
+    const onlyLeg = parseOnlyLeg(body.onlyLeg, parsed.length);
 
     const [markets, account] = preloaded
       ? [preloaded.markets, preloaded.account]
-      : await Promise.all([loadMarkets(fresh), loadAccount(address, fresh)]);
-    const marketA = marketOr404(markets, a.marketId);
-    const marketB = marketOr404(markets, b.marketId);
+      : await Promise.all([loadQuoteMarkets(fresh), loadAccount(address, fresh)]);
+    const legMarkets = parsed.map((leg) => marketOr404(markets, leg.marketId));
     const nowSec = Math.floor(Date.now() / 1000);
-    const eligibility = pairEligibility(marketA, marketB, nowSec, intent);
+    const eligibility = pairEligibility(legMarkets, nowSec, intent);
 
     // Only walk books once the pair is worth pricing — an ineligible pair has a
-    // reason to show, not a quote.
-    const [bookA, bookB] = eligibility.eligible
-      ? await Promise.all([loadTradeBook(marketA.marketId), loadTradeBook(marketB.marketId)])
-      : [null, null];
+    // reason to show, not a quote. The gas read needs neither, so it runs
+    // beside the books (both catch every error).
+    const [books, gasBalanceUsd] = await Promise.all([
+      eligibility.eligible ? Promise.all(legMarkets.map((m) => loadTradeBook(m.marketId))) : legMarkets.map(() => null),
+      preloaded ? preloaded.gasBalanceUsd : readGasBalance(fresh),
+    ]);
 
-    const legInput = (
-      market: BorosMarket,
-      parsed: { direction: BorosLegDirection; slippageApr: number },
-      book: BorosOrderBook | null,
-    ): BorosPairLegInput => ({
+    const legs: BorosPairLegInput[] = legMarkets.map((market, i) => ({
       market,
-      book,
-      direction: parsed.direction,
-      slippageApr: parsed.slippageApr,
+      book: books[i],
+      direction: parsed[i].direction,
+      slippageApr: parsed[i].slippageApr,
       currentSize: account.positionByMarket.get(market.marketId) ?? 0,
       committedMargin: account.committedMarginByMarket.get(market.marketId) ?? 0,
       isolatedOnly: market.isolatedOnly,
       onIsolatedMargin: account.isolatedMarkets.has(market.marketId),
       isolatedHasPositionOrOrders: account.isolatedOccupied.has(market.marketId),
-    });
-
-    const legA = legInput(marketA, a, bookA);
-    const legB = legInput(marketB, b, bookB);
-    const collateralPriceUsd = resolveCollateralPricesUsd(markets).get(marketA.tokenId) ?? null;
+    }));
+    const tokenId = legMarkets[0].tokenId;
+    const collateralPriceUsd = resolveCollateralPricesUsd(markets).get(tokenId) ?? null;
 
     const simulation = simulateBorosPair({
-      legA,
-      legB,
-      size,
+      legs: legs.map((leg, i) => ({ ...leg, size: parsed[i].size })),
       intent,
       onlyLeg,
       collateralPriceUsd,
@@ -520,18 +595,24 @@ export function createPairPricer(deps: AppDeps) {
       takerFeeOverride,
     });
 
-    const gasBalanceUsd = preloaded ? preloaded.gasBalanceUsd : await readGasBalance(fresh);
-
+    // The best-funded OTHER coin, for an open whose own coin cannot spare the
+    // gas top-up after its legs.
+    const fallbackZone = chooseGasTopUpZone({
+      amountUsd: 0,
+      markets,
+      freeCrossByToken: new Map([...freeCrossOf(account)].filter(([t]) => t !== tokenId)),
+      pricesUsd: resolveCollateralPricesUsd(markets),
+    });
     const accountState: BorosPairAccountState = {
-      cross: account.crossByToken.get(marketA.tokenId) ?? null,
+      cross: account.crossByToken.get(tokenId) ?? null,
       isolatedByMarket: account.isolatedByMarket,
       gasBalanceUsd,
+      gasFallbackFreeUsd: fallbackZone.ok ? fallbackZone.freeUsd : null,
     };
     const simulatedAtMs = Date.now();
     const gate = evaluatePairGate({
       simulation,
-      legA,
-      legB,
+      legs,
       account: accountState,
       eligibility,
       opposingAcknowledged: body.opposingAcknowledged === true,
@@ -543,17 +624,49 @@ export function createPairPricer(deps: AppDeps) {
       simulation,
       gate,
       eligibility,
-      legA,
-      legB,
+      legs,
+      parsed,
       simulatedAtMs,
-      size,
       intent,
       gasBalanceUsd,
       account,
+      markets,
     };
   };
 
-  return { loadMarkets, loadAccount, marketOr404, readGasBalance, priceRequest };
+  return { loadMarkets, loadQuoteMarkets, loadAccount, settleAfterWrite, marketOr404, readGasBalance, priceRequest };
+}
+
+/**
+ * What opening ONE unit of size on this market takes out of its collateral
+ * bucket, in collateral units: the initial margin plus the taker fee. Both are
+ * linear in size (IM = N × max(|apr|, floor) × max(DTM, tThresh)/365 × kIM;
+ * fee = takerFeeRate × N × years), so the ticket divides the bucket's
+ * available by this to state the size it can fund. The rate is the larger of
+ * mark and mid — the entry the formula charges is not known before the fill,
+ * and the larger one never overstates the size. Null when the market carries
+ * no margin inputs.
+ */
+function openCostPerSize(m: BorosMarket, nowSec: number): number | null {
+  const rate = Math.max(Math.abs(m.markApr), Math.abs(m.midApr));
+  const im = borosInitialMarginUsd(m, rate, 1, nowSec);
+  if (im === null) return null;
+  const years = Math.max(0, m.maturity - nowSec) / (365 * 86_400);
+  const fee = Number.isFinite(m.takerFeeRate) && m.takerFeeRate > 0 ? m.takerFeeRate * years : 0;
+  const cost = im + fee;
+  return cost > 0 ? cost : null;
+}
+
+/**
+ * Drop the cached Boros fills a write changed: the traded markets', held or
+ * closed (closed, re-opened and closed again, the closed entry would miss the
+ * new fills). No other market has a new fill from this write. Busting every
+ * market re-read each one, paced under the venue's rate limit: the cards then
+ * took about 50 s to show a trade (2026-10-16).
+ */
+function bustBorosFills(cache: AppDeps['cache'], marketIds: readonly number[]): void {
+  const traded = new Set(marketIds.map(String));
+  cache.bustWhere((key) => key.startsWith('boros:txns:') && traded.has(key.split(':')[3]));
 }
 
 export function borosPairRoutes(deps: AppDeps) {
@@ -580,7 +693,7 @@ export function borosPairRoutes(deps: AppDeps) {
     // exactly what the memo exists to protect.
     pending
       .then(({ result }) => {
-        const legs = [result.legA, result.legB];
+        const { legs } = result;
         const anyFailed = legs.some((l) => l.failure !== null);
         const mayHaveFilled = legs.some((l) => l.filledSize > 0 || l.failure?.code === 'unknown');
         if (anyFailed && !mayHaveFilled) recentExecutions.delete(key);
@@ -633,7 +746,7 @@ export function borosPairRoutes(deps: AppDeps) {
     }
   };
 
-  const { loadMarkets, loadAccount, marketOr404, readGasBalance, priceRequest } = createPairPricer(deps);
+  const { loadMarkets, loadQuoteMarkets, loadAccount, settleAfterWrite, marketOr404, readGasBalance, priceRequest } = createPairPricer(deps);
 
 
   return async function plugin(app: FastifyInstance): Promise<void> {
@@ -647,13 +760,47 @@ export function borosPairRoutes(deps: AppDeps) {
       const prices = resolveCollateralPricesUsd(markets);
       const holds = (m: BorosMarket): boolean => (account.positionByMarket.get(m.marketId) ?? 0) !== 0;
 
-      const rows = markets
-        .filter(
-          (m) =>
-            m.maturity > nowSec &&
-            (m.state === 'Normal' || (m.state === 'CloseOnly' && holds(m))) &&
-            (isSupportedCoin(normalizeUnderlying(m.base)) || holds(m)),
-        )
+      const listed = markets.filter(
+        (m) =>
+          m.maturity > nowSec &&
+          (m.state === 'Normal' || (m.state === 'CloseOnly' && holds(m))) &&
+          (isSupportedCoin(normalizeUnderlying(m.base)) || holds(m)),
+      );
+      const toRow = (m: BorosMarket) => ({
+        marketId: m.marketId,
+        name: m.name,
+        venue: m.venue,
+        base: m.base,
+        tokenId: m.tokenId,
+        // The unit a size on this market is denominated in. Sent with the
+        // market rather than left to the simulation, so the ticket can
+        // label its size field the moment a leg is picked.
+        collateral: BOROS_TOKEN_SYMBOLS[m.tokenId] ?? '',
+        maturity: m.maturity,
+        midApr: m.midApr,
+        markApr: m.markApr,
+        // The venue's own cap on how far a trade may move the rate. Sent per
+        // market because it is per market: half of it is the natural default
+        // close tolerance, and a bound wider than it can never fill.
+        maxRateDeviationApr: m.maxRateDeviationApr,
+        isolatedOnly: m.isolatedOnly === true,
+        closeOnly: m.state === 'CloseOnly',
+        paused: m.state === 'Paused',
+        onIsolatedMargin: account.isolatedMarkets.has(m.marketId),
+        isolatedHasPositionOrOrders: account.isolatedOccupied.has(m.marketId),
+        currentSize: account.positionByMarket.get(m.marketId) ?? 0,
+        collateralPriceUsd: prices.get(m.tokenId) ?? null,
+        openCostPerSize: openCostPerSize(m, nowSec),
+              spreadVenues: m.spreadVenues,
+      });
+      const byName = (x: { name: string }, y: { name: string }): number => x.name.localeCompare(y.name);
+      const spreadMarkets = markets
+        .filter((m) => isSpreadMarket(m) && m.maturity > nowSec && (isSupportedCoin(normalizeUnderlying(m.base)) || holds(m)))
+        .map((m) => ({ ...toRow(m), closeOnly: m.state !== 'Normal' }))
+        .sort(byName);
+
+      const rows = listed
+        .filter((m) => !isSpreadMarket(m))
         /**
          * Drop any market this ticket could never pair — one with no partner
          * sharing its maturity, its collateral AND its base.
@@ -685,34 +832,12 @@ export function borosPairRoutes(deps: AppDeps) {
               o.base.toLowerCase() === m.base.toLowerCase(),
           ),
         )
-        .map((m) => ({
-          marketId: m.marketId,
-          name: m.name,
-          venue: m.venue,
-          base: m.base,
-          tokenId: m.tokenId,
-          // The unit a size on this market is denominated in. Sent with the
-          // market rather than left to the simulation, so the ticket can
-          // label its size field the moment a leg is picked.
-          collateral: BOROS_TOKEN_SYMBOLS[m.tokenId] ?? '',
-          maturity: m.maturity,
-          midApr: m.midApr,
-          markApr: m.markApr,
-          // The venue's own cap on how far a trade may move the rate. Sent per
-          // market because it is per market: half of it is the natural default
-          // close tolerance, and a bound wider than it can never fill.
-          maxRateDeviationApr: m.maxRateDeviationApr,
-          isolatedOnly: m.isolatedOnly === true,
-          closeOnly: m.state === 'CloseOnly',
-          onIsolatedMargin: account.isolatedMarkets.has(m.marketId),
-          isolatedHasPositionOrOrders: account.isolatedOccupied.has(m.marketId),
-          currentSize: account.positionByMarket.get(m.marketId) ?? 0,
-          collateralPriceUsd: prices.get(m.tokenId) ?? null,
-        }))
-        .sort((x, y) => x.name.localeCompare(y.name));
+        .map(toRow)
+        .sort(byName);
 
       return reply.ok({
         markets: rows,
+        spreadMarkets,
         crossByToken: [...account.crossByToken.entries()].map(([tokenId, b]) => ({
           tokenId,
           available: b.available,
@@ -764,10 +889,10 @@ export function borosPairRoutes(deps: AppDeps) {
       // Bound BEFORE pricing: the gate below is only a failsafe if it reasons
       // over the account the orders will actually hit.
       assertTradableAddress(parseAddress(body.address));
-      const clientOrderIdA = parseClientOrderId(body.clientOrderIdA, 'clientOrderIdA');
-      const clientOrderIdB = parseClientOrderId(body.clientOrderIdB, 'clientOrderIdB');
-      if (clientOrderIdA === clientOrderIdB) {
-        throw new CoreError('the two legs need distinct clientOrderIds', 'validation');
+      const bodyLegs = parseLegs(body.legs);
+      const clientOrderIds = bodyLegs.map((leg, i) => parseClientOrderId(leg.clientOrderId, `legs[${i}].clientOrderId`));
+      if (new Set(clientOrderIds).size !== clientOrderIds.length) {
+        throw new CoreError('every leg needs its own clientOrderId', 'validation');
       }
       const orders = deps.getBorosOrders?.();
       if (!orders) {
@@ -784,7 +909,7 @@ export function borosPairRoutes(deps: AppDeps) {
       // account state the gate would now re-judge — its margin is spent, its
       // position is open — so re-running the gate first could 409 the exact
       // retry the memo exists to answer, hiding that the trade happened.
-      const memoKey = `${clientOrderIdA}|${clientOrderIdB}`;
+      const memoKey = [...clientOrderIds].sort().join('|');
       sweepExecutions();
       const replay = recentExecutions.get(memoKey);
       if (replay) {
@@ -794,7 +919,7 @@ export function borosPairRoutes(deps: AppDeps) {
         return reply.ok({ ...payload, replayed: true });
       }
 
-      const unlockCloses = lockCloses([parseLeg(body.legA, 'legA').marketId, parseLeg(body.legB, 'legB').marketId]);
+      const unlockCloses = lockCloses(bodyLegs.map((leg) => leg.marketId));
       if (!unlockCloses) return refuse(reply, {
         code: 409,
         category: 'validation',
@@ -804,11 +929,8 @@ export function borosPairRoutes(deps: AppDeps) {
       try {
         // Fresh account read: margin and positions decide the gate, and a cached
         // copy could be up to TTL.boros old — far too stale to authorise an order.
-        const { simulation, gate, intent, account, legA, legB } = await priceRequest(body, true);
-        const legs = [
-          { market: legA.market, sizing: simulation.legA.sizing },
-          { market: legB.market, sizing: simulation.legB.sizing },
-        ];
+        const { simulation, gate, intent, account, markets, legs: pricedLegs } = await priceRequest(body, true);
+        const legs = pricedLegs.map((leg, i) => ({ market: leg.market, sizing: simulation.legs[i].sizing }));
         unlockCloses(legs.filter((l) => l.sizing.opposing).map((l) => l.market.marketId));
         const addsToUnsupportedCoin = legs.some(
           (l) =>
@@ -816,6 +938,8 @@ export function borosPairRoutes(deps: AppDeps) {
             !isSupportedCoin(normalizeUnderlying(l.market.base)) &&
             (intent === 'open' || !l.sizing.opposing),
         );
+        const mixed = gate.blockers.find((b) => b.code === 'mixed-open');
+        if (mixed) throw new CoreError(mixed.message, 'validation');
         if (addsToUnsupportedCoin) return refuse(reply, {
           code: 409,
           category: 'validation',
@@ -833,7 +957,7 @@ export function borosPairRoutes(deps: AppDeps) {
             data: { blockers: gate.blockers },
           });
         }
-        if (simulation.receiveLeg === null) {
+        if (simulation.legs.length === 2 && simulation.receiveLeg === null) {
           throw new CoreError('the two legs do not offset — no spread to trade', 'validation');
         }
 
@@ -846,11 +970,12 @@ export function borosPairRoutes(deps: AppDeps) {
          * that entry's rejection could take the legitimate leg with it.
          */
         const orderFor = (
-          leg: typeof simulation.legA,
+          leg: (typeof simulation.legs)[number],
           clientOrderId: string,
         ): BorosMarketOrderRequest | null => {
           const size = Math.abs(leg.sizing.deltaSize);
           if (size === 0 || leg.execApr === null) return null;
+          const legMarket = pricedLegs.find((p) => p.market.marketId === leg.marketId)?.market ?? { spreadVenues: null };
           const raw = account.positionRawByMarket.get(leg.marketId);
           const reducing =
             leg.sizing.opposing && !leg.sizing.flips && raw !== undefined ? reducingOrderSize(raw, size) : null;
@@ -869,16 +994,15 @@ export function borosPairRoutes(deps: AppDeps) {
             size: reducing?.size ?? size,
             // Bound off the book MID, the same anchor the ticket's "Est." and
             // "Max" use; a mid-less market falls back to the fill rate.
-            limitApr: limitAprFor(orderSide, knownRate(leg.midApr) ? leg.midApr : leg.execApr, leg.slippageApr),
+            limitApr: limitAprFor(orderSide, knownRateOf(legMarket, leg.midApr) ? leg.midApr : leg.execApr, leg.slippageApr),
             clientOrderId,
             ...(reducing?.sizeWei !== undefined ? { sizeWei: reducing.sizeWei } : {}),
           };
         };
 
-        const legAOrder = orderFor(simulation.legA, clientOrderIdA);
-        const legBOrder = orderFor(simulation.legB, clientOrderIdB);
-        if (!legAOrder && !legBOrder) {
-          throw new CoreError('neither leg has anything to trade', 'validation');
+        const legOrders = simulation.legs.map((leg, i) => orderFor(leg, clientOrderIds[i]));
+        if (legOrders.every((o) => o === null)) {
+          throw new CoreError('no leg has anything to trade', 'validation');
         }
 
         // A second request that priced concurrently with this one lands here
@@ -889,15 +1013,33 @@ export function borosPairRoutes(deps: AppDeps) {
           const payload = await raced.result;
           return reply.ok({ ...payload, replayed: true });
         }
+        const thrown: unknown[] = [];
+        const client: BorosOrderClient = {
+          ...orders,
+          placeMarketOrders: (reqs, opts) =>
+            orders.placeMarketOrders(reqs, opts).catch((err: unknown) => {
+              thrown.push(err);
+              throw err;
+            }),
+        };
         const pending: Promise<ExecutionPayload> = submitBorosPair({
-          client: orders,
-          legA: legAOrder,
-          legB: legBOrder,
+          client,
+          legs: legOrders,
+          venues: legs.map((l) => l.market.spreadVenues ?? [normalizeVenue(l.market.venue)]),
           feeDragApr: simulation.feeDragApr,
-          receiveLeg: simulation.receiveLeg!,
+          receiveLeg: simulation.receiveLeg,
           // A close only reduces, so the gas top-up stays out of its way unless
           // the budget genuinely cannot pay — an exit is never taxed a dollar.
           reducing: intent === 'close',
+          // A close clears its markets' resting orders in the same batch, so
+          // none is left to re-open a leg once it is flat.
+          cancelOrdersOn:
+            intent === 'close'
+              ? legOrders.flatMap((o) => (o && account.restingOrderMarkets.has(o.marketId) ? [o.marketId] : []))
+              : undefined,
+          // An open the gate sent to the fallback treats its own coin as having
+          // nothing to spare, so the top-up comes from the best-funded one.
+          gasTopUpMarket: gasTopUpMarketFor(markets, account, intent !== 'close' && gate.gasTopUpFromFallback ? 0 : undefined),
         }).then((result) => ({ result, estimate: simulation, warnings: gate.warnings }));
         rememberExecution(memoKey, pending);
         const payload = await pending;
@@ -912,9 +1054,20 @@ export function borosPairRoutes(deps: AppDeps) {
          * snapshot. The position then appeared only when the TTL happened to
          * lapse — "it takes a while, and sometimes I have to refresh by hand".
          */
-        deps.cache.bust('boros:collaterals');
-        deps.cache.bust('boros:txns');
+        await settleAfterWrite(parseAddress(body.address), account, simulation.legs.map((l) => l.marketId));
 
+        if (thrown.length > 0) {
+          const unknown = classifyLegFailure(thrown[0]) === 'unknown';
+          return reply.code(502).send({
+            ok: false,
+            error: {
+              category: 'network',
+              message: unknown ? `${describeLegFailure(thrown[0])}${MAY_HAVE_FILLED}` : describeLegFailure(thrown[0]),
+              retryable: false,
+            },
+            data: { ...payload, replayed: false },
+          });
+        }
         return reply.ok({ ...payload, replayed: false });
       } finally {
         unlockCloses();
@@ -927,10 +1080,10 @@ export function borosPairRoutes(deps: AppDeps) {
      */
     const priceRoll = async (body: RollBody, fresh: boolean) => {
       const address = parseAddress(body.address);
-      const [markets, account, gasBalanceUsd] = await Promise.all([loadMarkets(fresh), loadAccount(address, fresh), readGasBalance(fresh)]);
+      const [markets, account, gasBalanceUsd] = await Promise.all([loadQuoteMarkets(fresh), loadAccount(address, fresh), readGasBalance(fresh)]);
       const step = (raw: RollStepBody | undefined, intent: 'close' | 'open', acknowledged: boolean) =>
         priceRequest(
-          { address, legA: raw?.legA, legB: raw?.legB, size: raw?.size, intent, opposingAcknowledged: acknowledged },
+          { address, legs: raw?.legs, intent, opposingAcknowledged: acknowledged },
           fresh,
           { markets, account, gasBalanceUsd },
         );
@@ -941,37 +1094,54 @@ export function borosPairRoutes(deps: AppDeps) {
       // The venue previews the batch as it would run it. A preview that
       // cannot be had is a blocker, not a guess — nothing else can vouch for
       // a FOK fill or for the margin after the closes.
-      const legs = rollLegsFor(exit.simulation, entry.simulation);
+      const openSizeWei = Object.fromEntries(
+        exit.simulation.legs.flatMap((l) => {
+          const raw = account.positionRawByMarket.get(l.marketId);
+          return raw === undefined ? [] : [[l.marketId, raw]];
+        }),
+      );
+      const plan = rollPlanFor(exit.simulation, entry.simulation, { openSizeWei });
       const orders = deps.getBorosOrders?.();
       // A preview that throws is still "no preview", but a refusal with a
       // status code is a fact worth showing (a position the venue no longer
       // finds, an input it rejects). A 429, a 5xx or a dropped connection is
       // the next poll's problem: for those "waiting for a quote" is the truth.
       let venueError: string | null = null;
-      const venue =
-        legs && orders?.simulateRollOver
-          ? await orders.simulateRollOver(legs).catch((err: unknown) => {
-              const status = err instanceof CoreError ? (err.details as { status?: number } | undefined)?.status : undefined;
-              venueError = status !== undefined && status < 500 && status !== 429 ? describeLegFailure(err) : null;
-              return null;
-            })
-          : null;
+      // The roll closes the short-dated legs, so their resting orders go in
+      // the same batch: one left behind could re-open a leg the roll just moved.
+      // The preview cancels the same ones, or an order in a close's path
+      // (MarketSelfSwap) blocks a roll the send would pass.
+      const cancelOrdersOn = plan ? [...new Set(plan.closes.map((o) => o.marketId))].filter((id) => account.restingOrderMarkets.has(id)) : [];
+      const preview = plan ? orders?.simulateRollOver?.(plan.closes, plan.opens, { cancelOrdersOn, fresh }) : undefined;
+      const venue = preview
+        ? await preview.catch((err: unknown) => {
+            const status = err instanceof CoreError ? (err.details as { status?: number } | undefined)?.status : undefined;
+            venueError =
+              status === 429
+                ? 'Boros rate limit reached. It retries in 10 s.'
+                : status !== undefined && status < 500
+                  ? describeLegFailure(err)
+                  : null;
+            return null;
+          })
+        : null;
       const gate = evaluateRollGate({
-        exit: { simulation: exit.simulation, gate: exit.gate, legA: exit.legA, legB: exit.legB },
-        entry: { simulation: entry.simulation, gate: entry.gate, legA: entry.legA, legB: entry.legB },
+        exit: { simulation: exit.simulation, gate: exit.gate, legs: exit.legs },
+        entry: { simulation: entry.simulation, gate: entry.gate, legs: entry.legs },
         venue,
         venueError,
       });
-      return { exit, entry, gate, venue, simulatedAtMs: Math.min(exit.simulatedAtMs, entry.simulatedAtMs) };
+      return { exit, entry, gate, venue, account, openSizeWei, plan, cancelOrdersOn, simulatedAtMs: Math.min(exit.simulatedAtMs, entry.simulatedAtMs) };
     };
 
     app.post('/boros/roll/simulate', async (req, reply) => {
-      const { exit, entry, gate, venue, simulatedAtMs } = await priceRoll(req.body as RollBody, false);
+      const { exit, entry, gate, venue, cancelOrdersOn, simulatedAtMs } = await priceRoll(req.body as RollBody, false);
       return reply.ok({
         exit: { simulation: exit.simulation, gate: exit.gate },
         entry: { simulation: entry.simulation, gate: entry.gate },
         gate,
         venue,
+        cancelOrdersOn,
         simulatedAtMs,
         gasBalanceUsd: entry.gasBalanceUsd ?? null,
       });
@@ -985,16 +1155,20 @@ export function borosPairRoutes(deps: AppDeps) {
     app.post('/boros/roll/execute', async (req, reply) => {
       const body = req.body as RollBody;
       assertTradableAddress(parseAddress(body.address));
-      const keys = ['exitA', 'exitB', 'entryA', 'entryB'] as const;
-      const ids = Object.fromEntries(
-        keys.map((k) => [k, parseClientOrderId(body.clientOrderIds?.[k], `clientOrderIds.${k}`)]),
-      ) as RollOrderIds;
-      if (new Set(Object.values(ids)).size !== keys.length) {
-        throw new CoreError('the four legs need distinct clientOrderIds', 'validation');
+      const rawIds = body.clientOrderIds;
+      if (typeof rawIds !== 'object' || rawIds === null || Array.isArray(rawIds)) {
+        throw new CoreError('clientOrderIds must map each leg to its id', 'validation');
+      }
+      const ids: RollOrderIds = Object.fromEntries(
+        Object.entries(rawIds).map(([k, v]) => [k, parseClientOrderId(v, `clientOrderIds.${k}`)]),
+      );
+      const idList = Object.values(ids);
+      if (idList.length === 0 || new Set(idList).size !== idList.length) {
+        throw new CoreError('every leg needs its own clientOrderId', 'validation');
       }
       const orders = deps.getBorosOrders?.();
-      if (!orders?.rollOver) {
-        throw new CoreError('Boros roll-over is not configured on this install.', 'not-configured');
+      if (!orders) {
+        throw new CoreError('Boros order placement is not configured on this install.', 'not-configured');
       }
       assertNotUpdating();
       await assertAgentNotExpired();
@@ -1002,106 +1176,52 @@ export function borosPairRoutes(deps: AppDeps) {
       // Memo BEFORE re-pricing, for the same reason as /pair/execute: a
       // lost-response retry must get the original outcome, and a roll that
       // went through changed the very state the gate would now re-judge.
-      const memoKey = keys.map((k) => ids[k]).join('|');
+      const memoKey = [...idList].sort().join('|');
       sweepRolls();
       const replay = recentRolls.get(memoKey);
       if (replay) return reply.ok({ ...(await replay.result), replayed: true });
 
-      const { exit, entry, gate } = await priceRoll(body, true);
-      if (gate.blockers.length > 0) {
-        return reply.code(409).send({
-          ok: false,
-          error: { category: 'validation', message: gate.blockers[0].message, retryable: false },
-          data: { blockers: gate.blockers },
-        });
-      }
-      const legs = rollLegsFor(exit.simulation, entry.simulation);
-      if (!legs) throw new CoreError('a leg of this roll has nothing to trade', 'validation');
-
-      const raced = recentRolls.get(memoKey);
-      if (raced) return reply.ok({ ...(await raced.result), replayed: true });
-      const pending: Promise<RollPayload> = submitBorosRoll(orders, legs).then((result) => ({
-        result,
-        exit: { simulation: exit.simulation, gate: exit.gate },
-        entry: { simulation: entry.simulation, gate: entry.gate },
-        gate,
-      }));
-      rememberRoll(memoKey, pending);
-      const payload = await pending;
-      deps.cache.bust('boros:collaterals');
-      deps.cache.bust('boros:txns');
-      return reply.ok({ ...payload, replayed: false });
-    });
-
-    /**
-     * ⚠ A top-up is an on-chain payment with no venue-side dedupe. Two things
-     * keep a re-press from paying twice: ONE top-up in flight at a time, and a
-     * replay memo keyed by the caller's id — a response lost after the payment
-     * landed answers the retry from the memo instead of paying again. A memo
-     * entry is dropped when its payment FAILED, so a genuine retry can pay.
-     */
-    const topUps = new Map<string, Promise<{ sentUsd: number }>>();
-    let topUpInFlight = false;
-    app.post('/boros/pair/top-up-gas', async (req, reply) => {
-      const body = (req.body ?? {}) as { amountUsd?: unknown; clientOrderId?: unknown; address?: unknown };
-      const amountUsd = Number(body.amountUsd);
-      if (!Number.isFinite(amountUsd) || amountUsd < MIN_TOP_UP_USD || amountUsd > MAX_TOP_UP_USD) {
-        throw new CoreError(
-          `amountUsd must be between $${MIN_TOP_UP_USD} and $${MAX_TOP_UP_USD}`,
-          'validation',
-        );
-      }
-      // The top-up always pays from the logged-in wallet. A tracked wallet
-      // that is not logged in must not get a payment it never made.
-      if (body.address !== undefined) {
-        const address = parseAddress(body.address);
-        const root = configuredRoot();
-        if (root && address !== root) {
-          throw new CoreError(
-            `Top up works only for the logged-in wallet ${maskAddress(root)}. Log in to ${maskAddress(address)} first.`,
-            'validation',
-          );
+      const unlockRoll = lockCloses([...parseLegs(body.exit?.legs), ...parseLegs(body.entry?.legs)].map((leg) => leg.marketId));
+      if (!unlockRoll) return refuse(reply, { code: 409, category: 'validation', message: ORDER_RUNNING, retryable: false });
+      try {
+        const { exit, entry, gate, venue, account, openSizeWei, cancelOrdersOn } = await priceRoll(body, true);
+        if (!orders.simulateRollOver) {
+          throw new CoreError('Boros roll-over is not configured on this install.', 'not-configured');
         }
-      }
-      const clientOrderId =
-        body.clientOrderId === undefined ? null : parseClientOrderId(body.clientOrderId, 'clientOrderId');
-      const prior = clientOrderId === null ? undefined : topUps.get(clientOrderId);
-      if (prior) return reply.ok({ ...(await prior), replayed: true });
-      const orders = deps.getBorosOrders?.();
-      if (!orders?.payTreasury) {
-        throw new CoreError(
-          'Boros gas top-up is not configured on this install.',
-          'not-configured',
-        );
-      }
-      assertNotUpdating();
-      await assertAgentNotExpired();
-      if (topUpInFlight) {
-        throw new CoreError(
-          'a gas top-up is already in flight — wait for it to land before sending another.',
-          'validation',
-        );
-      }
-      topUpInFlight = true;
-      const payment = (async () => {
-        const usdMarket = (await loadMarkets(false)).find((m) => m.tokenId === USD_TOKEN_ID);
-        if (!usdMarket) {
-          throw new CoreError(
-            'Boros lists no USD-collateral market to route a dollar top-up through.',
-            'venue-rejected',
-          );
+        if (gate.blockers.length > 0) {
+          return reply.code(409).send({
+            ok: false,
+            error: { category: 'validation', message: gate.blockers[0].message, retryable: false },
+            data: { blockers: gate.blockers },
+          });
         }
-        await orders.payTreasury!(amountUsd, usdMarket.marketId);
-        deps.cache.bust('boros:gas-balance');
-        return { sentUsd: amountUsd };
-      })().finally(() => {
-        topUpInFlight = false;
-      });
-      if (clientOrderId !== null) {
-        topUps.set(clientOrderId, payment);
-        payment.catch(() => topUps.delete(clientOrderId));
+        const plan = rollPlanFor(exit.simulation, entry.simulation, { ids, openSizeWei });
+        if (!plan) throw new CoreError('a leg of this roll has nothing to trade', 'validation');
+        const fillKeys = rollFillKeys(plan);
+        if (fillKeys.length !== idList.length || fillKeys.some((k) => ids[k] === undefined)) {
+          throw new CoreError(`clientOrderIds must name exactly these legs: ${fillKeys.join(', ')}`, 'validation');
+        }
+
+        const raced = recentRolls.get(memoKey);
+        if (raced) return reply.ok({ ...(await raced.result), replayed: true });
+        const gasTopUpMarket = gasTopUpMarketFor(exit.markets, account, venue?.availableAfter);
+        const pending: Promise<RollPayload> = submitBorosRoll(orders, plan, { cancelOrdersOn, gasTopUpMarket }).then((result) => ({
+          result,
+          exit: { simulation: exit.simulation, gate: exit.gate },
+          entry: { simulation: entry.simulation, gate: entry.gate },
+          gate,
+        }));
+        rememberRoll(memoKey, pending);
+        const payload = await pending;
+        await settleAfterWrite(
+          parseAddress(body.address),
+          account,
+          [...exit.simulation.legs, ...entry.simulation.legs].map((l) => l.marketId),
+        );
+        return reply.ok({ ...payload, replayed: false });
+      } finally {
+        unlockRoll();
       }
-      return reply.ok({ ...(await payment), replayed: false });
     });
 
     /**
@@ -1254,6 +1374,9 @@ export function borosPairRoutes(deps: AppDeps) {
           const current = account.positionByMarket.get(marketId) ?? 0;
 
           if (current === 0) {
+            // The read above came 0–2 s after the cancel, so it can still list the
+            // cancelled orders. Do not keep it for the cards.
+            deps.cache.bust(`boros:collaterals:${address}`);
             return reply.ok({ marketId, cancelled: true, closed: false, fill: null });
           }
           // Reduce = trade the opposite way to the position's sign.
@@ -1292,8 +1415,9 @@ export function borosPairRoutes(deps: AppDeps) {
              */
             // A market with no mid (the feed's 0) falls back to the mark: a bound
             // of 0 ± tolerance would be nowhere near the book.
-            limitApr: limitAprFor(direction, knownRate(market.midApr) ? market.midApr : market.markApr, slippageApr),
+            limitApr: limitAprFor(direction, knownRateOf(market, market.midApr) ? market.midApr : market.markApr, slippageApr),
             clientOrderId,
+            gasTopUpMarket: gasTopUpMarketFor(markets, account),
           });
           /**
            * ⚠ Bust the Boros reads this close just invalidated.
@@ -1305,8 +1429,7 @@ export function borosPairRoutes(deps: AppDeps) {
            * the CrossEx writes: a write busts what it changed (deals.ts busts
            * `account`, leverage.ts busts `positions`).
            */
-          deps.cache.bust('boros:collaterals');
-          deps.cache.bust('boros:txns');
+          await settleAfterWrite(address, account, [marketId]);
 
           return reply.ok({
             marketId,
@@ -1322,6 +1445,10 @@ export function borosPairRoutes(deps: AppDeps) {
             openSize,
           });
         } catch (err) {
+          // The cancel landed, and a close that timed out may have filled: the
+          // cards must not keep a read from before either.
+          deps.cache.bust(`boros:collaterals:${address}`);
+          bustBorosFills(deps.cache, [marketId]);
           const msg = err instanceof Error ? err.message : String(err);
           throw new CoreError(
             // "any", not "the": cancelOrders sends cancelAll and reports no

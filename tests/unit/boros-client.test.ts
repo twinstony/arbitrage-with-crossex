@@ -15,6 +15,7 @@ import {
   syncSettlementLedger,
   type FetchLike,
 } from '../../src/core/boros/client';
+import { borosHealthFactor } from '../../src/core/boros/opportunities';
 
 // The client tag lives in module state; reset it around every test so a case
 // that sets a version/active flag can never leak into the plain-tag assertions.
@@ -113,6 +114,60 @@ describe('fetchBorosMarkets', () => {
     // 2500/1e4 = 0.25, and 0.25 x 7.6% = 1.9% APR. Reading the factor as the
     // cap directly would have quoted 25%.
     expect(markets[0].maxRateDeviationApr).toBeCloseTo(0.019, 12);
+  });
+
+  it.each([
+    ['a spread mark under the floor', 0.0348, 0.25 * (1.00005 ** 1540 - 1)],
+    ['a negative mark', -0.02, 0.25 * (1.00005 ** 1540 - 1)],
+    ['a mark over the floor', 0.12, 0.03],
+  ])('sizes a spread rate band off max(floor, |mark|) for %s', async (_, markApr, band) => {
+    const markets = await fetchBorosMarkets(
+      stub(() => ({
+        body: {
+          results: [
+            {
+              marketId: 59,
+              tokenId: 2,
+              imData: { tickStep: 2, iTickThresh: 770 },
+              config: { maxRateDeviationFactorBase1e4: 2500 },
+              metadata: { isSpreadMarket: true },
+              platform: { platformId: 'hyperliquid-gate' },
+              data: { markApr },
+            },
+          ],
+        },
+      })),
+    );
+    expect(markets[0].maxRateDeviationApr).toBeCloseTo(band, 12);
+    expect(markets[0].maxRateDeviationApr).toBeGreaterThan(0);
+  });
+
+  // The contract checks every market against factor × max(floor, |mark|).
+  // Most live singles mark under their floor (Gate ETHUSDT 4.19% on a 6% floor),
+  // so factor × mark alone blocked bounds the venue takes.
+  it.each([
+    ['a mark under the floor', 0.0516, 0.25 * (1.00005 ** 1540 - 1)],
+    ['a negative mark', -0.1384, 0.25 * 0.1384],
+    ['a mark over the floor', 0.12, 0.03],
+  ])('sizes a single market rate band off max(floor, |mark|) for %s', async (_, markApr, band) => {
+    const markets = await fetchBorosMarkets(
+      stub(() => ({
+        body: {
+          results: [
+            {
+              marketId: 51,
+              tokenId: 2,
+              imData: { tickStep: 2, iTickThresh: 770 },
+              config: { maxRateDeviationFactorBase1e4: 2500 },
+              platform: { platformId: 'gate' },
+              data: { markApr },
+            },
+          ],
+        },
+      })),
+    );
+    expect(markets[0].maxRateDeviationApr).toBeCloseTo(band, 12);
+    expect(markets[0].maxRateDeviationApr).toBeGreaterThan(0);
   });
 
   it('normalizes the initial-margin inputs (kIM is 18-dec, tThresh comes off config)', async () => {
@@ -575,6 +630,34 @@ describe('fetchBorosCollaterals', () => {
     expect(p.positionInitialMargin).toBe('5');
   });
 
+  it('parses the venue liquidation APR, maintenance margin and free margin, and tolerates their absence', async () => {
+    const withFields = {
+      results: [
+        {
+          marketAcc: CROSS,
+          netBalance: '20',
+          initialMargin: '5',
+          availableInitialMargin: '7',
+          positions: [
+            // liquidationApr is an 18-dec string like every other rate (0.09).
+            { marketId: 155, signedSize: '-7', initialMargin: '5', maintMargin: '3', liquidationApr: '90000000000000000', orders: [] },
+          ],
+        },
+      ],
+    };
+    const g = (await fetchBorosCollaterals(accountStub(withFields, actives), ROOT, []))[0].cross!;
+    expect(g.availableInitialMargin).toBe('7');
+    expect(g.marketPositions[0].liquidationApr).toBeCloseTo(0.09, 12);
+    expect(g.marketPositions[0].maintMargin).toBe('3');
+
+    // The legacy `infos` fixture carries none of the three: available is
+    // undefined, maintMargin undefined, and a missing/zero liq reads as null.
+    const legacy = (await fetchBorosCollaterals(accountStub(infos, actives), ROOT, []))[0].cross!;
+    expect(legacy.availableInitialMargin).toBeUndefined();
+    expect(legacy.marketPositions[0].liquidationApr).toBeNull();
+    expect(legacy.marketPositions[0].maintMargin).toBeUndefined();
+  });
+
   it('reads resting orders from the order list instead of the initial-margin gap', async () => {
     const zones = await fetchBorosCollaterals(accountStub(infos, actives), ROOT, []);
     expect(zones[0].cross!.marketPositions[0].hasRestingOrders).toBe(false);
@@ -595,7 +678,7 @@ describe('fetchBorosCollaterals', () => {
     const market = {
       marketId: 155, tokenId: 3, name: '', venue: '', base: '', maturity: Date.now() / 1000 + 365 * 86_400,
       paymentPeriod: 0, settleFeeApr: 0, markApr: 0.1, floatingApr: 0, midApr: 0, notionalOi: 0, takerFeeRate: 0,
-      state: 'Normal', assetMarkPriceUsd: 1, kIM: 1, kMM: 0, imTickThresh: 0, imTickStep: 0, tThreshSec: 0, maxRateDeviationApr: 0,
+      state: 'Normal', assetMarkPriceUsd: 1, kIM: 1, kMM: 0, imTickThresh: 0, imTickStep: 0, tThreshSec: 0, maxRateDeviationApr: 0, spreadVenues: null,
     };
     const e18 = (n: number) => `${n}000000000000000000`;
     const book = (orders: Array<{ side: number; im: number }>, combined: number) => ({
@@ -635,10 +718,20 @@ describe('fetchBorosCollaterals', () => {
   });
 });
 
+describe('borosHealthFactor', () => {
+  it('is equity over maintenance margin, null when nothing is at risk', () => {
+    expect(borosHealthFactor(300, 200)).toBeCloseTo(1.5, 12);
+    expect(borosHealthFactor(100, 100)).toBeCloseTo(1, 12);
+    expect(borosHealthFactor(100, 0)).toBeNull();
+    expect(borosHealthFactor(100, -5)).toBeNull();
+  });
+});
+
 describe('resolveCollateralPricesUsd', () => {
+  const mk = (tokenId: number, base: string, px: number) =>
+    ({ marketId: tokenId * 100, tokenId, name: '', venue: '', base, maturity: 0, paymentPeriod: 0, settleFeeApr: 0, markApr: 0, floatingApr: 0, midApr: 0, notionalOi: 0, takerFeeRate: 0, state: 'Normal', assetMarkPriceUsd: px, kIM: 0, kMM: 0, imTickThresh: 0, imTickStep: 0, tThreshSec: 0, maxRateDeviationApr: 0, spreadVenues: null }) as const;
+
   it('prices stables at 1, token collateral via a same-asset market, unknown as null', () => {
-    const mk = (tokenId: number, base: string, px: number) =>
-      ({ marketId: tokenId * 100, tokenId, name: '', venue: '', base, maturity: 0, paymentPeriod: 0, settleFeeApr: 0, markApr: 0, floatingApr: 0, midApr: 0, notionalOi: 0, takerFeeRate: 0, state: 'Normal', assetMarkPriceUsd: px, kIM: 0, kMM: 0, imTickThresh: 0, imTickStep: 0, tThreshSec: 0, maxRateDeviationApr: 0 }) as const;
     const prices = resolveCollateralPricesUsd([
       { ...mk(3, 'HYPE', 40) }, // USDT-margined HYPE book
       { ...mk(1, 'BTC', 118_000) }, // BTC-margined BTC book
@@ -647,6 +740,17 @@ describe('resolveCollateralPricesUsd', () => {
     expect(prices.get(3)).toBe(1);
     expect(prices.get(1)).toBe(118_000);
     expect(prices.get(4)).toBeNull();
+  });
+
+  it('takes the price from a single market before a spread market listed first', () => {
+    const spread = { ...mk(2, 'ETH', 0.38), marketId: 59, spreadVenues: ['HYPERLIQUID', 'GATE'] as [string, string] };
+    const prices = resolveCollateralPricesUsd([spread, { ...mk(2, 'ETH', 2490.3), marketId: 51 }]);
+    expect(prices.get(2)).toBe(2490.3);
+  });
+
+  it('takes the spread market price when the token has no single market', () => {
+    const spread = { ...mk(1, 'BTC', 82352), marketId: 58, spreadVenues: ['HYPERLIQUID', 'GATE'] as [string, string] };
+    expect(resolveCollateralPricesUsd([spread]).get(1)).toBe(82352);
   });
 });
 

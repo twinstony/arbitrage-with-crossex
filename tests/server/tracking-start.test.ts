@@ -152,7 +152,10 @@ describe('the default start date', () => {
   it('Gate error writes nothing', async () => {
     start();
     mockGateGet('/positions', { body: [perp('HYPERLIQUID_FUTURE_ETH_USDC', '2026-07-05T00:00:00Z')] }).persist();
-    mockGateGet('/history_positions', { status: 500, body: { label: 'INTERNAL' } });
+    // times: 2 — this fork retries a Gate 5xx GET once, so BOTH attempts must
+    // see the failure; otherwise the retry would consume the success mock below
+    // and this test would be asserting the opposite of what it names.
+    mockGateGet('/history_positions', { status: 500, body: { label: 'INTERNAL' }, times: 2 });
     mockGateGet('/history_positions', { body: [] });
     mockRest();
 

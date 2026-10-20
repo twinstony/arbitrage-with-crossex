@@ -52,6 +52,7 @@ import { getLeverageMax } from '../../core/orders';
 import type { AppDeps } from '../app';
 import type { TtlCache } from '../cache';
 import { TTL } from '../cache';
+import { requireLeverageMax } from './leverage';
 
 const DEFAULT_NOTIONAL_USD = 10_000;
 const MIN_NOTIONAL_USD = 1_000;
@@ -165,7 +166,7 @@ async function loadLeverageMax(
           TTL.static,
           async () => {
             batch ??= getLeverageMax(ruleClient(deps), symbols);
-            return (await batch).get(symbol) ?? 0;
+            return requireLeverageMax(await batch, symbol);
           },
           { fresh },
         );
@@ -295,15 +296,26 @@ export async function scanOpportunities(
   // is unavailable (unconfigured/down), their PUBLIC books still price the
   // slippage; the core looks them up under this same fallback key.
   const fallbackBooks = new Set<string>();
+  const addPerp = (crossexVenue: string, rawBase: string): void => {
+    const base = rawBase.toUpperCase();
+    const symbol = symbolsByVenueBase.get(`${crossexVenue}:${base}`);
+    if (symbol) perpSymbols.add(symbol);
+    else if (!rulesAvailable) fallbackBooks.add(`${crossexVenue}:${base}`);
+  };
   for (const plan of groupBorosMarkets(markets, nowSec)) {
     for (const market of plan.markets) {
       const crossexVenue = normalizeVenue(market.venue);
       if (!crossexVenues.has(crossexVenue)) continue;
       bookMarketIds.push(market.marketId);
-      const base = market.base.toUpperCase();
-      const symbol = symbolsByVenueBase.get(`${crossexVenue}:${base}`);
-      if (symbol) perpSymbols.add(symbol);
-      else if (!rulesAvailable) fallbackBooks.add(`${crossexVenue}:${base}`);
+      addPerp(crossexVenue, market.base);
+    }
+    // Spread markets price their own book too (upstream 1.7.5): both venues
+    // must be in the CrossEx universe, and the spread must be trading.
+    for (const spread of plan.spreads) {
+      const venues = spread.spreadVenues;
+      if (spread.state !== 'Normal' || !venues?.every((v) => crossexVenues.has(v))) continue;
+      bookMarketIds.push(spread.marketId);
+      for (const venue of venues) addPerp(venue, spread.base);
     }
   }
 

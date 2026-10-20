@@ -68,23 +68,6 @@ export interface BorosMarketOrderRequest {
 }
 
 /**
- * One leg of a roll-over, as the venue's own builder takes it: the position on
- * `fromMarketId` is closed (opposite side, capped at what is held — sized by
- * the venue from the on-chain position, never from this float) and the same
- * side re-opened at the same size on `toMarketId`. Every order is FOK, so a
- * batch of these submitted with `requireSuccess` moves every leg in full or
- * nothing. `closeRate` / `openRate` are the worst rates each order accepts.
- */
-export interface BorosRollLeg {
-  fromMarketId: number;
-  toMarketId: number;
-  /** Collateral units, positive. */
-  size: number;
-  closeRate?: number;
-  openRate?: number;
-}
-
-/**
  * The venue's preview of a roll: the batch run in order on one simulated
  * account, so it answers the two things no book walk can — does every FOK
  * order fill whole inside its bound, and does the account still clear its
@@ -131,6 +114,10 @@ export type BorosLegFailureCode =
    * entry requirement, not this order's margin) and not `no-gas`
    * (`payTreasury` cannot clear it). */
   | 'min-cash'
+  /** The cross account already holds the most markets Boros lets it enter
+   * (`MMMarketLimitExceeded`, MarginManager.sol), and none could be exited:
+   * each still holds a position or an order. */
+  | 'market-limit'
   /** Anything the venue rejected for another reason. */
   | 'rejected'
   /** The submission never got a usable answer; the fill state is UNKNOWN. */
@@ -192,6 +179,7 @@ export interface BorosClosePositionRequest {
   openSizeWei: string;
   /** The direction that REDUCES: opposite the position's own side. */
   direction: BorosLegDirection;
+  gasTopUpMarket?: PlaceOrdersOptions['gasTopUpMarket'];
   /** Worst rate this close will accept, an APR fraction. */
   limitApr: number;
   clientOrderId: string;
@@ -227,20 +215,22 @@ export interface BorosOrderClient {
    */
   placeMarketOrders(reqs: BorosMarketOrderRequest[], opts?: PlaceOrdersOptions): Promise<BorosLegFill[]>;
   /**
-   * Roll positions to a later maturity as ONE all-or-nothing batch: the
-   * venue builds every close and open (FOK), this signs and submits them
-   * with `requireSuccess`. Returns one fill per order, every close first
-   * then every open, in leg order.
+   * A roll — every close, then every open, FOK — previewed by the venue on
+   * one simulated account state, as `placeMarketOrders` would send it. Pass
+   * the batch's own `cancelOrdersOn`: the preview cancels those orders first.
+   * `fresh` reads the account afresh: the check before a send must not judge
+   * it on a polled preview's reads.
    */
-  rollOver?(legs: BorosRollLeg[]): Promise<BorosLegFill[]>;
-  /** The same batch previewed by the venue on one simulated account state. */
-  simulateRollOver?(legs: BorosRollLeg[]): Promise<BorosRollSimulation>;
+  simulateRollOver?(
+    closes: BorosMarketOrderRequest[],
+    opens: BorosMarketOrderRequest[],
+    opts?: Pick<PlaceOrdersOptions, 'cancelOrdersOn'> & { fresh?: boolean },
+  ): Promise<BorosRollSimulation>;
   /** Force-cancel every resting order on one market (§6A remediation). */
   cancelOrders(marketId: number): Promise<void>;
   /** Force-close the whole netted position on one market (§6A remediation). */
   closePosition(req: BorosClosePositionRequest): Promise<BorosLegFill>;
   getGasBalance?(): Promise<number | null>;
-  payTreasury?(amountUsd: number, marketId: number): Promise<void>;
 }
 
 export interface PlaceOrdersOptions {
@@ -256,6 +246,18 @@ export interface PlaceOrdersOptions {
    * legs that CLOSE lets that check see the margin those closes free.
    */
   topUpAfter?: number;
+  /**
+   * Markets whose resting orders are cancelled at the head of the SAME batch.
+   * A close that left an order resting could see it fill later and re-open
+   * the leg it just closed (Boros has no reduce-only flag); in one batch the
+   * cancel and the close stand or fall together, so a refused close also
+   * cancels nothing.
+   */
+  cancelOrdersOn?: number[];
+  timeInForce?: 'immediate-or-cancel' | 'fill-or-kill';
+  /** The market whose cross account pays the automatic gas top-up, given its
+   * dollars and the traded market. Absent: the traded market pays. */
+  gasTopUpMarket?: (amountUsd: number, tradedMarketId: number) => number;
 }
 
 /** The rate bound one leg carries, from its estimate and its tolerance. */
@@ -279,28 +281,27 @@ export interface SubmitBorosPairInput {
    * a null execution rate, and because both legs share one batch that entry's
    * rejection can take the legitimate leg down with it.
    */
-  legA: BorosMarketOrderRequest | null;
-  legB: BorosMarketOrderRequest | null;
+  legs: (BorosMarketOrderRequest | null)[];
   /** Fee drag already priced into the simulation's spread numbers, so the
    * realised spread is quoted on the same basis as the estimate it is compared
    * against. An APR fraction. */
   feeDragApr: number;
-  /** Which leg receives fixed — fixes the sign of the realised spread. */
-  receiveLeg: 'A' | 'B';
+  receiveLeg: number | null;
   /** Both legs only reduce what the account already holds. Decides how hard the
    * gas top-up tries: an exit is funded only when it truly cannot pay. */
   reducing?: boolean;
+  /** Markets to clear of resting orders in the same batch (see
+   * `PlaceOrdersOptions.cancelOrdersOn`). */
+  cancelOrdersOn?: number[];
+  gasTopUpMarket?: PlaceOrdersOptions['gasTopUpMarket'];
+  venues?: ReadonlyArray<readonly string[]>;
 }
 
 export interface BorosPairResult {
-  legA: BorosLegFill;
-  legB: BorosLegFill;
-  /** min(|fill A|, |fill B|) — the part that actually ended up hedged. */
+  legs: BorosLegFill[];
   hedgedSize: number;
-  /** |fill A − fill B| — what is left directional, and on which leg. */
   unhedgedSize: number;
-  /** The leg carrying the residual; null when the fills matched. */
-  unhedgedLeg: 'A' | 'B' | null;
+  unhedgedLeg: number | null;
   /** Realised spread from the ACTUAL fills, net of the same fee drag as the
    * estimate. Null unless both legs got a fill to compute it from. */
   realisedSpreadApr: number | null;
@@ -314,8 +315,7 @@ export interface BorosPairResult {
    * "partially filled".
    */
   filledNothing: boolean;
-  /** False when only one leg was submitted (a completion). */
-  bothLegsSubmitted: boolean;
+  allLegsSubmitted: boolean;
 }
 
 /**
@@ -340,10 +340,9 @@ export async function submitBorosPair(input: SubmitBorosPairInput): Promise<Boro
     failure: { code: classifyLegFailure(err), message: describeLegFailure(err) },
   });
 
-  /** A leg that was never submitted: no fill, no shortfall, no failure. */
-  const notSubmitted = (which: 'A' | 'B'): BorosLegFill => ({
+  const notSubmitted = (index: number): BorosLegFill => ({
     marketId: 0,
-    direction: which === 'A' ? 'short' : 'long',
+    direction: index === 0 ? 'short' : 'long',
     filledSize: 0,
     shortfallSize: 0,
     execApr: null,
@@ -351,14 +350,9 @@ export async function submitBorosPair(input: SubmitBorosPairInput): Promise<Boro
     failure: null,
   });
 
-  // ONE batch, not two concurrent sends — see `placeMarketOrders`. A throw here
-  // covers every submitted leg, so all are reported failed rather than one
-  // silently vanishing.
-  const submitted: Array<{ key: 'A' | 'B'; req: BorosMarketOrderRequest }> = [];
-  if (input.legA) submitted.push({ key: 'A', req: input.legA });
-  if (input.legB) submitted.push({ key: 'B', req: input.legB });
+  const submitted = input.legs.flatMap((req, index) => (req ? [{ index, req }] : []));
 
-  const byKey = new Map<'A' | 'B', BorosLegFill>();
+  const byIndex = new Map<number, BorosLegFill>();
   if (submitted.length > 0) {
     try {
       const reqs = submitted.map((x) => x.req);
@@ -367,50 +361,65 @@ export async function submitBorosPair(input: SubmitBorosPairInput): Promise<Boro
         // A close frees margin; a top-up it might need (a negative budget)
         // runs its own strict margin check, so it goes after the closes.
         topUpAfter: input.reducing ? reqs.length : 0,
+        cancelOrdersOn: input.cancelOrdersOn,
+        gasTopUpMarket: input.gasTopUpMarket,
       });
-      submitted.forEach(({ key, req }, i) => {
-        byKey.set(key, fills[i] ?? failed(req, new Error(`no result returned for leg ${key}`)));
+      submitted.forEach(({ index, req }, i) => {
+        byIndex.set(index, fills[i] ?? failed(req, new Error(`no result returned for leg ${index + 1}`)));
       });
     } catch (err) {
-      for (const { key, req } of submitted) byKey.set(key, failed(req, err));
+      for (const { index, req } of submitted) byIndex.set(index, failed(req, err));
     }
   }
-  const legA = byKey.get('A') ?? notSubmitted('A');
-  const legB = byKey.get('B') ?? notSubmitted('B');
+  const legs = input.legs.map((_, index) => byIndex.get(index) ?? notSubmitted(index));
+  const fills = legs.map((l) => Math.abs(l.filledSize));
 
-  const fillA = Math.abs(legA.filledSize);
-  const fillB = Math.abs(legB.filledSize);
-  // Pair-level hedge accounting only means anything when BOTH legs were sent.
-  // On a single-leg completion the one fill is CLOSING a gap, so reporting it
-  // as an unhedged residual would state the exact opposite of what happened.
-  const bothSubmitted = submitted.length === 2;
-  const hedgedSize = bothSubmitted ? Math.min(fillA, fillB) : 0;
-  const unhedgedSize = bothSubmitted ? Math.abs(fillA - fillB) : 0;
-
-  const recv = input.receiveLeg === 'A' ? legA : legB;
-  const pay = input.receiveLeg === 'A' ? legB : legA;
-  const realisedSpreadApr =
-    recv.execApr === null || pay.execApr === null
-      ? null
-      : recv.execApr - pay.execApr - input.feeDragApr;
+  const allSubmitted = submitted.length === input.legs.length;
+  const pairSubmitted = legs.length === 2 && allSubmitted;
+  const hedgedSize = legs.length === 1 ? fills[0] : pairSubmitted ? Math.min(fills[0], fills[1]) : 0;
+  const unhedgedSize =
+    legs.length > 2 ? venueImbalance(legs, fills, input.venues) : pairSubmitted ? Math.abs(fills[0] - fills[1]) : 0;
 
   return {
-    legA,
-    legB,
+    legs,
     hedgedSize,
     unhedgedSize,
-    unhedgedLeg: unhedgedSize === 0 ? null : fillA > fillB ? 'A' : 'B',
-    /** False when only one leg was sent (a completion), so the report can drop
-     * the pair-level framing rather than imply a half-done pair. */
-    bothLegsSubmitted: bothSubmitted,
-    realisedSpreadApr,
-    partial: submitted.some(({ key }) => (byKey.get(key)?.shortfallSize ?? 0) > 0),
+    unhedgedLeg: unhedgedSize === 0 || legs.length !== 2 ? null : fills[0] > fills[1] ? 0 : 1,
+    allLegsSubmitted: allSubmitted,
+    realisedSpreadApr: realisedSpread(legs, input.receiveLeg, input.feeDragApr),
+    partial: submitted.some(({ index }) => (byIndex.get(index)?.shortfallSize ?? 0) > 0),
     // Off the fills, not the shortfalls, and only over legs actually sent: a
     // request with nothing to send was not refused.
     filledNothing:
       submitted.length > 0 &&
-      submitted.every(({ key }) => Math.abs(byKey.get(key)?.filledSize ?? 0) === 0),
+      submitted.every(({ index }) => Math.abs(byIndex.get(index)?.filledSize ?? 0) === 0),
   };
+}
+
+function venueImbalance(
+  legs: readonly BorosLegFill[],
+  fills: readonly number[],
+  venues: SubmitBorosPairInput['venues'],
+): number {
+  if (!venues || venues.length !== legs.length) return 0;
+  const exposure = new Map<string, number>();
+  legs.forEach((leg, i) => {
+    const signed = leg.direction === 'long' ? fills[i] : -fills[i];
+    venues[i].forEach((venue, k) => exposure.set(venue, (exposure.get(venue) ?? 0) + (k === 0 ? signed : -signed)));
+  });
+  const net = Math.abs([...exposure.values()].reduce((sum, v) => sum + v, 0));
+  return net > Math.max(1e-12, Math.max(...fills) * 1e-9) ? net : 0;
+}
+
+function realisedSpread(legs: readonly BorosLegFill[], receiveLeg: number | null, feeDragApr: number): number | null {
+  if (legs.length === 1) {
+    const { execApr } = legs[0];
+    return execApr === null ? null : (receiveLeg === 0 ? execApr : -execApr) - feeDragApr;
+  }
+  if (legs.length !== 2 || receiveLeg === null) return null;
+  const recv = legs[receiveLeg];
+  const pay = legs[1 - receiveLeg];
+  return recv.execApr === null || pay.execApr === null ? null : recv.execApr - pay.execApr - feeDragApr;
 }
 
 /**
@@ -459,6 +468,8 @@ export function classifyLegFailure(err: unknown): BorosLegFailureCode {
    * through to `rejected` and keeps the venue's own wording.
    */
   if (/TOP_UP_AT_LEAST/.test(text)) return 'min-cash';
+  // `MMMarketLimitExceeded()`, or the same words as prose.
+  if (/MARKET_?LIMIT_?EXCEEDED/.test(text)) return 'market-limit';
   if (/INSUFFICIENT[ _]GAS|GAS[ _]BALANCE/.test(text)) {
     return 'no-gas';
   }
@@ -471,6 +482,14 @@ export function classifyLegFailure(err: unknown): BorosLegFailureCode {
   if (err instanceof CoreError) {
     if (err.category === 'insufficient-margin') return 'insufficient-margin';
     if (err.category === 'network' || err.category === 'rate-limited') return 'unknown';
+    // A 5xx with no reason the rules above recognise is no verdict at all:
+    // the venue may have run the batch before it failed to answer. Calling
+    // that a rejection dropped the replay memo and invited a second fill.
+    // (A refusal BEFORE submission never gets here as unknown — the venue
+    // adapter's `neverSentLeg` folds it back to a plain rejection, and a
+    // `[SIMULATE]` refusal provably sent nothing, whatever its status.)
+    const status = (err.details as { status?: unknown } | undefined)?.status;
+    if (!simulated && typeof status === 'number' && status >= 500) return 'unknown';
   }
   if (!simulated && /TIMEOUT|NETWORK|UNREACHABLE|ECONN|ABORT/.test(text)) return 'unknown';
   return 'rejected';

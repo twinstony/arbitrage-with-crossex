@@ -7,7 +7,7 @@
  * drives the review. The pick page still prices its options over
  * /boros/pair/simulate, so those mocks stay.
  */
-import { screen, waitFor, within } from '@testing-library/react';
+import { cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { HttpResponse, http } from 'msw';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -46,6 +46,7 @@ const perp = (venue: string, side: 'LONG' | 'SHORT'): AssetPerpOpen => ({
   openedAt: NOW - 10 * DAY,
 });
 const yu = (marketId: number, venue: string, side: 'LONG' | 'SHORT'): AssetBorosOpen => ({
+  spreadVenues: null,
   marketId,
   venue,
   side,
@@ -82,19 +83,29 @@ const marketRow = (marketId: number, venue: string, maturity: number) => ({
   maturity,
   midApr: 0.06,
   markApr: 0.06,
+  spreadVenues: null as [string, string] | null,
   isolatedOnly: false,
   onIsolatedMargin: false,
   isolatedHasPositionOrOrders: false,
   currentSize: 0,
   collateralPriceUsd: 2500,
 });
+const SPREAD_NEW = 59;
+let spreadListed = false;
+let spreadCloseOnly = false;
+/** A Hyperliquid market on another collateral at the new maturity, listed first. */
+const HL_NEW_USDT = 13;
+let otherCollateral = false;
+let hlNewCloseOnly = false;
 const context = () => ({
   markets: [
+    ...(otherCollateral ? [{ ...marketRow(HL_NEW_USDT, 'Hyperliquid', NEW), tokenId: 1, collateral: 'USDT' }] : []),
     marketRow(GATE_OLD, 'Gate', OLD),
     marketRow(HL_OLD, 'Hyperliquid', OLD),
     marketRow(GATE_NEW, 'Gate', NEW),
-    marketRow(HL_NEW, 'Hyperliquid', NEW),
+    { ...marketRow(HL_NEW, 'Hyperliquid', NEW), closeOnly: hlNewCloseOnly },
   ],
+  spreadMarkets: spreadListed ? [{ ...marketRow(SPREAD_NEW, 'HL-GATE', NEW), spreadVenues: ['HYPERLIQUID', 'GATE'] as [string, string], closeOnly: spreadCloseOnly }] : [],
   crossByToken: [{ tokenId: 3, available: 1_000 }],
   isolatedByMarket: [],
   defaultSlippageApr: 0.0025,
@@ -145,17 +156,16 @@ const simLeg = (marketId: number, direction: 'long' | 'short', size: number, int
           orderSide: direction,
         },
 });
-type StepInput = { legA: { marketId: number; direction: 'long' | 'short' }; legB: { marketId: number; direction: 'long' | 'short' }; size: number };
+type StepInput = { legs: Leg[] };
 const simulation = (body: StepInput & { intent: string }) => ({
-  legA: simLeg(body.legA.marketId, body.legA.direction, body.size, body.intent),
-  legB: simLeg(body.legB.marketId, body.legB.direction, body.size, body.intent),
-  receiveLeg: 'B',
+  legs: body.legs.map((l) => simLeg(l.marketId, l.direction, l.size, body.intent)),
+  receiveLeg: body.legs.length === 2 ? 1 : 0,
   estSpreadApr: 0.04,
   worstSpreadApr: 0.035,
   costToCrossSize: 0.02,
   feeDragApr: 0.003,
   marginRequiredTotal: 8,
-  hedgedSize: body.size,
+  hedgedSize: body.legs[0].size,
   unhedgedSize: 0,
   collateral: 'ETH',
   collateralPriceUsd: 2500,
@@ -174,14 +184,14 @@ const rollGateBase = () => ({
   margin: { need: 5, availableBefore: 895, availableAfter: 900, shortfall: 0 } as BorosRollGate['margin'],
 });
 
-type Leg = { marketId: number; direction: 'long' | 'short'; slippageApr: number };
-type Step = { legA: Leg; legB: Leg; size: number };
+type Leg = { marketId: number; direction: 'long' | 'short'; slippageApr: number; size: number; clientOrderId?: string };
+type Step = { legs: Leg[] };
 type RollBody = {
   address: string;
   exit: Step;
   entry: Step;
   opposingAcknowledged?: boolean;
-  clientOrderIds: { exitA: string; exitB: string; entryA: string; entryB: string };
+  clientOrderIds: Record<string, string>;
 };
 type LegFailure = { code: string; message: string; cause?: 'this-leg' | 'batch' } | null;
 const legFill = (marketId: number, direction: string, filledSize: number, shortfallSize = 0, failure: LegFailure = null) => ({
@@ -193,19 +203,18 @@ const legFill = (marketId: number, direction: string, filledSize: number, shortf
   feeSize: filledSize > 0 ? 0.01 : null,
   failure,
 });
-type RollLegKey = 'exitA' | 'exitB' | 'entryA' | 'entryB';
-/** Build the four legs from a per-leg maker. */
-const legsOf = (body: RollBody, make: (key: RollLegKey, leg: Leg, size: number) => ReturnType<typeof legFill>) => ({
-  exitA: make('exitA', body.exit.legA, body.exit.size),
-  exitB: make('exitB', body.exit.legB, body.exit.size),
-  entryA: make('entryA', body.entry.legA, body.entry.size),
-  entryB: make('entryB', body.entry.legB, body.entry.size),
-});
+type RollLegKey = string;
+const legsOf = (body: RollBody, make: (key: RollLegKey, leg: Leg, size: number) => ReturnType<typeof legFill>) =>
+  Object.fromEntries(
+    (['exit', 'entry'] as const).flatMap((step) =>
+      body[step].legs.map((l) => [`${step}:${l.marketId}`, make(`${step}:${l.marketId}`, l, l.size)]),
+    ),
+  );
 const rolledResult = (body: RollBody) => ({
   status: 'rolled',
   legs: legsOf(body, (_k, leg, size) => legFill(leg.marketId, leg.direction, size)),
   reason: null,
-  rolledSize: body.exit.size,
+  rolledSize: body.exit.legs[0].size,
 });
 const refusedResult = (body: RollBody, named: RollLegKey, code: string, message: string) => ({
   status: 'refused',
@@ -232,7 +241,7 @@ const executeBody = (body: RollBody, result: unknown, replayed = false) =>
   });
 const okRoll = (body: RollBody) => HttpResponse.json(executeBody(body, rolledResult(body)));
 
-type PairSimBody = { intent: string; size: number; legA: Leg; legB: Leg };
+type PairSimBody = { intent: string; legs: Leg[] };
 
 function install(
   opts: {
@@ -244,6 +253,9 @@ function install(
     /** Held roll simulations wait on this before answering — for the
      * "confirm stays disabled until a fresh quote lands" case. */
     rollSimGate?: Promise<void>;
+    gasBalanceUsd?: number;
+    /** The old markets with resting orders the roll cancels. */
+    cancelOrdersOn?: number[];
   } = {},
 ) {
   let n = 0;
@@ -262,7 +274,7 @@ function install(
           gate: pairGate(),
           eligibility: { eligible: true, code: null, reason: null },
           simulatedAtMs: Date.now(),
-          gasBalanceUsd: 5,
+          gasBalanceUsd: opts.gasBalanceUsd ?? 5,
         }),
       );
     }),
@@ -275,8 +287,9 @@ function install(
           exit: { simulation: simulation({ ...body.exit, intent: 'close' }), gate: pairGate() },
           entry: { simulation: simulation({ ...body.entry, intent: 'open' }), gate: pairGate() },
           gate: opts.gate ? opts.gate() : rollGate(),
+          cancelOrdersOn: opts.cancelOrdersOn ?? [],
           simulatedAtMs: Date.now(),
-          gasBalanceUsd: 5,
+          gasBalanceUsd: opts.gasBalanceUsd ?? 5,
         }),
       );
     }),
@@ -307,6 +320,10 @@ beforeEach(() => {
   fitSize = undefined;
   deepSize = 60;
   bandApr = undefined;
+  spreadListed = false;
+  spreadCloseOnly = false;
+  otherCollateral = false;
+  hlNewCloseOnly = false;
 });
 
 describe('RollOverModal — the pick page', () => {
@@ -369,9 +386,9 @@ describe('RollOverModal — the pick page', () => {
     await user.click(within(dialog).getByRole('button', { name: '75%' }));
     await waitFor(() => {
       const last = pairSims.at(-1)!;
-      expect(last.size).toBe(75);
-      expect(last.legA.slippageApr).toBeCloseTo(0.0143, 9);
-      expect(last.legB.slippageApr).toBeCloseTo(0.0143, 9);
+      expect(last.legs[0].size).toBe(75);
+      expect(last.legs[0].slippageApr).toBeCloseTo(0.0143, 9);
+      expect(last.legs[1].slippageApr).toBeCloseTo(0.0143, 9);
     }, { timeout: 4_000 });
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
 
@@ -379,8 +396,8 @@ describe('RollOverModal — the pick page', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Roll over' }));
     await waitFor(() => {
       const last = rollSims.at(-1)!;
-      expect(last.exit.legA.slippageApr).toBeCloseTo(0.0143, 9);
-      expect(last.entry.legB.slippageApr).toBeCloseTo(0.0143, 9);
+      expect(last.exit.legs[0].slippageApr).toBeCloseTo(0.0143, 9);
+      expect(last.entry.legs[1].slippageApr).toBeCloseTo(0.0143, 9);
     }, { timeout: 4_000 });
   });
 
@@ -441,9 +458,90 @@ describe('RollOverModal — the pick page', () => {
     // These fixture markets report no deviation cap, so the seed is the 1%
     // fallback — which is NOT the context's 0.25% default.
     for (const s of sims) {
-      expect(s.legA.slippageApr).toBeCloseTo(0.01, 9);
-      expect(s.legB.slippageApr).toBeCloseTo(0.01, 9);
+      expect(s.legs[0].slippageApr).toBeCloseTo(0.01, 9);
+      expect(s.legs[1].slippageApr).toBeCloseTo(0.01, 9);
     }
+  });
+});
+
+describe('RollOverModal — spread target', () => {
+  it('spread target: the next maturity with a spread rolls into the one spread market', async () => {
+    spreadListed = true;
+    const user = userEvent.setup();
+    const entries: PairSimBody[] = [];
+    const sent: RollBody[] = [];
+    install({
+      onPairSimulate: (b) => {
+        if (b.intent === 'open') entries.push(b);
+      },
+      onRollExecute: (body) => {
+        sent.push(body);
+        return okRoll(body);
+      },
+    });
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(entries.length).toBeGreaterThan(0), { timeout: 4_000 });
+    expect(entries.at(-1)!.legs).toEqual([expect.objectContaining({ marketId: SPREAD_NEW, direction: 'short' })]);
+    expect((await within(dialog).findAllByText(/4\.00%/)).length).toBeGreaterThan(0);
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+    const confirm = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
+    await user.pointer({ keys: '[MouseLeft>]', target: confirm });
+    await waitFor(() => expect(sent).toHaveLength(1), { timeout: 4_000 });
+    expect(sent[0].entry.legs).toEqual([expect.objectContaining({ marketId: SPREAD_NEW, direction: 'short', size: 100 })]);
+    expect(sent[0].exit.legs).toHaveLength(2);
+    expect(Object.keys(sent[0].clientOrderIds)).toContain(`entry:${SPREAD_NEW}`);
+  });
+
+  it('a close-only single at the target maturity is no target: the window does not open on a market that takes no open', async () => {
+    hlNewCloseOnly = true;
+    const entries: PairSimBody[] = [];
+    install({
+      onPairSimulate: (b) => {
+        if (b.intent === 'open') entries.push(b);
+      },
+    });
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    expect(await within(dialog).findByText(/there is nothing to roll into yet/, undefined, { timeout: 4_000 })).toBeInTheDocument();
+    expect(entries).toEqual([]);
+    expect(within(dialog).getByRole('button', { name: 'Roll over' })).toBeDisabled();
+  });
+
+  it('a close-only spread at the target maturity counts as no spread: the roll goes into the two singles', async () => {
+    spreadListed = true;
+    spreadCloseOnly = true;
+    const entries: PairSimBody[] = [];
+    install({
+      onPairSimulate: (b) => {
+        if (b.intent === 'open') entries.push(b);
+      },
+    });
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    await screen.findByRole('dialog');
+    await waitFor(() => expect(entries.length).toBeGreaterThan(0), { timeout: 4_000 });
+    expect(entries.at(-1)!.legs.map((l) => l.marketId).sort()).toEqual([GATE_NEW, HL_NEW].sort());
+    expect(entries.some((b) => b.legs.some((l) => l.marketId === SPREAD_NEW))).toBe(false);
+  });
+});
+
+describe('RollOverModal — collateral', () => {
+  it('rolls into the held coin\'s market when the venue lists another collateral at the new maturity', async () => {
+    otherCollateral = true;
+    const entries: PairSimBody[] = [];
+    install({
+      onPairSimulate: (b) => {
+        if (b.intent === 'open') entries.push(b);
+      },
+    });
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    await screen.findByRole('dialog');
+    await waitFor(() => expect(entries.length).toBeGreaterThan(0), { timeout: 4_000 });
+    expect(entries.at(-1)!.legs.map((l) => l.marketId).sort()).toEqual([GATE_NEW, HL_NEW].sort());
+    expect(entries.some((b) => b.legs.some((l) => l.marketId === HL_NEW_USDT))).toBe(false);
   });
 });
 
@@ -457,17 +555,20 @@ describe('RollOverModal — the atomic roll', () => {
 
     const [body] = sent;
     // Closing reverses the held sides: Gate LONG is sold, Hyperliquid SHORT bought.
-    expect(body.exit.legA).toMatchObject({ marketId: GATE_OLD, direction: 'short' });
-    expect(body.exit.legB).toMatchObject({ marketId: HL_OLD, direction: 'long' });
-    // The re-entry takes the pair's own sides at the new maturity.
-    expect(body.entry.legA).toMatchObject({ marketId: GATE_NEW, direction: 'long' });
-    expect(body.entry.legB).toMatchObject({ marketId: HL_NEW, direction: 'short' });
-    expect(body.exit.size).toBe(100);
-    expect(body.entry.size).toBe(100);
+    expect(body.exit.legs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ marketId: GATE_OLD, direction: 'short', size: 100 }),
+        expect.objectContaining({ marketId: HL_OLD, direction: 'long', size: 100 }),
+      ]),
+    );
+    expect(body.entry.legs[0]).toMatchObject({ marketId: GATE_NEW, direction: 'long', size: 100 });
+    expect(body.entry.legs[1]).toMatchObject({ marketId: HL_NEW, direction: 'short', size: 100 });
 
-    const ids = [body.clientOrderIds.exitA, body.clientOrderIds.exitB, body.clientOrderIds.entryA, body.clientOrderIds.entryB];
-    expect(new Set(ids).size).toBe(4);
-    expect(ids.every(Boolean)).toBe(true);
+    expect(Object.keys(body.clientOrderIds).sort()).toEqual(
+      [`entry:${GATE_NEW}`, `entry:${HL_NEW}`, `exit:${GATE_OLD}`, `exit:${HL_OLD}`].sort(),
+    );
+    expect(new Set(Object.values(body.clientOrderIds)).size).toBe(4);
+    expect(Object.values(body.clientOrderIds).every(Boolean)).toBe(true);
 
     expect(await within(dialog).findByText(/Rolled 100 ETH/)).toBeInTheDocument();
     // No second send, and no alert on a clean roll.
@@ -482,7 +583,7 @@ describe('RollOverModal — the atomic roll', () => {
     install({
       onRollExecute: (body, n) => {
         sent.push(body);
-        if (n === 1) return HttpResponse.json(executeBody(body, refusedResult(body, 'entryA', 'insufficient-margin', 'not enough margin')));
+        if (n === 1) return HttpResponse.json(executeBody(body, refusedResult(body, `entry:${GATE_NEW}`, 'insufficient-margin', 'not enough margin')));
         return okRoll(body);
       },
     });
@@ -587,10 +688,10 @@ describe('RollOverModal — the review page', () => {
     await user.type(exitSlip, '1');
     await waitFor(() => {
       const last = sims.at(-1)!;
-      expect(last.exit.legA.slippageApr).toBeCloseTo(0.01, 9);
-      expect(last.exit.legB.slippageApr).toBeCloseTo(0.01, 9);
+      expect(last.exit.legs[0].slippageApr).toBeCloseTo(0.01, 9);
+      expect(last.exit.legs[1].slippageApr).toBeCloseTo(0.01, 9);
       // Untouched, so still on its seed (the 1% fallback for these markets).
-      expect(last.entry.legA.slippageApr).toBeCloseTo(0.01, 9);
+      expect(last.entry.legs[0].slippageApr).toBeCloseTo(0.01, 9);
     }, { timeout: 4_000 });
 
     await user.click(entryMax);
@@ -599,16 +700,66 @@ describe('RollOverModal — the review page', () => {
     await user.type(entrySlip, '2');
     await waitFor(() => {
       const last = sims.at(-1)!;
-      expect(last.entry.legA.slippageApr).toBeCloseTo(0.02, 9);
-      expect(last.entry.legB.slippageApr).toBeCloseTo(0.02, 9);
+      expect(last.entry.legs[0].slippageApr).toBeCloseTo(0.02, 9);
+      expect(last.entry.legs[1].slippageApr).toBeCloseTo(0.02, 9);
     }, { timeout: 4_000 });
 
     // The hold sends ONE roll, each batch at its own tolerance.
     await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
     await user.pointer({ keys: '[MouseLeft>]', target: confirm });
     await waitFor(() => expect(sent).toHaveLength(1), { timeout: 4_000 });
-    expect(sent[0].exit.legA.slippageApr).toBeCloseTo(0.01, 9);
-    expect(sent[0].entry.legB.slippageApr).toBeCloseTo(0.02, 9);
+    expect(sent[0].exit.legs[0].slippageApr).toBeCloseTo(0.01, 9);
+    expect(sent[0].entry.legs[1].slippageApr).toBeCloseTo(0.02, 9);
+  });
+
+  it('F-D: a new market that holds the other side asks for the tick, shows it, and sends it', async () => {
+    const user = userEvent.setup();
+    const sims: RollBody[] = [];
+    const sent: RollBody[] = [];
+    install({ onRollExecute: (body) => { sent.push(body); return okRoll(body); } });
+    // Another pair holds 0.004 the other way on the re-entry's first market:
+    // Boros nets the two, so the roll flips that position.
+    server.use(
+      http.post('/api/boros/roll/simulate', async ({ request }) => {
+        const body = (await request.json()) as RollBody;
+        sims.push(body);
+        const acked = body.opposingAcknowledged === true;
+        const entry = simulation({ ...body.entry, intent: 'open' });
+        const l0 = entry.legs[0];
+        const held = l0.direction === 'short' ? 0.004 : -0.004;
+        l0.sizing = { ...l0.sizing, currentSize: held, resultingSize: held + l0.sizing.deltaSize, opposing: true, flips: true };
+        return HttpResponse.json(
+          env({
+            exit: { simulation: simulation({ ...body.exit, intent: 'close' }), gate: pairGate() },
+            entry: { simulation: entry, gate: { ...pairGate(), requiresAcknowledgement: true, opposingLegs: [0] } },
+            gate: rollGate({
+              blockers: acked ? [] : [{ code: 'flip-unacknowledged', message: 'Re-entry: Tick the acknowledgement to confirm what happens to your existing position.' }],
+            }),
+            cancelOrdersOn: [],
+            simulatedAtMs: Date.now(),
+            gasBalanceUsd: 5,
+          }),
+        );
+      }),
+    );
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+
+    const box = await within(dialog).findByRole('checkbox');
+    expect(within(dialog).getByText(/I understand this closes my existing .* position of 0\.004 ETH, realising its PnL, and opens/)).toBeInTheDocument();
+    const confirm = within(dialog).getByRole('button', { name: 'Roll over' });
+    expect(confirm).toBeDisabled();
+    expect(sims.at(-1)!.opposingAcknowledged).toBe(false);
+
+    await user.click(box);
+    await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
+    expect(sims.at(-1)!.opposingAcknowledged).toBe(true);
+    await user.pointer({ keys: '[MouseLeft>]', target: confirm });
+    await waitFor(() => expect(sent).toHaveLength(1), { timeout: 4_000 });
+    expect(sent[0].opposingAcknowledged).toBe(true);
   });
 
   it('reads the margin, the warnings and the blockers straight from the roll gate', async () => {
@@ -709,10 +860,343 @@ describe('RollOverModal — the review page', () => {
     // Hyperliquid SHORT locked 8%, closed at 6% → gains the same. 0.0877 ETH
     // at $2,500 = $219.18, before the fees PairCosts lists.
     const label = await within(dialog).findByText(/Est\. total trade PnL/);
-    expect(within(dialog).getByText('+$219.18')).toBeInTheDocument();
+    expect(within(dialog).getByText('$219.18')).toBeInTheDocument();
     const title = label.getAttribute('title') ?? '';
     // One row per leg: "venue · locked → exec" on the left, its PnL on the right.
     expect(title).toMatch(/Gate · 4\.00% → 6\.00%\t\$109\.59/);
     expect(title).toMatch(/Hyperliquid · 8\.00% → 6\.00%\t\$109\.59/);
   });
+});
+
+/**
+ * Open-only: open the new maturity and LEAVE the old legs running. No close,
+ * so it is an ordinary pair OPEN over /boros/pair/execute — never the atomic
+ * /boros/roll/execute — and the review has no exit batch.
+ */
+describe('RollOverModal — open only (keep old legs)', () => {
+  type PairExecBody = {
+    address: string;
+    intent: string;
+    legs: Leg[];
+  };
+  const pairExecuteBody = (body: PairExecBody) =>
+    env({
+      result: {
+        legs: body.legs.map((l) => legFill(l.marketId, l.direction, l.size)),
+        allLegsSubmitted: true,
+        hedgedSize: body.legs[0].size,
+        unhedgedSize: 0,
+        unhedgedLeg: null,
+        realisedSpreadApr: 0.04,
+        partial: false,
+        filledNothing: false,
+      },
+      estimate: simulation({ ...body, intent: 'open' }),
+      warnings: [],
+      replayed: false,
+    });
+
+  it('sends a pair OPEN at the target market ids and size, not a roll, and shows no exit', async () => {
+    const user = userEvent.setup();
+    const opened: PairExecBody[] = [];
+    let rolls = 0;
+    install();
+    server.use(
+      http.post('/api/boros/pair/execute', async ({ request }) => {
+        const body = (await request.json()) as PairExecBody;
+        opened.push(body);
+        return HttpResponse.json(pairExecuteBody(body));
+      }),
+      http.post('/api/boros/roll/execute', () => {
+        rolls += 1;
+        return HttpResponse.json({ ok: false, error: { category: 'validation', message: 'should not roll', retryable: false } }, { status: 409 });
+      }),
+    );
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+
+    // Switch to open-only; the primary button renames accordingly.
+    await user.click(within(dialog).getByRole('button', { name: 'Open only (keep old legs)' }));
+    const next = await within(dialog).findByRole('button', { name: 'Open new maturity' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+
+    // The review has NO exit batch — just the new legs.
+    expect(within(dialog).queryByText('Exit')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Re-entry')).not.toBeInTheDocument();
+    expect(within(dialog).getByText(/Your perps hedge the new legs\. The .* legs stay open, with no perps/)).toBeInTheDocument();
+
+    const confirm = await within(dialog).findByRole('button', { name: 'Open new maturity' });
+    await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
+    await user.pointer({ keys: '[MouseLeft>]', target: confirm });
+    await waitFor(() => expect(opened).toHaveLength(1), { timeout: 4_000 });
+
+    const [body] = opened;
+    expect(body.intent).toBe('open');
+    // The new maturity's two markets, each taking the pair's own side.
+    expect(body.legs[0]).toMatchObject({ marketId: GATE_NEW, direction: 'long', size: 100 });
+    expect(body.legs[1]).toMatchObject({ marketId: HL_NEW, direction: 'short', size: 100 });
+    // Two distinct ids, kept for replay.
+    expect(body.legs[0].clientOrderId).toBeTruthy();
+    expect(body.legs[1].clientOrderId).toBeTruthy();
+    expect(body.legs[0].clientOrderId).not.toBe(body.legs[1].clientOrderId);
+    // Nothing was ever rolled.
+    expect(rolls).toBe(0);
+
+    expect(await within(dialog).findByText(/Opened 100 ETH/)).toBeInTheDocument();
+  });
+
+  it('prices the options without an exit: the cost is the opening fee alone', async () => {
+    // The old legs stay open, so no exit fee is paid and no exit PnL realised.
+    const user = userEvent.setup();
+    install();
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    const costRow = async (label: string) => (await within(dialog).findByText(label)).parentElement as HTMLElement;
+
+    // Close & reopen: the round trip, both fees and the exit PnL behind the ⓘ.
+    const roundTrip = await costRow('Rollover Cost');
+    await waitFor(() => expect(roundTrip.querySelector('[title]')?.getAttribute('title')).toMatch(/Exit PnL/));
+
+    await user.click(within(dialog).getByRole('button', { name: 'Open only (keep old legs)' }));
+    const opening = await costRow('Opening cost');
+    // 0.02 ETH to cross the entry books at $2,500: the opening fee, nothing else.
+    await waitFor(() => expect(opening).toHaveTextContent(/50\.00/));
+    const split = opening.querySelector('[title]')?.getAttribute('title') ?? '';
+    expect(split).toMatch(/^Opening fee\t.\$50\.00/);
+    expect(split).not.toMatch(/Exit fee|Exit PnL\t/);
+  });
+
+  it('offers no Retry after a partial fill — the same ids would only replay it', async () => {
+    const user = userEvent.setup();
+    let sends = 0;
+    install();
+    server.use(
+      http.post('/api/boros/pair/execute', async ({ request }) => {
+        sends += 1;
+        const body = (await request.json()) as PairExecBody;
+        const full = pairExecuteBody(body) as { data: { result: Record<string, unknown> } };
+        Object.assign(full.data.result, {
+          legs: [legFill(body.legs[0].marketId, body.legs[0].direction, 100), legFill(body.legs[1].marketId, body.legs[1].direction, 60)],
+          hedgedSize: 60,
+          unhedgedSize: 40,
+          unhedgedLeg: 0,
+          partial: true,
+        });
+        return HttpResponse.json(full);
+      }),
+    );
+    renderWithClient(<RollOverModal pair={pair} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Open only (keep old legs)' }));
+    const next = await within(dialog).findByRole('button', { name: 'Open new maturity' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+    const confirm = await within(dialog).findByRole('button', { name: 'Open new maturity' });
+    await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
+    await user.pointer({ keys: '[MouseLeft>]', target: confirm });
+
+    expect(await within(dialog).findByText(/the rest did not fill\. Open the rest from Fixed Rate Pairs\./)).toBeInTheDocument();
+    expect(within(dialog).queryByRole('button', { name: /Retry/ })).not.toBeInTheDocument();
+    expect(sends).toBe(1);
+  });
+});
+
+describe('RollOverModal — per-venue exposure', () => {
+  const SPREAD_OLD = 58;
+  const bookOf = (single: { gate: number; hl: number }, spread: number, kind?: 'spread' | 'singles') => {
+    const sized = (l: AssetBorosOpen, size: number): AssetBorosOpen => ({ ...l, sizeToken: size, notionalUsd: size * 2500 });
+    const g: AssetGroup = {
+      ...group,
+      perpOpen: [
+        { ...perp('GATE', 'LONG'), qty: single.gate + spread, notionalUsd: (single.gate + spread) * 2500 },
+        { ...perp('HYPERLIQUID', 'SHORT'), qty: single.hl + spread, notionalUsd: (single.hl + spread) * 2500 },
+      ],
+      borosOpen: [
+        sized(yu(GATE_OLD, 'GATE', 'LONG'), single.gate),
+        sized(yu(HL_OLD, 'HYPERLIQUID', 'SHORT'), single.hl),
+        ...(spread > 0
+          ? [{ ...sized(yu(SPREAD_OLD, 'HYPERLIQUID', 'SHORT'), spread), spreadVenues: ['HYPERLIQUID', 'GATE'] as [string, string] }]
+          : []),
+      ],
+    };
+    const pairs = deriveAsset(g, {}, 0, NOW).pairs;
+    return pairs.find((p) => p.kind === kind) ?? pairs[0];
+  };
+  const exposureOf = (legs: { marketId: number; size: number }[], sign: 1 | -1) => {
+    let gate = 0;
+    let hl = 0;
+    for (const l of legs) {
+      if (l.marketId === GATE_OLD || l.marketId === GATE_NEW) gate += sign * l.size;
+      else if (l.marketId === HL_OLD || l.marketId === HL_NEW) hl += sign * l.size;
+      else {
+        gate += sign * l.size;
+        hl += sign * l.size;
+      }
+    }
+    return { gate, hl };
+  };
+  const quoted = async (p: ReturnType<typeof bookOf>, share?: '50%') => {
+    const user = userEvent.setup();
+    const closes: PairSimBody[] = [];
+    const opens: PairSimBody[] = [];
+    install({ onPairSimulate: (b) => (b.intent === 'open' ? opens : closes).push(b) });
+    renderWithClient(<RollOverModal pair={p} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    if (share) {
+      await waitFor(() => expect(opens.length).toBeGreaterThan(0), { timeout: 4_000 });
+      await user.click(within(within(dialog).getByRole('group', { name: 'Share shortcuts' })).getByRole('button', { name: share }));
+    }
+    const size = Number((within(dialog).getByLabelText('Size to roll (ETH)') as HTMLInputElement).value);
+    await waitFor(
+      () => {
+        expect(closes.at(-1)?.legs[0].size).toBeLessThanOrEqual(size);
+        expect(opens.length).toBeGreaterThan(0);
+      },
+      { timeout: 4_000 },
+    );
+    await waitFor(() => expect(Math.max(...opens.at(-1)!.legs.map((l) => l.size))).toBe(size), { timeout: 4_000 });
+    return { exit: closes.at(-1)!.legs, entry: opens.at(-1)!.legs, size };
+  };
+  const held = (p: ReturnType<typeof bookOf>) =>
+    exposureOf(p.legs.filter((l) => l.kind === 'yu').map((l) => ({ marketId: l.marketId!, size: l.sizeToken })), 1);
+
+  /** Roll the default size, or a typed one; the sizes the execute sends, by market. */
+  const rollAt = async (p: ReturnType<typeof bookOf>, typed?: string) => {
+    const user = userEvent.setup();
+    const sent: RollBody[] = [];
+    install({ onRollExecute: (body) => { sent.push(body); return okRoll(body); } });
+    renderWithClient(<RollOverModal pair={p} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    if (typed !== undefined) {
+      const box = within(dialog).getByLabelText('Size to roll (ETH)');
+      await user.clear(box);
+      await user.type(box, typed);
+    }
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+    const confirm = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(confirm).not.toBeDisabled(), { timeout: 4_000 });
+    await user.pointer({ keys: '[MouseLeft>]', target: confirm });
+    await waitFor(() => expect(sent).toHaveLength(1), { timeout: 4_000 });
+    const sizes = (legs: Leg[]) => Object.fromEntries(legs.map((l) => [l.marketId, l.size]));
+    return { exit: sizes(sent[0].exit.legs), entry: sizes(sent[0].entry.legs) };
+  };
+
+  // A part fill leaves more decimals than the box shows (0.3598764 reads
+  // 0.359876); the whole roll must still move every wei, on each venue. A
+  // pair holds the smaller venue's size, so Hyperliquid's extra stays put.
+  for (const [label, gate, hl] of [
+    ['coin-sized', 0.3598764, 0.3598764],
+    ['dollar-sized', 1261.2500004, 1261.2500004],
+    ['uneven', 0.3598764, 0.5000004],
+  ] as const) {
+    it(`${label} hold: the default whole roll sends the pair's size exactly on each venue`, async () => {
+      const p = bookOf({ gate, hl }, 0);
+      const { exit, entry } = await rollAt(p);
+      expect(exit).toEqual({ [GATE_OLD]: gate, [HL_OLD]: gate });
+      expect(entry).toEqual({ [GATE_NEW]: gate, [HL_NEW]: gate });
+    });
+  }
+
+  it('a size typed as the held size to display precision rolls the whole', async () => {
+    const p = bookOf({ gate: 0.3598764, hl: 0.3598764 }, 0);
+    expect((await rollAt(p, '0.359876')).exit).toEqual({ [GATE_OLD]: 0.3598764, [HL_OLD]: 0.3598764 });
+  });
+
+  it('a smaller typed size still rolls part', async () => {
+    const p = bookOf({ gate: 0.3598764, hl: 0.3598764 }, 0);
+    const { exit, entry } = await rollAt(p, '0.35');
+    expect(exit).toEqual({ [GATE_OLD]: 0.35, [HL_OLD]: 0.35 });
+    expect(entry).toEqual({ [GATE_NEW]: 0.35, [HL_NEW]: 0.35 });
+  });
+
+  /** Open the review at the default size, or a typed one; its text. */
+  const reviewAt = async (p: ReturnType<typeof bookOf>, typed?: string, cancelOrdersOn = [GATE_OLD]) => {
+    const user = userEvent.setup();
+    install({ cancelOrdersOn });
+    renderWithClient(<RollOverModal pair={p} base="ETH" nowSec={NOW} onClose={() => {}} />);
+    const dialog = await screen.findByRole('dialog');
+    if (typed !== undefined) {
+      const box = within(dialog).getByLabelText('Size to roll (ETH)');
+      await user.clear(box);
+      await user.type(box, typed);
+    }
+    const next = await within(dialog).findByRole('button', { name: 'Roll over' });
+    await waitFor(() => expect(next).not.toBeDisabled(), { timeout: 4_000 });
+    await user.click(next);
+    await within(dialog).findByText('How it executes');
+    return dialog.textContent ?? '';
+  };
+
+  it('G10: a part roll says the kept part loses its orders too; a whole roll keeps the plain line', async () => {
+    const p = bookOf({ gate: 0.3598764, hl: 0.3598764 }, 0);
+    const part = await reviewAt(p, '0.2');
+    expect(part).toMatch(/Your orders on the \S+ markets are cancelled, also for the part you keep\. Place them again after the roll\./);
+    cleanup();
+    const whole = await reviewAt(p);
+    expect(whole).toMatch(/Resting orders on the \S+ markets are cancelled in the same batch\./);
+    expect(whole).not.toMatch(/also for the part you keep/);
+    cleanup();
+    // No resting order on the old markets: no cancel line at all.
+    const none = await reviewAt(p, '0.2', []);
+    expect(none).not.toMatch(/are cancelled/);
+  });
+
+  for (const [label, single, spread] of [
+    ['$50', 0.01, 0.01],
+    ['$6M', 1261.25, 1071.75],
+  ] as const) {
+    // A mixed book is two pairs (mozzarella 2026-10-14); each rolls on its own.
+    it(`mixed book at ${label}: the spread pair's whole roll closes the spread and opens the new one`, async () => {
+      spreadListed = true;
+      const p = bookOf({ gate: single, hl: single }, spread, 'spread');
+      expect(p.legs.filter((l) => l.kind === 'yu').map((l) => l.marketId)).toEqual([SPREAD_OLD]);
+      const { exit, entry } = await quoted(p);
+      expect(exit.map((l) => [l.marketId, l.size])).toEqual([[SPREAD_OLD, spread]]);
+      expect(entry).toEqual([expect.objectContaining({ marketId: SPREAD_NEW, direction: 'short', size: spread })]);
+    });
+
+    it(`mixed book at ${label}: the singles pair's whole roll closes both singles and opens one spread at the venue exposure`, async () => {
+      spreadListed = true;
+      const p = bookOf({ gate: single, hl: single }, spread, 'singles');
+      expect(p.legs.filter((l) => l.kind === 'yu')).toHaveLength(2);
+      const { exit, entry } = await quoted(p);
+      expect(exit.map((l) => [l.marketId, l.size])).toEqual([
+        [GATE_OLD, single],
+        [HL_OLD, single],
+      ].sort((a, b) => p.legs.findIndex((l) => l.marketId === a[0]) - p.legs.findIndex((l) => l.marketId === b[0])));
+      expect(entry).toEqual([expect.objectContaining({ marketId: SPREAD_NEW, direction: 'short', size: single })]);
+      const before = held(p);
+      const out = exposureOf(exit, -1);
+      const add = exposureOf(entry, 1);
+      expect(before.gate + out.gate + add.gate).toBe(before.gate);
+      expect(before.hl + out.hl + add.hl).toBe(before.hl);
+    });
+
+    it(`mixed book at ${label}: half a roll keeps each venue's exposure`, async () => {
+      spreadListed = true;
+      const p = bookOf({ gate: single, hl: single }, spread, 'singles');
+      const { exit, entry, size } = await quoted(p, '50%');
+      expect(entry).toEqual([expect.objectContaining({ marketId: SPREAD_NEW, size })]);
+      const before = held(p);
+      const out = exposureOf(exit, -1);
+      const add = exposureOf(entry, 1);
+      expect(Math.abs(before.gate + out.gate + add.gate - before.gate)).toBeLessThan(before.gate * 1e-12);
+      expect(Math.abs(before.hl + out.hl + add.hl - before.hl)).toBeLessThan(before.hl * 1e-12);
+    });
+
+    for (const share of [undefined, '50%'] as const) {
+      it(`plain pair at ${label}, ${share ?? 'whole'}: sends the same size on all four legs, as before`, async () => {
+        const eth = single + spread;
+        const { exit, entry, size } = await quoted(bookOf({ gate: eth, hl: eth }, 0), share);
+        expect(exit.map((l) => l.size)).toEqual([size, size]);
+        expect(entry.map((l) => [l.marketId, l.size])).toEqual([
+          [GATE_NEW, size],
+          [HL_NEW, size],
+        ]);
+      });
+    }
+  }
 });

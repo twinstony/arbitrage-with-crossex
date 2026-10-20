@@ -1,5 +1,8 @@
-/** Margin-account health math, shared by the web donuts AND the server's
- * notification formatter — one implementation so IM/MM can never drift. */
+/**
+ * Gate CrossEx margin as shares of the margin balance — the figures the
+ * Accounts tab and the header read. Shared by the web donuts AND the
+ * server's notification formatter — one implementation so IM/MM can never drift.
+ */
 import type { CrossexAccount } from '../api/types';
 
 export interface MarginParts {

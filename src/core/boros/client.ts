@@ -16,9 +16,11 @@
  */
 import { BOROS_NETWORK } from '../../../web/src/lib/borosNetwork';
 import { prettyVenue } from '../../../web/src/lib/fmt';
+import { spreadName, spreadPlatform } from '../../../web/src/lib/spread';
 import { CoreError } from '../errors';
 import { BOOK_VENUES } from '../estimate/books';
 import { borosInitialMarginUsd } from './opportunities';
+import { parseSpreadVenues } from './spread';
 import { normalizeVenue } from './venue';
 
 /** The api-gateway surface (`/apis` → api-gateway → open-api's `open-api-v2/…`
@@ -111,11 +113,12 @@ export interface BorosMarket {
   takerFeeRate: number;
   /**
    * The venue's own cap on how far a trade may move the rate, as an APR
-   * fraction: `config.maxRateDeviationFactorBase1e4 / 1e4 × markApr`.
+   * fraction: `factor / 1e4 × max(floor, |markApr|)`, the floor being the IM
+   * rate floor (pendle-core-v3 `MarketOrderAndOtc.sol:135`, the same on every
+   * market; the Boros app's `getMaxRateDeviation` matches it).
    *
    * The factor is a FRACTION OF THE MARK, not the deviation itself — 2500 on a
-   * 6.57% market is 0.25 × 0.0657 = 1.64% APR, which is what the venue UI shows
-   * as "max rate deviation". A close bound wider than this can never fill, so
+   * 12% market is 0.25 × 0.12 = 3% APR. A close bound wider than this can never fill, so
    * half of it is the natural default slippage.
    */
   maxRateDeviationApr: number;
@@ -151,6 +154,7 @@ export interface BorosMarket {
    * another bucket's).
    */
   isolatedOnly?: boolean;
+  spreadVenues: [string, string] | null;
 }
 
 /** Boros books are quoted in whole APR ticks of this size (apr = tick × 0.0001). */
@@ -176,6 +180,10 @@ export interface BorosMarketPosition {
   notionalSize: string;
   fixedApr: number | null;
   markApr: number;
+  /** The mark rate at which the venue liquidates this position, as it reports
+   * it (reflects the collateral actually in its bucket). norm18'd; null when
+   * the venue reports 0 or a non-finite value, or a legacy response omits it. */
+  liquidationApr?: number | null;
   pnl: {
     /** Cumulative funding settled for the CURRENT position — verified NET of
      * settlement fees (settlement = yieldReceived − yieldPaid − fee). */
@@ -189,6 +197,9 @@ export interface BorosMarketPosition {
    * as a fallback for the line above, and nothing breaks if a legacy response
    * omits it. */
   initialMargin?: string;
+  /** This position's maintenance margin (18-dec string); optional for a legacy
+   * response. Feeds the bucket health factor (equity / maintenance). */
+  maintMargin?: string;
   hasRestingOrders?: boolean;
 }
 
@@ -204,6 +215,10 @@ export interface BorosMarginGroup {
    * groups holding positions; optional here so a legacy/empty group degrades
    * to "unknown" instead of a guess. */
   marginRatio?: number;
+  /** Free collateral the venue reports for this bucket (18-dec string);
+   * optional for a legacy response, when callers fall back to
+   * netBalance − committed margin. */
+  availableInitialMargin?: string;
   marketPositions: BorosMarketPosition[];
 }
 
@@ -464,7 +479,7 @@ export async function fetchBorosMarkets(fetchImpl: FetchLike): Promise<BorosMark
     if (resumeToken === null || added.length === 0) break;
   }
   const nowSec = Date.now() / 1000;
-  return out.map((m) => normalizeBorosMarket(m, nowSec));
+  return out.filter((m) => !isUnreadableSpread(m)).map((m) => normalizeBorosMarket(m, nowSec));
 }
 
 /**
@@ -486,7 +501,38 @@ export async function fetchBorosMarket(fetchImpl: FetchLike, marketId: number): 
   return normalizeBorosMarket(found, Date.now() / 1000);
 }
 
+/**
+ * The same read for many ids: up to 100 ids a call, for 2 CU. Boros leaves
+ * out an id it does not serve (no 404), so the map simply lacks it.
+ */
+export async function fetchBorosMarketsByIds(
+  fetchImpl: FetchLike,
+  marketIds: readonly number[],
+): Promise<Map<number, BorosMarket>> {
+  const out = new Map<number, BorosMarket>();
+  for (let i = 0; i < marketIds.length; i += 100) {
+    const body = (await requestJson(
+      fetchImpl,
+      `${BOROS_GATEWAY_BASE_URL}/v1/markets/by-ids?marketIds=${marketIds.slice(i, i + 100).join(',')}`,
+    )) as { results?: Array<Record<string, unknown>> };
+    if (!Array.isArray(body?.results)) {
+      throw new CoreError('Boros /markets/by-ids: unexpected response shape (no results[])', 'network');
+    }
+    const nowSec = Date.now() / 1000;
+    for (const m of body.results) {
+      if (Number.isFinite(Number(m.marketId))) out.set(Number(m.marketId), normalizeBorosMarket(m, nowSec));
+    }
+  }
+  return out;
+}
+
 const MARKET_STATUS: Record<number, string> = { 0: 'Paused', 1: 'CloseOnly', 2: 'Normal' };
+
+function isUnreadableSpread(m: Record<string, unknown>): boolean {
+  const metadata = (m.metadata ?? {}) as Record<string, unknown>;
+  const platform = (m.platform ?? {}) as Record<string, unknown>;
+  return metadata.isSpreadMarket === true && parseSpreadVenues(true, String(platform.platformId ?? '')) === null;
+}
 
 function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): BorosMarket {
   const imData = (m.imData ?? {}) as Record<string, unknown>;
@@ -498,24 +544,42 @@ function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): Boros
     const platform = (m.platform ?? {}) as Record<string, unknown>;
     const platformId = String(platform.platformId ?? '');
     const venueKey = normalizeVenue(platformId);
+    const spreadVenues = parseSpreadVenues(metadata.isSpreadMarket === true, platformId);
+    const venue = BOOK_VENUES.has(venueKey) ? prettyVenue(venueKey) : platformId;
+    const base = String(metadata.underlyingSymbol ?? '');
+    const due = new Date(maturity * 1000);
     return {
       marketId: Number(m.marketId),
       tokenId: Number(m.tokenId),
-      name: String(imData.name ?? ''),
-      venue: BOOK_VENUES.has(venueKey) ? prettyVenue(venueKey) : platformId,
-      base: String(metadata.underlyingSymbol ?? ''),
+      name: spreadVenues
+        ? `${spreadName(base, spreadVenues)} ${due.getUTCDate()} ${due.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} ${due.getUTCFullYear()}`
+        : String(imData.name ?? ''),
+      venue: spreadVenues ? spreadPlatform(spreadVenues) : venue,
+      base,
       maturity,
       paymentPeriod: Number(extConfig.paymentPeriod ?? 0),
       settleFeeApr: norm18(extConfig.settleFeeRate as string),
       markApr: Number(data.markApr ?? 0),
       floatingApr: Number(data.floatingApr ?? 0),
-      midApr: Number(data.midApr ?? 0),
+      // A spread trades around 0, so its 0 is a real level (see knownRateOf);
+      // one with no mid falls back to its mark rather than to a false 0.
+      midApr: Number(data.midApr ?? (spreadVenues ? data.markApr : undefined) ?? 0),
       notionalOi: Number(data.notionalOI ?? 0),
       takerFeeRate: norm18(config.takerFee as string),
       maxRateDeviationApr:
-        (Number(config.maxRateDeviationFactorBase1e4 ?? 0) / 1e4) * Number(data.markApr ?? 0),
+        (Number(config.maxRateDeviationFactorBase1e4 ?? 0) / 1e4) *
+        Math.max(
+          1.00005 ** (Number(imData.iTickThresh ?? 0) * Number(imData.tickStep ?? 0)) - 1,
+          Math.abs(Number(data.markApr ?? 0)),
+        ),
+      // A spread Boros still lists as a dev test (isUiWhitelisted false, so not
+      // in the Boros app) takes no opens here either; a held one still closes.
       state:
-        maturity > 0 && maturity <= nowSec ? 'Matured' : (MARKET_STATUS[Number(config.status)] ?? 'Unknown'),
+        maturity > 0 && maturity <= nowSec
+          ? 'Matured'
+          : spreadVenues && metadata.isUiWhitelisted === false && Number(config.status) === 2
+            ? 'CloseOnly'
+            : (MARKET_STATUS[Number(config.status)] ?? 'Unknown'),
       assetMarkPriceUsd: Number(data.assetMarkPrice ?? 0),
       kIM: norm18(config.kIM as string),
       kMM: norm18(config.kMM as string),
@@ -523,6 +587,7 @@ function normalizeBorosMarket(m: Record<string, unknown>, nowSec: number): Boros
       imTickStep: Number(imData.tickStep ?? 0),
       tThreshSec: Number(config.tThresh ?? 0),
       isolatedOnly: imData.isIsolatedOnly === true,
+      spreadVenues,
   };
 }
 
@@ -658,12 +723,15 @@ export async function fetchBorosCollaterals(
     const side = toBig(p.signedSize) < 0n ? 1 : 0;
     const a = live.get(`${marketAcc.toLowerCase()}:${Number(p.marketId)}`) ?? {};
     const rate = Number(a.side ?? side) === side ? a.fixedApr : undefined;
+    const liq = norm18(p.liquidationApr as string);
     return {
       marketId: Number(p.marketId),
       side,
       notionalSize: String(p.signedSize ?? '0'),
       fixedApr: typeof rate === 'number' && Number.isFinite(rate) ? rate : null,
       markApr: marketById.get(Number(p.marketId))?.markApr ?? 0,
+      liquidationApr: liq !== 0 ? liq : null,
+      maintMargin: p.maintMargin as string | undefined,
       pnl: {
         rateSettlementPnl: String(a.settlementPnl ?? '0'),
         unrealisedPnl: String(a.unrealisedPnl ?? '0'),
@@ -700,6 +768,7 @@ export async function fetchBorosCollaterals(
       marketAcc,
       netBalance: String(r.netBalance ?? '0'),
       initialMargin: r.initialMargin as string | undefined,
+      availableInitialMargin: r.availableInitialMargin as string | undefined,
       marketPositions: Array.isArray(r.positions)
         ? (r.positions as Array<Record<string, unknown>>).map((p) =>
             toPosition(String(r.marketAcc ?? ''), p),
@@ -873,7 +942,8 @@ export function resolveCollateralPricesUsd(markets: BorosMarket[]): Map<number, 
       prices.set(tokenId, 1);
       continue;
     }
-    const ref = markets.find((m) => m.base === symbol && m.assetMarkPriceUsd > 0);
+    const priced = markets.filter((m) => m.base === symbol && m.assetMarkPriceUsd > 0);
+    const ref = priced.find((m) => m.spreadVenues === null) ?? priced[0];
     prices.set(tokenId, ref ? ref.assetMarkPriceUsd : null);
   }
   return prices;

@@ -35,20 +35,37 @@ import type { AssetGroup, AssetViewResponse, CrossexAccount } from '../../web/sr
 import { readTelegramConfig } from '../../src/server/notify/telegram';
 
 function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
-  const leg = (venue: string, execApr: number | null, midApr: number, marketId: number, settleFeeApr = 0.001) => ({
-    marketId,
+  const perpLeg = (venue: string) => ({
     venue,
     crossexVenue: venue,
     crossexSymbol: `${venue}_BTCUSDT`,
     base: 'BTC',
+  });
+  const borosLeg = (
+    venue: string,
+    side: 'SHORT' | 'LONG',
+    execApr: number | null,
+    midApr: number,
+    marketId: number,
+    settleFeeApr = 0.001,
+  ) => ({
+    marketId,
+    side,
+    venue,
+    spreadVenues: null,
     midApr,
     execApr,
     settleFeeApr,
+    takerFeeRate: 0.0005,
   });
   return {
     base: 'BTC',
-    shortLeg: leg('BINANCE', 0.082, 0.081, 1, 0.001),
-    longLeg: leg('BYBIT', 0.031, 0.032, 2, 0.001),
+    shortLeg: perpLeg('BINANCE'),
+    longLeg: perpLeg('BYBIT'),
+    borosLegs: [
+      borosLeg('BINANCE', 'SHORT', 0.082, 0.081, 1, 0.001),
+      borosLeg('BYBIT', 'LONG', 0.031, 0.032, 2, 0.001),
+    ],
     grossSpreadApr: 0.049,
     execSpreadApr: 0.051,
     borosImpactApr: -0.002,
@@ -64,8 +81,10 @@ function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
       annualizedApr: 0.0159,
     },
     capital: {
-      borosShortImUsd: 500,
-      borosLongImUsd: 500,
+      borosIms: [
+        { marketId: 1, imUsd: 500 },
+        { marketId: 2, imUsd: 500 },
+      ],
       perpShortImUsd: 1000,
       perpLongImUsd: 1000,
       shortLeverageMax: 10,
@@ -88,11 +107,14 @@ function makeGroup(pairs: number[], over: Partial<OpportunityGroup> = {}): Oppor
   groupSeq += 1;
   const built = pairs.map((apr) => {
     marketSeq += 2;
-    return makePair({
-      netFixedAprOnCapital: apr,
-      shortLeg: { ...(apr === null ? makePair().shortLeg : makePair().shortLeg), marketId: marketSeq },
-      longLeg: { ...makePair().longLeg, marketId: marketSeq + 1 },
-    });
+    const basePair = makePair({ netFixedAprOnCapital: apr });
+    return {
+      ...basePair,
+      borosLegs: basePair.borosLegs.map((b) => ({
+        ...b,
+        marketId: b.side === 'SHORT' ? marketSeq : marketSeq + 1,
+      })),
+    };
   });
   return {
     tokenId: groupSeq,
@@ -211,7 +233,9 @@ describe('rankPairs — the panel pairing, viability and ordering', () => {
     const [g] = makeResult([makeGroup([0.1, 0.2])]).groups;
     const [p1, p2] = g.pairs;
     expect(pairKey(g, p1)).not.toBe(pairKey(g, p2));
-    expect(pairKey(g, p1)).toBe(`${g.tokenId}:${g.maturity}:${p1.shortLeg.marketId}:${p1.longLeg.marketId}`);
+    expect(pairKey(g, p1)).toBe(
+      `${g.tokenId}:${g.maturity}:${p1.borosLegs.find((l) => l.side === 'SHORT')?.marketId}:${p1.borosLegs.find((l) => l.side === 'LONG')?.marketId}`,
+    );
   });
 });
 
@@ -409,6 +433,7 @@ function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
       {
         marketId: 201,
         venue: 'HYPERLIQUID',
+        spreadVenues: null,
         maturity,
         collateral: 'USDT',
         side: 'SHORT',
@@ -425,6 +450,7 @@ function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
       {
         marketId: 205,
         venue: 'GATE',
+        spreadVenues: null,
         maturity,
         collateral: 'USDT',
         side: 'LONG',
@@ -443,6 +469,7 @@ function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
       {
         marketId: 201,
         venue: 'HYPERLIQUID',
+        spreadVenues: null,
         maturity,
         settleUsd: 120,
         settleFeeUsd: 12,
@@ -455,6 +482,7 @@ function makeAssetGroup(over: Partial<AssetGroup> = {}): AssetGroup {
       {
         marketId: 205,
         venue: 'GATE',
+        spreadVenues: null,
         maturity,
         settleUsd: -20,
         settleFeeUsd: 2,

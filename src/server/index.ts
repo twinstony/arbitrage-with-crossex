@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
 import fastifyStatic from '@fastify/static';
-import { fetchBorosMarkets, resolveBorosFetch, setClientTagContext } from '../core/boros/client';
+import { fetchBorosMarkets, resolveBorosFetch, resolveCollateralPricesUsd, setClientTagContext } from '../core/boros/client';
 import { makeClientsIfConfigured, requireClients, type Clients } from '../core/clients';
 import { Store } from '../engine/db';
 import { startLoop, type LoopDeps } from '../engine/loop';
@@ -18,7 +18,7 @@ import { gateVenue } from '../engine/venueGate';
 import type { Clock, VenuePort } from '../engine/types';
 import { buildApp } from './app';
 import { readBorosAgentConfig } from './borosAgent';
-import { makeBorosApiOrderClient, USD_TOKEN_ID } from '../core/boros/borosApi';
+import { makeBorosApiOrderClient } from '../core/boros/borosApi';
 import type { BorosOrderClient } from '../core/boros/orders';
 import { TtlCache, TTL } from './cache';
 import { readOrCreateApiToken } from './authToken';
@@ -34,7 +34,7 @@ import { createTelegramLink } from './telegram/link';
 import { TelegramStatus } from './telegram/status';
 import { createRollProbe } from './telegram/rollProbe';
 import { createTelegramSync, readTriggerCoins } from './telegram/sync';
-import { createAssetViewBuilder } from './routes/assetView';
+import { assetViewBuilderFor } from './routes/assetView';
 import { configuredRoot, createPairPricer } from './routes/borosPair';
 import { readInstallInfo, readLocalVersion } from './version';
 
@@ -171,12 +171,13 @@ try {
         return value.find((m) => m.marketId === marketId)?.tokenId;
       },
       // Same cached read, so an order that has to top its own gas up costs no
-      // extra upstream traffic.
-      usdMarketId: async () => {
+      // extra upstream traffic. The top-up is paid in the traded market's own
+      // collateral, so its dollars are converted at that token's price.
+      collateralPriceUsd: async (tokenId) => {
         const { value } = await cache.get('boros:markets', TTL.boros, () =>
           fetchBorosMarkets(resolveBorosFetch()),
         );
-        return value.find((m) => m.tokenId === USD_TOKEN_ID)?.marketId;
+        return resolveCollateralPricesUsd(value).get(tokenId) ?? null;
       },
     });
     console.log(
@@ -194,7 +195,6 @@ const telegramBot = createBotClient({
   wallet: configuredRoot,
 });
 const telegramStatus = new TelegramStatus();
-let assetViewBuilder: ReturnType<typeof createAssetViewBuilder> | null = null;
 let pairPricer: ReturnType<typeof createPairPricer> | null = null;
 const telegramSync = createTelegramSync({
   dataDir,
@@ -203,7 +203,7 @@ const telegramSync = createTelegramSync({
   readCoins: () => readTriggerCoins({ cache, getClients }),
   probeRolls: createRollProbe({
     borosAddress: configuredRoot,
-    buildAssetView: (params) => (assetViewBuilder ??= createAssetViewBuilder(appDeps))(params),
+    buildAssetView: (params) => assetViewBuilderFor(appDeps)(params),
     loadMarkets: (fresh) => (pairPricer ??= createPairPricer(appDeps)).loadMarkets(fresh),
     price: (body, fresh) => (pairPricer ??= createPairPricer(appDeps)).priceRequest(body, fresh),
     now: Date.now,

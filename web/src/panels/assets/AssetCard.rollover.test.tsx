@@ -1,8 +1,8 @@
 /**
  * The roll-over path through the asset card: a pair whose rate legs mature
  * inside the roll window (EXPIRY_WARN_SEC) is counted once in the banner, flagged on its
- * card in the 4 Leg Pairs tab, and offered a Roll over button that opens
- * the popup. A pair outside the window gets none of it.
+ * card in the Pairs tab, and offered a Roll over button that opens
+ * the popup. A pair outside the window keeps only the button, un-nudged.
  */
 import { cleanup, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -33,6 +33,7 @@ const perp = (o: Partial<AssetPerpOpen> & { venue: string; side: 'LONG' | 'SHORT
 });
 
 const yu = (o: Partial<AssetBorosOpen> & { marketId: number; venue: string; side: 'LONG' | 'SHORT'; sizeToken: number; maturity: number }): AssetBorosOpen => ({
+  spreadVenues: null,
   collateral: 'ETH',
   notionalUsd: o.sizeToken * 2500,
   entryApr: 0.08,
@@ -110,8 +111,8 @@ describe('AssetCard — roll over', () => {
       scrolled.push(this);
     };
     renderCard(book(8));
-    await userEvent.click(await screen.findByRole('button', { name: /pair can roll over/ }));
-    const panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    await userEvent.click(await screen.findByRole('button', { name: /pair due to roll/ }));
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     // The pair's card is what lands at the top of the viewport.
     expect(scrolled).toHaveLength(1);
     expect(scrolled[0]).toContainElement(within(panel).getByRole('button', { name: /Gate LONG \/ Hyperliquid SHORT/ }));
@@ -120,7 +121,7 @@ describe('AssetCard — roll over', () => {
     await userEvent.click(within(panel).getByRole('button', { name: /Gate LONG \/ Hyperliquid SHORT/ }));
     expect(within(panel).queryByRole('button', { name: 'Roll over' })).not.toBeInTheDocument();
     // The banner must show it again, not leave the fold as the user left it.
-    await userEvent.click(screen.getByRole('button', { name: /pair can roll over/ }));
+    await userEvent.click(screen.getByRole('button', { name: /pair due to roll/ }));
     expect(within(panel).getByRole('button', { name: 'Roll over' })).toBeInTheDocument();
   });
 
@@ -128,17 +129,17 @@ describe('AssetCard — roll over', () => {
     renderCard(book(8));
     // The banner counts pairs and sends the trader to the pairs tab — which
     // is the tab a card opens on (his call 2026-09-20), so leave it first.
-    const banner = await screen.findByRole('button', { name: /^1 pair can roll over/ });
-    expect(screen.getByRole('tab', { name: /4 Leg Pairs/ })).toHaveAttribute('aria-selected', 'true');
+    const banner = await screen.findByRole('button', { name: /^1 pair due to roll/ });
+    expect(screen.getByRole('tab', { name: /^Fixed Rate Pairs/ })).toHaveAttribute('aria-selected', 'true');
     await userEvent.click(screen.getByRole('tab', { name: /Funding Bundles/ }));
     expect(screen.getByRole('tab', { name: /Funding Bundles/ })).toHaveAttribute('aria-selected', 'true');
     await userEvent.click(banner);
-    expect(screen.getByRole('tab', { name: /4 Leg Pairs/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: /^Fixed Rate Pairs/ })).toHaveAttribute('aria-selected', 'true');
 
     // The summary row carries the FLAG; the action lives in the expansion —
     // and a rollable pair opens EXPANDED, so the action is already on
     // screen (his call 2026-09-18). No click on the row: that would fold it.
-    const panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     expect(within(panel).getByText('ready to roll')).toBeInTheDocument();
     await userEvent.click(within(panel).getByRole('button', { name: 'Roll over' }));
 
@@ -157,7 +158,7 @@ describe('AssetCard — roll over', () => {
 
   it('the banner is quiet between 10 and 7 days out, loud a week from settlement', async () => {
     renderCard(book(8));
-    const quiet = (await screen.findByRole('button', { name: /pair can roll over/ })).closest('[data-tone]')!;
+    const quiet = (await screen.findByRole('button', { name: /pair due to roll/ })).closest('[data-tone]')!;
     expect(quiet).toHaveAttribute('data-tone', 'quiet');
     expect(within(quiet as HTMLElement).queryByText(/matures in/)).not.toBeInTheDocument();
     cleanup();
@@ -168,7 +169,7 @@ describe('AssetCard — roll over', () => {
     const loud = loudBtn.closest('[data-tone]')! as HTMLElement;
     expect(loud).toHaveAttribute('data-tone', 'loud');
     expect(within(loud).getByText(/Gate \/ Hyperliquid matures in 5d/)).toBeInTheDocument();
-    expect(within(loud).queryByText(/can roll over/)).not.toBeInTheDocument();
+    expect(within(loud).queryByText(/due to roll/)).not.toBeInTheDocument();
   });
 
   it('the guide pill explains the roll, the fee saving and when to do it', async () => {
@@ -249,7 +250,8 @@ describe('AssetCard — roll over', () => {
         }),
       ),
       http.post('/api/boros/pair/simulate', async ({ request }) => {
-        const body = (await request.json()) as { size: number; intent: string; legA: { marketId: number; direction: 'long' | 'short'; slippageApr: number }; legB: { marketId: number; direction: 'long' | 'short' } };
+        const req = (await request.json()) as { intent: string; legs: { marketId: number; direction: 'long' | 'short'; slippageApr: number; size: number }[] };
+        const body = { intent: req.intent, size: req.legs[0].size, legA: req.legs[0], legs: req.legs };
         sims.push(body);
         // A leg that opens from flat: the roll is charged its whole margin.
         const leg = (marketId: number, direction: 'long' | 'short') => ({
@@ -274,9 +276,8 @@ describe('AssetCard — roll over', () => {
           ok: true,
           data: {
             simulation: {
-              legA: leg(body.legA.marketId, body.legA.direction),
-              legB: leg(body.legB.marketId, body.legB.direction),
-              receiveLeg: 'B',
+              legs: body.legs.map((l) => leg(l.marketId, l.direction)),
+              receiveLeg: 1,
               // 50% on notional: 20 ETH × $2,500 × 0.5 = $25k a year over
               // $10k of perp margin (a fifth of $50k) + 2 ETH of new Boros
               // margin ($5k) — 166.67% on capital, far above the row's rate.
@@ -303,7 +304,7 @@ describe('AssetCard — roll over', () => {
     localStorage.setItem('crossex.strategy.v1', JSON.stringify({ address: '0x1111111111111111111111111111111111111111' }));
     renderCard(book(8));
 
-    const panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     // A generous wait: the context and the probe are two round trips, and the
     // full suite runs this file under load.
     expect(await within(panel).findByText('roll opportunity', undefined, { timeout: 10_000 })).toBeInTheDocument();
@@ -342,31 +343,85 @@ describe('AssetCard — roll over', () => {
     expect(headline.textContent).toBe(`${promised.textContent}fixed`);
   }, 20_000);
 
+  it('a pair with no rate (under $100) sends no roll probe: there is nothing to compare it with', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const row = (marketId: number, venue: string, maturity: number) => ({
+      marketId,
+      name: `${venue} ETH`,
+      venue,
+      base: 'ETH',
+      tokenId: 3,
+      collateral: 'ETH',
+      maturity,
+      midApr: 0.06,
+      markApr: 0.06,
+      maxRateDeviationApr: 0.02,
+      isolatedOnly: false,
+      onIsolatedMargin: false,
+      isolatedHasPositionOrOrders: false,
+      currentSize: 0,
+      collateralPriceUsd: 2500,
+    });
+    let contextServed = false;
+    let sims = 0;
+    server.use(
+      http.get('/api/boros/pair/context', () => {
+        contextServed = true;
+        return HttpResponse.json({
+          ok: true,
+          data: {
+            markets: [row(1, 'Gate', now + 8 * DAY), row(2, 'Hyperliquid', now + 8 * DAY), row(11, 'Gate', now + 45 * DAY), row(12, 'Hyperliquid', now + 45 * DAY)],
+            crossByToken: [],
+            isolatedByMarket: [],
+            defaultSlippageApr: 0.0025,
+            maxSlippageApr: 0.1,
+          },
+        });
+      }),
+      http.post('/api/boros/pair/simulate', () => {
+        sims += 1;
+        return HttpResponse.json({ ok: false, error: { message: 'not expected' } }, { status: 500 });
+      }),
+    );
+    localStorage.setItem('crossex.strategy.v1', JSON.stringify({ address: '0x1111111111111111111111111111111111111111' }));
+    // 0.01 ETH a leg: about $25 of notional, under the $100 the rate needs.
+    const tiny = book(8);
+    tiny.perpOpen = [perp({ venue: 'GATE', side: 'LONG', qty: 0.01 }), perp({ venue: 'HYPERLIQUID', side: 'SHORT', qty: 0.01 })];
+    tiny.borosOpen = tiny.borosOpen.map((l) => ({ ...l, sizeToken: 0.01, notionalUsd: 25, imUsd: 1 }));
+    renderCard(tiny);
+
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
+    expect(await within(panel).findByText('ready to roll')).toBeInTheDocument();
+    await waitFor(() => expect(contextServed).toBe(true));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(sims).toBe(0);
+  });
+
   it('offsetting perps with no rate legs are ONE pair with its Boros side missing, not loose legs', () => {
     // The book after a missed roll: both perps still on, both rate legs gone.
     const g = { ...book(8), borosOpen: [] };
     renderCard(g);
-    const panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     const row = within(panel).getByRole('button', { name: /Gate LONG \/ Hyperliquid SHORT Boros legs missing/ });
     expect(row).toHaveAttribute('aria-expanded', 'true');
     // Both gaps are named, each with its own action, plus the one for both.
-    expect(within(panel).getAllByText('missing')).toHaveLength(2);
+    expect(within(panel).getAllByText('missing 100 ETH')).toHaveLength(2);
     expect(within(panel).getAllByRole('button', { name: 'Open leg' })).toHaveLength(2);
     expect(within(panel).getByRole('button', { name: 'Open both Boros legs' })).toBeInTheDocument();
     // … and the other way out: stop farming it.
     expect(within(panel).getByRole('button', { name: 'Close perps' })).toBeEnabled();
     // Nothing is left over, so there is no "Ungrouped legs" card at all.
     expect(within(panel).queryByText('Ungrouped legs')).not.toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /4 Leg Pairs/ })).toHaveTextContent('1');
+    expect(screen.getByRole('tab', { name: /^Fixed Rate Pairs/ })).toHaveTextContent('1');
   });
 
   it('with ONE rate leg still on, only the other side is missing — and only it can be opened', () => {
     const base = book(8);
     const g = { ...base, borosOpen: base.borosOpen.filter((l) => l.venue === 'GATE') };
     renderCard(g);
-    const panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     expect(within(panel).getByRole('button', { name: /Gate LONG \/ Hyperliquid SHORT Boros leg missing/ })).toBeInTheDocument();
-    expect(within(panel).getAllByText('missing')).toHaveLength(1);
+    expect(within(panel).getAllByText('missing 100 ETH')).toHaveLength(1);
     expect(within(panel).getAllByRole('button', { name: 'Open leg' })).toHaveLength(1);
     expect(within(panel).queryByRole('button', { name: 'Open both Boros legs' })).not.toBeInTheDocument();
     expect(within(panel).getByRole('button', { name: 'Close perps' })).toBeEnabled();
@@ -376,7 +431,7 @@ describe('AssetCard — roll over', () => {
     const base = book(8);
     // One perp with nothing opposite it: no pair to form, so it stays loose.
     renderCard({ ...base, perpOpen: base.perpOpen.filter((p) => p.venue === 'GATE'), borosOpen: [] });
-    let panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    let panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     expect(within(panel).getByText('Ungrouped legs')).toBeInTheDocument();
     expect(within(panel).getByText('1 perp')).toBeInTheDocument();
     expect(within(panel).queryByText(/Boros legs? missing/)).not.toBeInTheDocument();
@@ -384,16 +439,29 @@ describe('AssetCard — roll over', () => {
 
     // One rate leg with no perps at all behind it.
     renderCard({ ...base, perpOpen: [], borosOpen: base.borosOpen.filter((l) => l.venue === 'GATE') });
-    panel = screen.getByRole('tabpanel', { name: /4 Leg Pairs/ });
+    panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
     expect(within(panel).getByText('Ungrouped legs')).toBeInTheDocument();
     expect(within(panel).getByText('1 YU')).toBeInTheDocument();
     expect(within(panel).queryByText(/Boros legs? missing/)).not.toBeInTheDocument();
   });
 
-  it('a pair maturing in 40 days: no banner, no flag, no button', () => {
+  it('a pair maturing in 40 days: no banner, no flag, a folded card — and a plain Roll over button inside it', async () => {
     renderCard(book(40));
-    expect(screen.queryByText(/can roll over|Roll over now/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/due to roll|Roll over now/)).not.toBeInTheDocument();
     expect(screen.queryByText('ready to roll')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Roll over' })).not.toBeInTheDocument();
+    // Nothing reminds outside the window: the card stays folded.
+    const panel = screen.getByRole('tabpanel', { name: /^Fixed Rate Pairs/ });
+    expect(within(panel).queryByRole('button', { name: 'Roll over' })).not.toBeInTheDocument();
+
+    // The roll itself is the trader's at any time (his call 2026-09-30):
+    // unfold the pair and the action is there, without the nudge.
+    await userEvent.click(within(panel).getByRole('button', { name: /Gate LONG \/ Hyperliquid SHORT/ }));
+    const roll = within(panel).getByRole('button', { name: 'Roll over' });
+    expect(roll).not.toHaveClass('roll-nudge');
+    await userEvent.click(roll);
+    expect(within(screen.getByRole('dialog')).getByRole('heading', { name: 'Roll over — Gate / Hyperliquid' })).toBeInTheDocument();
+    // Opening it by hand raises no banner and no flag.
+    expect(screen.queryByText(/due to roll|Roll over now/)).not.toBeInTheDocument();
+    expect(screen.queryByText('ready to roll')).not.toBeInTheDocument();
   });
 });

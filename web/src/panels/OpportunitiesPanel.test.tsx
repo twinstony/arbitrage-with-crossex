@@ -3,12 +3,15 @@
  * cohort lives in test/fixtures; degraded variants are spelled per case. */
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
-import type { OpportunityLeg, OpportunityPair, SymbolRule } from '../api/types';
+import { http, HttpResponse } from 'msw';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { OpportunityLeg, OpportunityPair, Rebate, SymbolRule } from '../api/types';
 import {
+  agentStatus,
   baseHandlers,
   ETH_GATE,
   makeOpportunitiesResult,
+  makeOpportunityBorosLeg,
   makeOpportunityGroup,
   makeOpportunityLeg,
   makeOpportunityMarketRow,
@@ -18,7 +21,8 @@ import {
   OPP_NT,
   symbolHandlers,
 } from '../test/fixtures';
-import { server } from '../test/server';
+import { env, server } from '../test/server';
+import { STRATEGY_STORAGE_KEY } from './HomeControls';
 import { renderWithClient } from '../test/utils';
 import { useTradeFlow } from '../trade/TradeFlow';
 import { OPPORTUNITIES_STORAGE_KEY, OpportunitiesPanel } from './OpportunitiesPanel';
@@ -71,23 +75,21 @@ const ROLL_PROFIT = rollPair().estProfitUsd as number;
 function nullBtcGroup() {
   const legs = {
     shortLeg: makeOpportunityLeg({
-      marketId: 201,
       venue: 'BYBIT',
       crossexVenue: 'BYBIT',
       crossexSymbol: 'BYBIT_FUTURE_BTC_USDT',
       base: 'BTC',
-      midApr: 0.06,
-      execApr: null,
     }),
     longLeg: makeOpportunityLeg({
-      marketId: 202,
       venue: 'GATE',
       crossexVenue: 'GATE',
       crossexSymbol: 'GATE_FUTURE_BTC_USDT',
       base: 'BTC',
-      midApr: 0.03,
-      execApr: null,
     }),
+    borosLegs: [
+      makeOpportunityBorosLeg({ marketId: 201, venue: 'BYBIT', midApr: 0.06, execApr: null }),
+      makeOpportunityBorosLeg({ marketId: 202, side: 'LONG', venue: 'GATE', midApr: 0.03, execApr: null }),
+    ],
   };
   return makeOpportunityGroup({
     tokenId: 4,
@@ -138,8 +140,10 @@ function nullBtcGroup() {
           annualizedApr: null,
         },
         capital: {
-          borosShortImUsd: 6,
-          borosLongImUsd: 3,
+          borosIms: [
+            { marketId: 201, imUsd: 6 },
+            { marketId: 202, imUsd: 3 },
+          ],
           perpShortImUsd: null,
           perpLongImUsd: null,
           shortLeverageMax: null,
@@ -228,7 +232,6 @@ describe('OpportunitiesPanel — ranking and null tolerance', () => {
             crossexSymbol: '',
           }),
           longLeg: makeOpportunityLeg({
-            marketId: 102,
             venue: 'BINANCE',
             crossexVenue: 'BINANCE',
             crossexSymbol: '',
@@ -728,6 +731,26 @@ describe('OpportunitiesPanel — the assumptions strip', () => {
     );
   });
 
+  it('turns a double-click on the preset amount into an editable custom size', async () => {
+    const urls: string[] = [];
+    server.use(opportunitiesHandler(makeOpportunitiesResult(), { urls }));
+    renderWithClient(<OpportunitiesPanel />);
+
+    await waitFor(() => expect(urls).toHaveLength(1));
+    await userEvent.click(screen.getByRole('radio', { name: '$100k' }));
+    await userEvent.dblClick(screen.getByText('100,000'));
+
+    // Custom starts from the amount on screen, focused and selected, so typing replaces it.
+    expect(screen.getByRole('radio', { name: /^Custom/ })).toHaveAttribute('aria-checked', 'true');
+    const size = screen.getByLabelText('Custom notional (USD)');
+    expect(size).toHaveValue('100000');
+    expect(size).toHaveFocus();
+    await userEvent.keyboard('25000');
+    await waitFor(() => expect(paramsOf(urls.at(-1)!)).toMatchObject({ notionalUsd: '25000' }), {
+      timeout: 4000,
+    });
+  });
+
   it('keeps the last valid size while the input is unusable', async () => {
     const urls: string[] = [];
     server.use(opportunitiesHandler(makeOpportunitiesResult(), { urls }));
@@ -937,10 +960,9 @@ const quoteOf = (venue: string) => (venue === 'HYPERLIQUID' ? 'USDC' : 'USDT');
  * and the symbol all name the same exchange and the same coin. Renaming only
  * `venue` decouples the field the venue facet keys on from the one Execute
  * keys on, which hides exactly the regressions these fixtures exist to catch. */
-function venueLeg(side: 'short' | 'long', venue: string, base: string): OpportunityLeg {
+function venueLeg(venue: string, base: string): OpportunityLeg {
   return {
     ...makeOpportunityLeg(),
-    marketId: marketIdFor(side, venue, base),
     venue,
     crossexVenue: venue,
     crossexSymbol: `${venue}_FUTURE_${base}_${quoteOf(venue)}`,
@@ -959,8 +981,12 @@ function venuePair(
   return {
     ...makeOpportunityPair(),
     base,
-    shortLeg: venueLeg('short', shortVenue, base),
-    longLeg: venueLeg('long', longVenue, base),
+    shortLeg: venueLeg(shortVenue, base),
+    longLeg: venueLeg(longVenue, base),
+    borosLegs: [
+      makeOpportunityBorosLeg({ marketId: marketIdFor('short', shortVenue, base), venue: shortVenue }),
+      makeOpportunityBorosLeg({ marketId: marketIdFor('long', longVenue, base), side: 'LONG', venue: longVenue }),
+    ],
     netFixedAprOnCapital: apr,
     ...over,
   };
@@ -1362,5 +1388,42 @@ describe('OpportunitiesPanel — filters', () => {
       expect(screen.getByText('No fixed-return opportunities')).toBeInTheDocument(),
     );
     expect(screen.queryByRole('group', { name: 'Filter opportunities' })).not.toBeInTheDocument();
+  });
+});
+
+describe('OpportunitiesPanel — the rebate is the logged-in owner\'s', () => {
+  const ROOT = `0x${'1'.repeat(40)}`;
+  const rebate: Rebate = {
+    mode: 'relative',
+    settlementFeePercentage: 0.5,
+    rebateBps: 5_000,
+    startTimestamp: null,
+    endTimestamp: null,
+    marketIds: null,
+    active: true,
+  };
+  const serve = (address: string) => {
+    localStorage.setItem(STRATEGY_STORAGE_KEY, JSON.stringify({ address, walletUpgraded: true }));
+    server.use(
+      http.get('/api/boros/agent', () => HttpResponse.json(env(agentStatus({ configured: true, root: ROOT })))),
+      http.get('/api/boros/rebate', () => HttpResponse.json(env(rebate))),
+      opportunitiesHandler(makeOpportunitiesResult({ groups: [makeOpportunityGroup()] })),
+    );
+  };
+  afterEach(() => localStorage.clear());
+
+  it('offers the rebate toggle on the logged-in wallet', async () => {
+    serve(ROOT);
+    renderWithClient(<OpportunitiesPanel />);
+    expect(await screen.findByText('Include rebate in APR')).toBeInTheDocument();
+  });
+
+  it('hides it for a view-only wallet', async () => {
+    serve(`0x${'2'.repeat(40)}`);
+    renderWithClient(<OpportunitiesPanel />);
+    await waitFor(() => expect(toggles()).toHaveLength(1));
+    // Give the agent and rebate reads time to land before asserting absence.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.queryByText('Include rebate in APR')).toBeNull();
   });
 });

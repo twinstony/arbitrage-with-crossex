@@ -1,9 +1,9 @@
 {
-  "version": "1.7.2",
+  "version": "1.7.6",
   "highlights": [
-    "Settlement-fee rebates: a rebated wallet sees its rebate % on every opportunity and can include it in the APR",
-    "Positions count the rebate you have earned in Total PnL, the APR, the Boros table and the PnL waterfall",
-    "Viewing a wallet you are not logged in to is one clean read-only view: only that wallet, and the header says so",
-    "Telegram setup reads done only for the wallet the alerts are linked to"
+    "Roll between singles and a spread: Boros previews every roll, and the window shows the margin it needs",
+    "Fixed Rate Pairs splits your book by size, so a small single no longer hides the spread offer",
+    "A trade shows on your cards in seconds, not minutes",
+    "Clearer roll messages, and a roll into a market you hold the other way can now be sent"
   ]
 }

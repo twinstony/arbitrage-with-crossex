@@ -104,6 +104,9 @@ export interface AppDeps {
   /** `interest` absent keeps the all-time interest ledger in memory: tests only. */
   rebalance?: { jobs: JobFile; interest?: InterestFile; sleep?: (ms: number) => Promise<void>; onDone?: () => void };
   transfer?: { jobs: TransferFile; sleep?: (ms: number) => Promise<void>; onDone?: () => void };
+  /** How long a Boros write waits for Boros to show the trade before it answers
+   * (default 6 s, polled each 1 s). Tests set `maxMs: 0`. */
+  borosSettle?: { maxMs?: number; sleep?: (ms: number) => Promise<void> };
   /** `wallet` is the Boros wallet the bot client names in x-terminal-wallet. */
   telegram?: { link: TelegramLink; sync: TelegramSync; status: TelegramStatus; bot: BotClient; wallet?: () => string | null };
 }
@@ -114,6 +117,19 @@ declare module 'fastify' {
     ok(data: unknown, opts?: { stale?: boolean }): FastifyReply;
   }
 }
+
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "font-src 'self' data:",
+  "img-src 'self' data: https://storage.googleapis.com/boros-prod/ https://raw.githubusercontent.com/pendle-finance/arbitrage-with-crossex/",
+  "connect-src 'self' https://raw.githubusercontent.com/pendle-finance/arbitrage-with-crossex/ https://api-boros.pendle.finance/apis/",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
 
 export function buildApp(deps: AppDeps): FastifyInstance {
   const app = Fastify({ logger: false });
@@ -151,7 +167,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     // clickjackable from any site the user happens to visit. Refuse to be
     // framed at all — the terminal is never legitimately embedded.
     reply.header('X-Frame-Options', 'DENY');
-    reply.header('Content-Security-Policy', "frame-ancestors 'none'");
+    reply.header('Content-Security-Policy', CONTENT_SECURITY_POLICY);
 
     const host = req.headers.host;
     const origin = req.headers.origin;

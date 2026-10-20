@@ -14,6 +14,7 @@ import { del, fetchJson, patchJson, postJson, putJson } from './client';
 import { useTabActive } from '../components/TabBar';
 import { uuid } from '../lib/uuid';
 import type {
+  AssetBorosMargin,
   AssetViewResponse,
   BorosCancelAndCloseResult,
   DealAlert,
@@ -54,7 +55,6 @@ import type {
   TransferView,
   VenueFees,
   UpdateStatus,
-  TopUpGasResponse,
   RunUpdateResponse,
   UpdateProgress,
 } from './types';
@@ -167,6 +167,20 @@ function assetViewSearch(since: number | undefined, legSince: string): string {
 /** Asset-grouped tracking view: venue-reported lifetime sums per asset since
  * `since` (0 = all time). Same address-switch doctrine as useStrategy:
  * deliberately NO keepPreviousData across keys. */
+/**
+ * Just the Boros accounts' margin, for the header's account status on every
+ * tab — the asset view carries the same rows but is far heavier to poll.
+ */
+export function useBorosMargin(address: string | null) {
+  return useQuery({
+    queryKey: ['borosMargin', address ?? ''] as const,
+    queryFn: () =>
+      fetchJson<{ borosMargin: AssetBorosMargin[] }>(`/boros/margin/${encodeURIComponent(address ?? '')}`),
+    enabled: Boolean(address),
+    refetchInterval: 30_000,
+  });
+}
+
 export function useAssetView(address: string | null, since?: number, legSince = '') {
   const shown = useTabActive();
   return useQuery({
@@ -372,6 +386,7 @@ export function useSymbolDetail(symbol: string | null) {
     queryFn: () => fetchJson<SymbolDetail>(`/symbols/${encodeURIComponent(symbol ?? '')}`),
     enabled: Boolean(symbol),
     staleTime: 300_000,
+    refetchInterval: (q) => (q.state.data && !(q.state.data.leverageMax > 0) ? 10_000 : false),
   });
 }
 
@@ -406,6 +421,7 @@ export function useDealView(id: string | null) {
     void qc.invalidateQueries({ queryKey: qk.positions });
     void qc.invalidateQueries({ queryKey: ['assetView'] });
     void qc.invalidateQueries({ queryKey: qk.account });
+    void qc.invalidateQueries({ queryKey: qk.openOrders });
   }, [id, mode, qc]);
 
   return query;
@@ -590,7 +606,10 @@ export function useBorosPairContext(address: string | null, active = true) {
   const shown = tabShown && active;
   return useQuery({
     queryKey: qk.borosPairContext(address ?? ''),
-    queryFn: () => fetchJson<BorosPairContext>(`/boros/pair/context?address=${address}`),
+    queryFn: () =>
+      fetchJson<BorosPairContext>(
+        `/boros/pair/context?address=${encodeURIComponent(address ?? '')}`,
+      ),
     enabled: (query) => Boolean(address) && canFetch(shown, query),
     placeholderData: keepPreviousData,
     refetchInterval: shown ? 15_000 : false,
@@ -637,7 +656,9 @@ export function useExecuteBorosPair() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['boros', 'pair', 'context'] });
       void qc.invalidateQueries({ queryKey: ['assetView'] });
-      void qc.invalidateQueries({ queryKey: qk.positions });
+      // The header margin reads the same server entry the trade just refreshed.
+      // CrossEx positions are left alone: a Boros trade cannot change them.
+      void qc.invalidateQueries({ queryKey: ['borosMargin'] });
     },
   });
 }
@@ -649,13 +670,13 @@ export function useExecuteBorosPair() {
  * The whole request is the key, so any field change is a different quote, and
  * a stale quote never survives a remount (gcTime 0).
  */
-export function useBorosRollSimulation(req: BorosRollRequest | null, enabled = true) {
+export function useBorosRollSimulation(req: BorosRollRequest | null, enabled = true, refetchInterval = 4_000) {
   return useQuery({
     queryKey: ['boros', 'roll', 'simulate', JSON.stringify(req)] as const,
     queryFn: () => postJson<BorosRollSimulateResponse>('/boros/roll/simulate', req),
     enabled: Boolean(req) && enabled,
     placeholderData: keepPreviousData,
-    refetchInterval: 4_000,
+    refetchInterval,
     gcTime: 0,
   });
 }
@@ -671,26 +692,9 @@ export function useExecuteBorosRoll() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['boros', 'pair', 'context'] });
       void qc.invalidateQueries({ queryKey: ['assetView'] });
-      void qc.invalidateQueries({ queryKey: qk.positions });
-    },
-  });
-}
-
-export function useTopUpGas() {
-  const qc = useQueryClient();
-  // One id per ATTEMPT-UNTIL-SUCCESS: a re-press after a lost response sends
-  // the same id, and the server answers from its memo instead of paying
-  // again. A success mints a fresh id for the next top-up.
-  const idRef = useRef<string | null>(null);
-  return useMutation({
-    mutationFn: ({ amountUsd, address }: { amountUsd: number; address: string }) => {
-      idRef.current ??= `gas-${uuid()}`.slice(0, 64);
-      return postJson<TopUpGasResponse>('/boros/pair/top-up-gas', { amountUsd, address, clientOrderId: idRef.current });
-    },
-    onSuccess: () => {
-      idRef.current = null;
-      void qc.invalidateQueries({ queryKey: ['boros', 'pair', 'simulate'] });
-      void qc.invalidateQueries({ queryKey: qk.borosAgent });
+      // The header margin reads the same server entry the trade just refreshed.
+      // CrossEx positions are left alone: a Boros trade cannot change them.
+      void qc.invalidateQueries({ queryKey: ['borosMargin'] });
     },
   });
 }
@@ -761,7 +765,9 @@ export function useBorosCancelAndClose() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['boros', 'pair', 'context'] });
       void qc.invalidateQueries({ queryKey: ['assetView'] });
-      void qc.invalidateQueries({ queryKey: qk.positions });
+      // The header margin reads the same server entry the trade just refreshed.
+      // CrossEx positions are left alone: a Boros trade cannot change them.
+      void qc.invalidateQueries({ queryKey: ['borosMargin'] });
     },
   });
 }

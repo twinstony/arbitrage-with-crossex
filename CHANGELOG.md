@@ -3,6 +3,167 @@
 Only substantial releases are listed here — each one bumps `version.json` (which is what the
 in-app update check compares against).
 
+## 1.7.6 — 2026-10-17
+
+TLDR: Every roll is one batch that Boros previews first, singles ↔ spread included. Fixed Rate
+Pairs splits a book by size, so a part single no longer hides the spread offer. A trade shows
+on the cards in seconds.
+
+- **Every roll: one batch, one preview.** A roll sends its closes and then its opens in one
+  batch, all or none. Before the send, Boros previews the whole batch and the roll window
+  shows the required and available margin from it. This works for singles → singles,
+  singles → spread, spread → singles and spread → spread, whole or in part. Before, a roll
+  between singles and a spread showed "Simulation failed" and no margin. A roll with no
+  preview is blocked. The exact size held moves, so no dust stays behind. A whole roll exits
+  the old markets once they are flat, so it works at the 10-market limit.
+- **Clearer roll refusals.** One bullet per cause, and each fix said once. The market limit,
+  your own order on the market and low gas each have plain text. On a part roll at the
+  market limit, the fix offers the whole roll only when it frees enough markets (except when
+  another pair shares the market; fixed in 1.7.7).
+- **Roll into a market you hold the other way.** When the new market holds the opposite side
+  of another pair, the roll window shows the same tick box as the order ticket. Before, the
+  roll was stuck behind a blocker with no box.
+- **"Margin freed" is right.** The exit step shows the margin the close releases. Before, a
+  whole close showed 0.
+- **Rolls stay inside the Boros rate limit.** Roll windows refresh every 10 s and reuse the
+  account reads for 15 s. The check before a send always reads fresh. Before, one open roll
+  window used the whole limit and every Boros read failed for up to a minute.
+- **Fixed Rate Pairs split by size.** A held single that covers part of a perp unit no longer
+  turns the whole unit into singles: the rest keeps its spread offer. Opens are capped at what
+  the venue lacks. Missing legs read "held / needed", for example "0 / 0.05 ETH", and the badge
+  names the gap: "missing 0.05 ETH", also on the Funding Bundles row. Gaps that
+  differ by under $25 a side count as even. A single under $50 no longer hides the spread offer.
+- **Open-only rolls.** After a roll that keeps the old legs, the perps hedge the new, later
+  legs. The old legs show as their own card, with the perps they lack, until they mature.
+  Within one venue pair, the further maturity takes the perps first, unless that hedges less
+  of the book. A roll that fills a hair short leaves no tiny card on the old date. The roll
+  window says this in three bullets.
+- **A Boros leg held the other way.** The card marks it "held other way" and offers Close,
+  not Open. Before, the Open would net against it, and a wrong-way spread offered perps that
+  would close the ones you hold. A single counts only on its hedge side: before, an HL long
+  single behind HL short perps read as hedged.
+- **Share of a shared leg.** The percent after a leg size has a hover with the whole position,
+  this pair's part and the other cards' part.
+- **Telegram roll alerts.** One suggestion per held pair, with its kind (singles or spread, to
+  singles or spread) and its markets.
+- **Boros rebate per market.** The rebate chip and "Include rebate in APR" use each market's
+  own rate. A card with two rates shows "40-50%"; the hover gives each leg's rate.
+- **Trades show in seconds.** After a Boros trade, the cards update within a few seconds.
+  Before, they took up to 2 minutes, because the terminal re-read the fill history of every
+  market the account ever traded. The header margin updates with the cards.
+- **Fewer Boros reads.** A pair under $100, which shows no rate, no longer sends roll probes.
+  Matured markets load in one read. A new wallet's settlement history loads once, not twice.
+- **Smaller changes.** Each roll option names its target ("→ singles" or the spread). The roll
+  window shows "—" until the preview is back. A Boros rate limit reads "Boros rate limit
+  reached. It retries in 10 s." Exact sizes show when a short label would read
+  "2.4k / 2.4k ETH". Reduce-only on a pair stays on a held spread; close singles from their
+  pair card.
+
+## 1.7.5 — 2026-10-14
+
+TLDR: Boros spread markets. Where Boros lists one, a single Boros order hedges a
+Hyperliquid/Gate pair, so a pair has 3 legs instead of 4. Low Boros gas no longer stops an
+order. ETH and BTC coin books need a 0.1% match to read "Hedged".
+
+- **Spread markets.** A spread market such as "ETH Spread HL-GATE" is one Boros market that
+  pays the funding gap between two venues. Where Boros lists one for a pair's two venues,
+  coin, collateral and maturity, the pair uses it: 1 Boros order, one fee and one margin
+  instead of two. Without one, the pair keeps its 2 single Boros legs. Opportunities,
+  Positions, Funding Bundles, close, roll, Telegram roll alerts and share links all read a
+  spread leg as one leg that covers both venues. If you hold a spread and 2 singles at the
+  same venues and maturity, Fixed Rate Pairs shows them as 2 pairs, so you can compare their
+  rates and close or roll each one on its own. The spread pair is hedged by your perps first;
+  a pair the perps do not cover shows the missing perps. Any two venues work, not only
+  Hyperliquid and Gate. A spread that Boros has not launched in its app yet is treated as
+  close-only: it takes no new orders.
+- **Order ticket uses the spread.** Boros rates → Pair: when the two picked markets have a
+  trading spread market, the order goes on the spread. A "Trade on ETH Spread HL-GATE" line
+  says so. A paused or close-only spread trades the singles.
+- **Low gas no longer stops an order.** An order still adds about $1 of Boros gas when gas
+  runs low. If the traded coin cannot spare it, the dollar now comes from the coin with the
+  most free cross margin. Before, the open was blocked and a close at gas debt failed. The
+  "Top up gas by hand" box is gone, because every order tops up by itself. A close shows a
+  gas line only when gas is below $0.
+- **Perfect hedge 0.1% on ETH and BTC coin books.** "Hedged" and the "To complete the hedge"
+  hint now need the legs within 0.1%, not 2%, on ETH and BTC coin-margined books. USDT-market
+  legs, HYPE and other coins keep 2%. The locked APR and profit at maturity do not change.
+- **Bigger Boros orders fill.** The order ticket now uses the same rate limit as Boros. Before,
+  it used a tighter one on most markets (Gate ETHUSDT 27 Nov: ±1.05% instead of ±1.50%), so it
+  blocked wider tolerances and capped large orders that Boros would have filled.
+- **Liquidation APR matches Boros.** The order ticket now works out a Boros leg's liquidation
+  rate the way the Boros contract does. Before, a short showed liquidation too far away once
+  the rate passed the margin floor: Hyperliquid ETH 27 Nov, short at 7.87%, showed 9.48%; the
+  real figure is 9.03%. As in the Boros app, a rate past 250% (or past 10 × the mark rate)
+  shows "N/A", in the ticket and under held Boros legs.
+- **Rolls match your coin.** Roll over and the Telegram roll alert now offer markets in the
+  coin you hold. Before, a BTC Hyperliquid/Gate pair was offered a USDT market and got no
+  roll alert.
+- **Share links.** The share card shows a pair's Boros side as one spread row. Long Boros legs
+  now read the right way round on the share page. Links shared before keep their old numbers.
+- **Smaller changes.** The Pairs tab is "Fixed Rate Pairs". The form that closes only the
+  Boros legs is titled "Close Boros legs". Double-click the amount on Opportunities to edit it.
+  Long leg names wrap instead of running into the Size column. Boxed buttons start with a
+  capital: "Open more", "Ack", "Restore", "Mark".
+
+## 1.7.4 — 2026-10-09
+
+TLDR: Boros gas top-ups now pay from the market you trade, in that market's own coin. Accounts
+with no USDT on Boros can trade again.
+
+- **Gas top-up from the traded market.** When prepaid Boros gas runs low, an order adds about
+  $1 of gas. Before, that dollar always came out of the USDT account, so a trader with only ETH
+  or BTC collateral could not trade at all. Now it comes out of the traded market's own
+  collateral: ETH, BTC or USDT, at that coin's price.
+- **"Top up gas" pays in the market's coin too.** The answer names the coin it paid in. With
+  no market picked, it pays from the account with the most free margin.
+- **A clear warning when a coin has no price.** If Boros shows no price for the collateral,
+  the ticket says the order cannot top up gas, and points you to the Boros app.
+
+## 1.7.3 — 2026-10-05
+
+TLDR: An Accounts tab and one health status in the header, for Gate and Boros together. Roll
+into a new maturity without closing the old legs. A clearer Boros pair ticket. Safer Boros
+closes. Fixes from the security audit, and updates that keep your setup.
+
+- **Accounts tab (was Balances).** One card lists every account: Gate CrossEx and each Boros
+  account, with available / balance, IM used and MM used. A Boros account reads in its own
+  coin first, with dollars under it. Every account liquidates at 100% MM used, so one scale
+  applies: amber from 67%, red from 91%. The card starts with a verdict, such as "All
+  accounts healthy" or "1 account near liquidation".
+- **One health status in the header.** It reads "Healthy", or names the account at risk, such
+  as "Boros ETH cross 95% MM used". It also shows Gate and Boros available / balance. Click it
+  to open Accounts. Every Boros leg on Positions shows its liquidation APR.
+- **Roll without closing the old legs.** The roll window has an "Open only (keep old legs)"
+  mode. It opens the new maturity and leaves the old legs to settle at maturity, so you pay no
+  exit fee. Its options show only the opening cost. The extra Boros pair reads "Excess hedge".
+- **Roll any time.** Roll over is offered on every live pair. The reminders still start 10
+  days before maturity.
+- **Boros pair ticket.** Pick the coin, then each leg's market, then a maturity both markets
+  list. Each market names its collateral, such as "Gate ETHUSDT · ETH". Two markets with no
+  shared maturity say they cannot be paired. "Available" is now the largest size your
+  collateral can open, not the collateral itself.
+- **Safer Boros closes.** Both Boros legs of a pair close in one batch: both close or
+  neither. Every close and roll also cancels your resting Boros orders on those markets in
+  the same batch, so a forgotten order cannot reopen the leg. An unclear venue error on a
+  pair now reads "unknown", and a retry cannot fill the pair twice.
+- **Boros opens free their own market slots.** A Boros account can be in only so many
+  markets, and a matured market keeps its slot until it is exited. Every open now exits your
+  matured markets first, in the same batch. If no slot can be freed, the leg says "too many
+  markets".
+- **Positions.** Leftover Boros legs at two venues form a pair card with "Perp leg(s)
+  missing". Each pair's maturity bar shows the time passed on one timeline shared by the
+  coin's pairs, with a mark for today. The APR shows even when a pair is not hedged, with the
+  floating part split out. A view-only wallet shows every position, your Gate perps
+  included. It only blocks trading and hides the rebate.
+- **Perp pairs.** Execute pair no longer stays disabled while the maker price moves. A maker
+  re-peg snaps to the right side of the book. When the hedge fails, the maker order is
+  cancelled at once. A failed status read raises an alert.
+- **Updates and install.** An update keeps a custom port and folder, and installs exactly the
+  release it shows. A failed download stops the update and says so. On Windows, the
+  installer puts the old version back if the new one cannot start, and the app restarts
+  within a minute if it stops. Uninstall with purge lists anything left on disk. The app
+  sends a strict Content-Security-Policy, with more fixes from the security audit.
+
 ## 1.7.2 — 2026-09-25
 
 TLDR: Settlement-fee rebates show in the terminal. A rebated wallet sees its rebate on every

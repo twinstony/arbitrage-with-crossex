@@ -39,6 +39,7 @@ import type {
   BorosEntryMode,
   EntryMode,
   ExitMode,
+  OpportunityBorosLeg,
   OpportunityGroup,
   OpportunityPair,
   Rebate,
@@ -50,9 +51,10 @@ import { QueryError } from '../components/QueryError';
 import { SegmentedToggle } from '../components/SegmentedToggle';
 import { Skeleton } from '../components/Skeleton';
 import { microLabelClass } from '../components/Th';
-import { TokenIcon, VenueIcon } from '../components/AssetIcon';
+import { SpreadIcon, TokenIcon, VenueIcon } from '../components/AssetIcon';
 import { SideVenue } from '../components/VenueChip';
 import { borosMarketUrl, isUsdCollateral } from '../lib/boros';
+import { spreadName } from '../lib/spread';
 import {
   fmtAge,
   fmtDateLocal,
@@ -69,14 +71,15 @@ import { useTradeFlowOptional } from '../trade/TradeFlow';
 import { StrategyFreshness } from './HomeControls';
 import { OpportunityFilterBar } from './OpportunityFilterBar';
 import { canChartCapital, canChartProfit, OpportunityWaterfall } from './OpportunityWaterfall';
-import { heldPerpsOf, repriceHeld, type HeldBook, type HeldTag } from './heldPerps';
+import { heldBorosOf, heldPerpsOf, repriceHeld, type HeldBook, type HeldTag } from './heldPerps';
 import { applyRebate } from './opportunityRebate';
-import { rebateAppliesTo, rebateChipLabel } from '../lib/rebate';
+import { rebateAccountLabel, rebateAppliesTo, rebateChipLabel, rebateLegsNote } from '../lib/rebate';
 import { useActiveWallet, useTrackedAddressOptional } from './trackedAddress';
 import {
   applyFilters,
   hasActiveFilter,
   loadFilters,
+  maturityDays,
   NO_FILTERS,
   saveFilters,
   toRows,
@@ -401,31 +404,35 @@ function LegRow({
  * cheap), not by book — the numbered legs carry the book. */
 function VenueBox({
   venue,
+  icon,
   why,
   fixedApr,
   positive,
+  wide = false,
   children,
 }: {
   venue: string;
-  why: string;
+  icon?: ReactNode;
+  why?: string;
   fixedApr: number | null;
-  /** Receives fixed (green, "+") vs pays fixed (guava, "−"). */
+  /** Receives fixed (green, unsigned) vs pays fixed (guava, "−"). */
   positive: boolean;
+  wide?: boolean;
   children: ReactNode;
 }) {
   return (
-    <div className="min-w-0 rounded border border-wash/10 p-5">
+    <div className={`min-w-0 rounded border border-wash/10 p-5${wide ? ' xl:col-span-2' : ''}`}>
       <div className="mb-4 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-        <VenueIcon venue={venue} size={20} />
+        {icon ?? <VenueIcon venue={venue} size={20} />}
         <span className="whitespace-nowrap text-[16px] font-bold leading-[19.36px] text-ink-50">{venue}</span>
-        <span className="whitespace-nowrap text-[12px] text-ink-500">{why}</span>
+        {why && <span className="whitespace-nowrap text-[12px] text-ink-500">{why}</span>}
         {fixedApr !== null && Number.isFinite(fixedApr) && (
           <span
             className={`num ml-auto whitespace-nowrap rounded px-3 py-1.5 text-[14px] font-bold ${
               positive ? 'bg-grass/10 text-grass' : 'bg-guava/10 text-guava'
             }`}
           >
-            {positive ? '+' : '−'}
+            {positive ? '' : '−'}
             {fmtPct(Math.abs(fixedApr), 1)} Fixed
           </span>
         )}
@@ -493,12 +500,14 @@ const OpportunityCard = memo(function OpportunityCard({
   }, [hasPerps, served, notionalUsd, rebate, includeRebate]);
   // The chip shows whenever the rebate actually reaches one of this card's two
   // markets (active window + market filter) — independent of the toggle.
-  const rebateChip =
-    rebate &&
-    (rebateAppliesTo(rebate, pair.shortLeg.marketId) || rebateAppliesTo(rebate, pair.longLeg.marketId))
-      ? rebate
-      : null;
+  const rebatedLegs = rebate ? pair.borosLegs.filter((leg) => rebateAppliesTo(rebate, leg.marketId)) : [];
+  const rebatedMarketIds = rebatedLegs.map((leg) => leg.marketId);
+  const rebateChip = rebate && rebatedLegs.length > 0 ? rebate : null;
+  const rebateLegs = rebateChip ? rebateLegsNote(rebateChip, rebatedLegs) : '';
   const chips = cardChips(pair);
+  const spreadLeg = pair.borosLegs.find((leg) => leg.spreadVenues !== null) ?? null;
+  const shortBoros = pair.borosLegs.find((leg) => leg.side === 'SHORT');
+  const longBoros = pair.borosLegs.find((leg) => leg.side === 'LONG');
   // Only the PAIR's own reasons — they explain this card's own numbers. The
   // group's warnings are about the other markets in the cohort ("… has no
   // CrossEx perp venue"), and those rows stopped being displayed with the
@@ -515,7 +524,7 @@ const OpportunityCard = memo(function OpportunityCard({
   // still serves them, so a loss must never wear the profit colour.
   const netNegative = capitalApr !== null && capitalApr < 0;
   const netTone = netNegative ? 'text-rose-400' : 'text-emerald-400';
-  const days = Math.max(1, Math.round(group.secondsToMaturity / 86_400));
+  const days = maturityDays(group.secondsToMaturity);
   const maturityTitle = `Matures ${fmtDateLocal(group.maturity)} · ${fmtAge(group.secondsToMaturity * 1000)} left`;
   // Token-margined groups also size in the collateral token — bracket the
   // notional with that amount (USDT groups stay pure-dollar).
@@ -597,9 +606,13 @@ const OpportunityCard = memo(function OpportunityCard({
           <Chip
             sm
             tone="green"
-            title={`Boros settlement-fee rebate on this account${rebateChip.startTimestamp ? ` since ${fmtDateLocal(rebateChip.startTimestamp)}` : ''}`}
+            title={
+              rebateLegs
+                ? `Settlement-fee rebate:\n${rebateLegs}`
+                : `Boros settlement-fee rebate on this account${rebateChip.startTimestamp ? ` since ${fmtDateLocal(rebateChip.startTimestamp)}` : ''}`
+            }
           >
-            {rebateChipLabel(rebateChip)}
+            {rebateChipLabel(rebateChip, rebatedMarketIds)}
           </Chip>
         )}
         {chips.map((c) => (
@@ -681,7 +694,7 @@ const OpportunityCard = memo(function OpportunityCard({
               {capitalUsd === null ? (
                 <Dash why={CAPITAL_WHY} />
               ) : (
-                <span title="The minimum capital this trade posts across the four legs.">
+                <span title={`The minimum capital this trade posts across the ${spreadLeg ? 'three' : 'four'} legs.`}>
                   ~{fmtUsd(capitalUsd, 0)}
                 </span>
               )}
@@ -775,11 +788,9 @@ const OpportunityCard = memo(function OpportunityCard({
             className="mt-4 flex cursor-auto flex-col gap-3.5 border-t border-ink-800 pt-4 text-xs"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* "four legs · $10k notional each", then a rule, then the
-                no-price-risk reassurance — the mock's divider line. */}
             <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2.5">
               <span className="whitespace-nowrap text-[11.5px] text-ink-200">
-                four legs ·{' '}
+                {spreadLeg ? 'three' : 'four'} legs ·{' '}
                 <span className="text-link">
                   {fmtNotionalShort(notionalUsd)}
                   {collateralQty
@@ -790,7 +801,7 @@ const OpportunityCard = memo(function OpportunityCard({
               </span>
               <span aria-hidden="true" className="min-w-[24px] flex-1 border-t border-dashed border-ink-300/25" />
               <span className="whitespace-nowrap rounded-full border border-wash/[0.15] bg-ink-950/60 px-4 py-[5px] text-[12px] text-ink-300">
-                nets to 0 · no price risk
+                nets to 0 · no price exposure
               </span>
             </div>
             {/* Two columns only from xl: the content column is the viewport less
@@ -800,7 +811,7 @@ const OpportunityCard = memo(function OpportunityCard({
               <VenueBox
                 venue={prettyVenue(pair.shortLeg.venue)}
                 why="funding is rich here"
-                fixedApr={pair.shortLeg.execApr ?? pair.shortLeg.midApr}
+                fixedApr={spreadLeg || !shortBoros ? null : (shortBoros.execApr ?? shortBoros.midApr)}
                 positive
               >
                 <LegRow
@@ -814,23 +825,16 @@ const OpportunityCard = memo(function OpportunityCard({
                       : `up to ${pair.capital.shortLeverageMax}× leverage`
                   }
                 />
-                <LegRow
-                  n={2}
-                  side="short"
-                  label={`Short ${base}`}
-                  kind="Boros"
-                  note={<RateNote midApr={pair.shortLeg.midApr} execApr={pair.shortLeg.execApr} />}
-                  href={borosMarketUrl(pair.shortLeg.marketId, 'short')}
-                />
+                {!spreadLeg && shortBoros && <BorosLegRow n={2} leg={shortBoros} label={`Short ${base}`} />}
               </VenueBox>
               <VenueBox
                 venue={prettyVenue(pair.longLeg.venue)}
                 why="funding is cheap here"
-                fixedApr={pair.longLeg.execApr ?? pair.longLeg.midApr}
+                fixedApr={spreadLeg || !longBoros ? null : (longBoros.execApr ?? longBoros.midApr)}
                 positive={false}
               >
                 <LegRow
-                  n={3}
+                  n={spreadLeg ? 2 : 3}
                   side="long"
                   label={`Long ${base}`}
                   kind="CrossEx"
@@ -840,15 +844,23 @@ const OpportunityCard = memo(function OpportunityCard({
                       : `up to ${pair.capital.longLeverageMax}× leverage`
                   }
                 />
-                <LegRow
-                  n={4}
-                  side="long"
-                  label={`Long ${base}`}
-                  kind="Boros"
-                  note={<RateNote midApr={pair.longLeg.midApr} execApr={pair.longLeg.execApr} />}
-                  href={borosMarketUrl(pair.longLeg.marketId, 'long')}
-                />
+                {!spreadLeg && longBoros && <BorosLegRow n={4} leg={longBoros} label={`Long ${base}`} />}
               </VenueBox>
+              {spreadLeg?.spreadVenues && (
+                <VenueBox
+                  venue={spreadName(base, spreadLeg.spreadVenues)}
+                  icon={<SpreadIcon venues={spreadLeg.spreadVenues} size={20} />}
+                  fixedApr={spreadLeg.execApr ?? spreadLeg.midApr}
+                  positive={(spreadLeg.side === 'SHORT' ? 1 : -1) * (spreadLeg.execApr ?? spreadLeg.midApr) >= 0}
+                  wide
+                >
+                  <BorosLegRow
+                    n={3}
+                    leg={spreadLeg}
+                    label={`${spreadLeg.side === 'SHORT' ? 'Short' : 'Long'} ${spreadName(base, spreadLeg.spreadVenues)}`}
+                  />
+                </VenueBox>
+              )}
             </div>
             {/* Kept from the app: the mock never says this, but it is the one
                 line that explains why four legs are not four risks. */}
@@ -903,6 +915,20 @@ const OpportunityCard = memo(function OpportunityCard({
   );
 });
 
+function BorosLegRow({ n, leg, label }: { n: number; leg: OpportunityBorosLeg; label: string }) {
+  const side = leg.side === 'SHORT' ? 'short' : 'long';
+  return (
+    <LegRow
+      n={n}
+      side={side}
+      label={label}
+      kind="Boros"
+      note={<RateNote midApr={leg.midApr} execApr={leg.execApr} />}
+      href={borosMarketUrl(leg.marketId, side)}
+    />
+  );
+}
+
 /** "at 8.0% → 7.8% after impact" — the Boros leg's mid rate and what it locks. */
 function RateNote({ midApr, execApr }: { midApr: number; execApr: number | null }) {
   // Only the rate this leg actually LOCKS. The mid → exec arrow that used to
@@ -948,6 +974,9 @@ export function OpportunitiesPanel() {
   const shownKeysRef = useRef<ReadonlySet<string>>(new Set());
   const flow = useTradeFlowOptional();
   const sizeId = useId();
+  // Set by a double-click on the preset amount, so the custom input that
+  // replaces it takes focus with its digits selected.
+  const focusSizeRef = useRef(false);
 
   const persist = (next: Partial<StoredControls>) =>
     writeJson(OPPORTUNITIES_STORAGE_KEY, {
@@ -989,7 +1018,10 @@ export function OpportunitiesPanel() {
   // The account's settlement-fee rebate config (null when not rebated / no agent).
   // The chip shows whenever there IS an active rebate; the toggle decides whether
   // it lands in the APR. Every affordance stays hidden for a non-rebated account.
-  const rebate = useRebate().data ?? null;
+  // The rebate is the logged-in owner's: a view-only wallet does not see it.
+  const viewOnly = useActiveWallet().viewOnly;
+  const ownRebate = useRebate().data ?? null;
+  const rebate = viewOnly ? null : ownRebate;
   const hasRebate = !!rebate && rebate.active;
 
   // Every viable PAIR, not one per group: a cohort with three markets offers
@@ -1004,20 +1036,18 @@ export function OpportunitiesPanel() {
    */
   const trackedAddress = useTrackedAddressOptional()?.address ?? null;
   const exposure = usePositions(trackedAddress !== null).data?.exposure;
-  const borosMarkets = useBorosPairContext(trackedAddress).data?.markets;
-  // The perp exposure is the logged-in account's: never pair it with another wallet's Boros legs.
-  const viewOnly = useActiveWallet().viewOnly;
+  const pairContext = useBorosPairContext(trackedAddress).data;
+  const borosMarkets = pairContext?.markets;
+  const spreadMarkets = pairContext?.spreadMarkets;
   const held = useMemo(() => {
-    if (viewOnly || !exposure) return undefined;
+    if (!exposure) return undefined;
     const books: HeldBook[] = exposure.map((g) => ({
       base: g.base,
       perps: g.legs.map((l) => ({ venue: l.exchange, side: l.side })),
-      boros: (borosMarkets ?? [])
-        .filter((m) => m.currentSize !== 0 && m.base.toUpperCase() === g.base.toUpperCase())
-        .map((m) => ({ venue: m.venue, maturity: m.maturity })),
+      boros: heldBorosOf([...(borosMarkets ?? []), ...(spreadMarkets ?? [])], g.base),
     }));
     return heldPerpsOf(books);
-  }, [viewOnly, exposure, borosMarkets]);
+  }, [exposure, borosMarkets, spreadMarkets]);
   const pricedAtUsd = data?.meta.notionalUsd;
   const rows = useMemo(
     () =>
@@ -1103,11 +1133,28 @@ export function OpportunitiesPanel() {
               aria-label="Custom notional (USD)"
               value={sizeStr}
               onChange={(e) => setSizeStr(e.target.value)}
+              ref={(el) => {
+                if (!el || !focusSizeRef.current) return;
+                focusSizeRef.current = false;
+                el.focus();
+                el.select();
+              }}
               title="The notional each leg is priced at."
               className="num w-24 bg-transparent text-sm font-semibold text-ink-50 outline-none placeholder:text-ink-500"
             />
           ) : (
-            <span className="num text-sm font-semibold text-ink-50">
+            <span
+              className="num cursor-text select-none text-sm font-semibold text-ink-50"
+              title="Double-click to edit"
+              onDoubleClick={() => {
+                // Edit from the amount on screen, not the last custom size.
+                focusSizeRef.current = true;
+                setSizeStr(String(notionalUsd));
+                setSize(notionalUsd);
+                setNotionalChoice('custom');
+                persist({ notionalChoice: 'custom', customNotionalUsd: notionalUsd });
+              }}
+            >
               {notionalUsd.toLocaleString('en-US')}
             </span>
           )}
@@ -1184,7 +1231,7 @@ export function OpportunitiesPanel() {
           <div className={microLabelClass}>Settlement rebate</div>
           <label
             className="flex h-9 cursor-pointer items-center gap-2 whitespace-nowrap text-[12px] text-ink-200"
-            title={`Credit this account's Boros settlement-fee rebate (${rebateChipLabel(rebate as Rebate)}) into every APR, Return and profit.`}
+            title={`Credit this account's Boros settlement-fee rebate (${rebateAccountLabel(rebate as Rebate)}) into every APR, Return and profit.`}
           >
             <input
               type="checkbox"

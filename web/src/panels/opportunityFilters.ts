@@ -10,6 +10,7 @@
  * pair at the bottom that reads and writes the persisted selection.
  */
 import type { OpportunityGroup, OpportunityPair, Rebate } from '../api/types';
+import { daysToMaturity } from '../lib/boros';
 import { prettyVenue } from '../lib/fmt';
 import { readJson, writeJson } from '../lib/storage';
 import { heldTagFor, repriceHeld, type HeldPerps, type HeldTag } from './heldPerps';
@@ -41,8 +42,7 @@ export interface OpportunityRow {
 export const venueKey = (venue: string): string => venue.trim().toUpperCase();
 
 /** Days to maturity as the cards show it, so a chip and a card never disagree. */
-export const maturityDays = (secondsToMaturity: number): number =>
-  Math.max(1, Math.round(secondsToMaturity / 86_400));
+export const maturityDays = (secondsToMaturity: number): number => Math.max(1, daysToMaturity(secondsToMaturity, 0));
 
 /** Once shown, a row survives this far below zero before it drops out. Without
  * the band a pair hovering at 0% flips in and out on every poll, and every row
@@ -102,7 +102,7 @@ export function toRows(
       const priced = rebate ? applyRebate(heldPriced, rebate.config, rebate.notionalUsd) : heldPriced;
       const apr = priced.netFixedAprOnCapital;
       if (apr === null || !Number.isFinite(apr)) continue;
-      const key = `${group.tokenId}:${group.maturity}:${pair.shortLeg.marketId}:${pair.longLeg.marketId}`;
+      const key = `${group.tokenId}:${group.maturity}:${pair.borosLegs.map((leg) => leg.marketId).join(':')}`;
       // A pair already on screen holds its place down to the band; a new one
       // still has to clear zero to earn a slot.
       if (apr < (shownKeys?.has(key) ? HYSTERESIS_APR : 0)) continue;

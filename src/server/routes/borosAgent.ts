@@ -27,8 +27,8 @@
 import type { FastifyInstance } from 'fastify';
 import { privateKeyToAccount } from 'viem/accounts';
 import { CoreError } from '../../core/errors';
-import { BOROS_API_BASE, makeBorosApiOrderClient, USD_TOKEN_ID } from '../../core/boros/borosApi';
-import { fetchBorosMarkets, resolveBorosFetch } from '../../core/boros/client';
+import { BOROS_API_BASE, makeBorosApiOrderClient } from '../../core/boros/borosApi';
+import { fetchBorosMarkets, resolveBorosFetch, resolveCollateralPricesUsd } from '../../core/boros/client';
 import type { AppDeps } from '../app';
 import { TTL } from '../cache';
 import { readAgentApproval, resetAgentApprovalCache } from '../borosAgentApproval';
@@ -91,7 +91,7 @@ export function borosAgentRoutes(deps: AppDeps) {
       agentPrivateKey: login.agentPrivateKey as `0x${string}`,
       tokenIdForMarket: async (marketId) =>
         (await loadMarkets()).value.find((m) => m.marketId === marketId)?.tokenId,
-      usdMarketId: async () => (await loadMarkets()).value.find((m) => m.tokenId === USD_TOKEN_ID)?.marketId,
+      collateralPriceUsd: async (tokenId) => resolveCollateralPricesUsd((await loadMarkets()).value).get(tokenId) ?? null,
     });
     const entries = { ...loginEntries(login), ...extra };
     // Persisted the same way as the Gate secret: 0700 dir, 0600 temp file,

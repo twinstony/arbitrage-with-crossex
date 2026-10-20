@@ -58,7 +58,6 @@ import {
   type BorosLegFill,
   type BorosMarketOrderRequest,
   type BorosOrderClient,
-  type BorosRollLeg,
   type BorosRollSimulation,
   type PlaceOrdersOptions,
 } from './orders';
@@ -78,7 +77,26 @@ const ROUTER_ADDRESS = BOROS_NETWORK.routerAddress;
 /** `marketId` sentinel for a CROSS account — max uint24. */
 export const CROSS_MARKET_ID = 0xff_ff_ff;
 
-export const USD_TOKEN_ID = 3;
+/**
+ * Whole cents of USD as a `payTreasury` amount in a collateral token.
+ *
+ * `payTreasury` moves scaled cash (18 decimals) in the token of the market it
+ * is charged on (MarginManager._transferToTreasury), and the backend credits
+ * `amount × token.usdPrice` to the gas budget. So $1 is 1e18 only for a $1
+ * token; in the ETH zone it is 1e18 / ethPrice. Rounded UP so the credit never
+ * lands under the dollars asked for. Integer maths from here on: the price is
+ * fixed to 8 decimals once, and no float ever reaches the amount.
+ */
+export function usdCentsToCollateralWei(cents: number, priceUsd: number): bigint {
+  if (!Number.isInteger(cents) || cents <= 0) throw new CoreError(`invalid top-up amount: ${cents} cents`, 'validation');
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
+    throw new CoreError('the collateral price is unknown, so a dollar amount cannot be converted', 'validation');
+  }
+  const priceE8 = BigInt(Math.round(priceUsd * 1e8));
+  if (priceE8 <= 0n) throw new CoreError('the collateral price is unknown, so a dollar amount cannot be converted', 'validation');
+  const numerator = BigInt(cents) * 10n ** BigInt(DECIMALS - 2) * 10n ** 8n;
+  return (numerator + priceE8 - 1n) / priceE8;
+}
 
 export { AUTO_TOP_UP_BELOW_USD, AUTO_TOP_UP_USD } from './client';
 import { AUTO_TOP_UP_BELOW_USD, AUTO_TOP_UP_USD } from './client';
@@ -91,10 +109,11 @@ const SIDE_SHORT = 1;
  * Time-in-force 1 = IOC: take what the book gives, cancel the rest. GTC would
  * leave a resting order nobody asked for; FOK turns every thin book into a
  * total miss rather than a partial fill the panel can report and complete.
- * (The roll-over is the exception — the venue's own builder makes its legs
- * FOK, because there a total miss is the point.)
+ * (The roll-over is the exception — its legs go FOK, because there a total
+ * miss is the point.)
  */
 const TIF_IOC = 1;
+const TIF_FOK = 2;
 
 /**
  * Orderbook-only routing, matching what the SDK sent (`ammId ?? 0`). Omitting
@@ -105,6 +124,8 @@ const AMM_ORDERBOOK_ONLY = 0;
 
 /** How long one submission may take before the fill state is UNKNOWN. */
 const SUBMIT_TIMEOUT_MS = 60_000;
+/** How long a roll preview reuses its account reads (see `previewRead`). */
+const PREVIEW_READ_TTL_MS = 15_000;
 
 /** The backend's per-call error for the calls that did NOT fail when a
  * `requireSuccess` batch is refused in simulation (send-txs.service). */
@@ -149,11 +170,12 @@ export interface BorosApiConfig {
   /** marketId → collateral tokenId, needed to pack a MarketAcc. Async so the
    * caller can serve it off the same TTL-cached markets read the routes use. */
   tokenIdForMarket: (marketId: number) => Promise<number | undefined> | number | undefined;
-  /** A market in the USD collateral zone, which is where a gas top-up is
-   * charged from. Without it an order cannot carry its own top-up and the
-   * account has to be topped up by hand. Async for the same reason as
-   * `tokenIdForMarket`: it comes off the routes' cached markets read. */
-  usdMarketId?: () => Promise<number | undefined> | number | undefined;
+  /** USD price of one collateral token (tokenId), null when unpriceable. A gas
+   * top-up is paid from the cross margin of the market it is charged on, in
+   * THAT market's token, so a dollar has to be converted at this price.
+   * Without it an order cannot carry its own top-up. Async for the same reason
+   * as `tokenIdForMarket`: it comes off the routes' cached markets read. */
+  collateralPriceUsd?: (tokenId: number) => Promise<number | null | undefined> | number | null | undefined;
   baseUrl?: string;
   fetchImpl?: ApiFetch;
   /** Receipt polling, exposed so tests need no timers. */
@@ -209,7 +231,11 @@ export function decimalString(n: number): string {
   if (Math.abs(n) >= 1e21) {
     throw new CoreError(`size ${n} is out of range for an 18-decimal amount`, 'validation');
   }
-  return n.toFixed(DECIMALS).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+  const [mantissa, exponent] = String(Math.abs(n)).split('e');
+  const plain = exponent === undefined ? mantissa : `0.${'0'.repeat(-Number(exponent) - 1)}${mantissa.replace('.', '')}`;
+  const [whole, fraction = ''] = plain.split('.');
+  const cut = fraction.slice(0, DECIMALS).replace(/0+$/, '');
+  return `${n < 0 ? '-' : ''}${whole}${cut ? `.${cut}` : ''}`;
 }
 
 /**
@@ -261,15 +287,6 @@ interface RollOverSimulationWire {
     fee?: string | null;
     error?: string | null;
   }>;
-}
-
-/** One call of the venue's roll-over builder: a `place-order` call plus what it trades. */
-interface RollOverCall extends PlaceOrderCall {
-  action: 'close' | 'open';
-  marketId: number;
-  /** 18-decimal integer string. */
-  size: string;
-  resolved?: { side?: number; requestedRate?: number };
 }
 
 interface TxResponse {
@@ -456,16 +473,34 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
     return typeof res?.balanceInUSD === 'number' ? res.balanceInUSD : null;
   };
 
-  /** `cents`, not dollars: the exact integer→wei step is the whole point, so
-   * no float ever reaches the amount. */
+  /**
+   * `cents`, not dollars: the exact integer→wei step is the whole point, so
+   * no float ever reaches the amount.
+   *
+   * Charged to the CROSS account of `marketId`'s collateral zone, in that
+   * zone's token — the dollars are converted at the token's price. Throws when
+   * the zone or its price cannot be read: guessing would either pay from the
+   * wrong zone or treat token units as dollars.
+   */
   const buildPayTreasuryCalldata = async (cents: number, marketId: number): Promise<Hex[]> => {
+    const tokenId = await config.tokenIdForMarket(marketId);
+    if (tokenId === undefined) {
+      throw new CoreError(`Boros market ${marketId} is not listed, so its collateral is unknown.`, 'validation');
+    }
+    const priceUsd = config.collateralPriceUsd ? await config.collateralPriceUsd(tokenId) : null;
+    if (typeof priceUsd !== 'number' || !(priceUsd > 0)) {
+      throw new CoreError(
+        `The USD price of Boros collateral token ${tokenId} is unknown, so a $${cents / 100} gas top-up cannot be converted into it.`,
+        'venue-rejected',
+      );
+    }
     const { calls } = await call<{ calls: PlaceOrderCall[] }>(
       '/v1/calldata-builder/agent/pay-treasury',
       {
         accountId: config.accountId,
         isCross: true,
         marketId,
-        amount: (BigInt(cents) * 10n ** BigInt(DECIMALS - 2)).toString(),
+        amount: usdCentsToCollateralWei(cents, priceUsd).toString(),
       },
     );
     if (!calls?.length) {
@@ -480,7 +515,13 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
   /**
    * The top-up an order carries so it can pay its own gas — see
    * AUTO_TOP_UP_BELOW_USD. Empty when the budget is healthy, unreadable, or
-   * there is no USD market to charge.
+   * the collateral cannot be priced.
+   *
+   * Charged on `marketId`, a market the batch itself trades, unless
+   * `pickMarket` names another zone because this one cannot spare it.
+   * Charging the USD zone regardless refused every order from an account with
+   * no USDT (its `_checkIMStrict` reverts, and `requireSuccess` takes the
+   * whole batch down with it).
    *
    * Best effort ON PURPOSE. Every failure here returns [] and lets the order go
    * out: the budget may well be fine, and refusing to trade because a
@@ -488,8 +529,12 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
    * removes. If the balance really was too low the venue refuses the bundle and
    * `classifyLegFailure` reports that as a gas failure, which is the truth.
    */
-  const autoTopUpCalldata = async (reducing: boolean): Promise<Hex[]> => {
-    if (!config.usdMarketId) return [];
+  const autoTopUpCalldata = async (
+    reducing: boolean,
+    marketId: number | undefined,
+    pickMarket?: PlaceOrdersOptions['gasTopUpMarket'],
+  ): Promise<Hex[]> => {
+    if (!config.collateralPriceUsd || marketId === undefined) return [];
     try {
       const balance = await readGasBalance();
       // An EXIT is funded only when it genuinely cannot pay. The relayer's floor
@@ -499,25 +544,22 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
       // OPEN keeps the buffer: it is the order that should not stall next time.
       const floor = reducing ? 0 : AUTO_TOP_UP_BELOW_USD;
       if (balance === null || balance >= floor) return [];
-      const marketId = await config.usdMarketId();
-      if (marketId === undefined) return [];
       // A negative budget is debt. Clear it and leave the full amount on top,
       // which is what Boros charges its own users in the same state.
       //
-      // Counted in CENTS, and the wei built from those, because `decimalString`
-      // goes through `toFixed(18)`: $1.80 as a float is 1.80000000000000004…,
-      // and formatting it to 18 places writes that tail into the amount. Round
+      // Counted in CENTS, and the wei built from those, so no float tail
+      // reaches the amount: $1.80 as a float is 1.80000000000000004…. Round
       // rather than ceil — a sub-cent under-recovery of the debt is absorbed by
       // the whole dollar sitting on top of it.
       const owed = balance < 0 ? -balance : 0;
       const cents = Math.round(AUTO_TOP_UP_USD * 100) + Math.round(owed * 100);
-      return await buildPayTreasuryCalldata(cents, marketId);
+      return await buildPayTreasuryCalldata(cents, pickMarket ? pickMarket(cents / 100, marketId) : marketId);
     } catch {
       return [];
     }
   };
 
-  const buildOrderCalldata = async (req: BorosMarketOrderRequest): Promise<Hex> => {
+  const buildOrderCalldata = async (req: BorosMarketOrderRequest, tif: number): Promise<Hex> => {
     const { calls } = await call<{ calls: PlaceOrderCall[] }>(
       '/v1/calldata-builder/agent/place-order',
       {
@@ -525,7 +567,7 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
         marketId: req.marketId,
         side: req.direction === 'long' ? SIDE_LONG : SIDE_SHORT,
         size: (req.sizeWei ?? parseUnits(decimalString(req.size), DECIMALS)).toString(),
-        tif: TIF_IOC,
+        tif,
         // The worst rate this leg accepts. `slippage` is deliberately NOT sent
         // alongside: the backend derives its guard from mid ± slippage, which
         // would silently replace the bound the user's tolerance produced.
@@ -583,42 +625,196 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
     failure: { code: 'unknown', message },
   });
 
+  /** `bulkCancels` calldata clearing every resting order on these markets. */
+  const cancelCalldatas = async (marketIds: number[] = []): Promise<Hex[]> => {
+    const perMarket = await Promise.all(
+      marketIds.map(async (marketId) => {
+        const marketAcc = await marketAccFor(marketId);
+        const { calls } = await call<{ calls: PlaceOrderCall[] }>('/v1/calldata-builder/agent/cancel-orders', {
+          markets: [{ marketAcc, marketId, cancelAll: true, orderIds: [] }],
+        });
+        return (calls ?? []).map((c) => c.calldata as Hex);
+      }),
+    );
+    return perMarket.flat();
+  };
+
+  /**
+   * An open roll window previews on a poll (4 s until 1.7.6, now 10 s), and
+   * the venue meters each client IP at 200 computing units a minute (the
+   * root's market-acc infos cost 5). Read afresh on every 4 s poll, the
+   * preview alone spent 14 units a poll, 210 a minute, and every read from the IP failed with 429 until the minute
+   * turned. So a polled preview reuses its account reads for
+   * PREVIEW_READ_TTL_MS. The check before a send reads fresh (`fresh`), and a
+   * send or a cancel clears the reads before it starts and after it ends, so
+   * no read taken mid-send outlives it.
+   */
+  const previewReads = new Map<string, { at: number; value: Promise<unknown> }>();
+  const previewRead = <T>(key: string, load: () => Promise<T>): Promise<T> => {
+    const hit = previewReads.get(key);
+    if (hit && Date.now() - hit.at < PREVIEW_READ_TTL_MS) return hit.value as Promise<T>;
+    const value = load();
+    previewReads.set(key, { at: Date.now(), value });
+    value.catch(() => previewReads.delete(key));
+    return value;
+  };
+
+  type MarketAccInfo = { marketAcc?: string; positions?: Array<{ marketId: number; signedSize?: string; orders?: unknown[] }> };
+  const readMarketAccInfos = async (cached = false): Promise<MarketAccInfo[]> => {
+    const read = async () =>
+      (await call<{ results?: MarketAccInfo[] }>(`/v1/accounts/market-acc-infos-by-root?root=${config.root}`, undefined, 'GET')).results ?? [];
+    return cached ? previewRead('infos', read) : read();
+  };
+  const readEnteredMarkets = (marketAcc: string, cached = false) => {
+    const read = () =>
+      call<{ results?: Array<{ marketId: number; isMatured?: boolean }> }>(`/v1/accounts/entered-markets?marketAcc=${marketAcc}`, undefined, 'GET');
+    return cached ? previewRead(`entered:${marketAcc}`, read) : read();
+  };
+
+  /**
+   * `enterExitMarkets` calldata that frees market slots on the cross accounts
+   * these markets trade on, for the head of the same batch.
+   *
+   * A cross account may be in only so many markets (`MMMarketLimitExceeded`,
+   * MarginManager.sol), and a matured market keeps its slot until it is
+   * exited. The core builder the Boros app uses exits markets before every
+   * order (pendle-backend-v3 `TradeService.getExitMarketIds`); the open-api
+   * `place-order` this client uses does not, so it is done here:
+   * - always, every matured market: the contract lets a matured market go
+   *   even with a residual position (MarketHubEntry.sol `exitMarket`);
+   * - with `withEmpty`, also every market holding no position and no order.
+   * Never a market this batch trades.
+   *
+   * Best effort, like the gas top-up: a failed read sends the batch without
+   * exits, and the venue stays the check.
+   */
+  /**
+   * The cross markets an opening batch exits at its head, per account: every
+   * matured one, and with `withEmpty` every one holding no position and no
+   * order. Never a market the batch trades. Empty when they cannot be read.
+   */
+  const exitMarketIdsFor = async (marketIds: number[], withEmpty: boolean, cached = false): Promise<Array<{ marketAcc: string; ids: number[] }>> => {
+    try {
+      const keep = new Set(marketIds);
+      const accs = [...new Set((await Promise.all(marketIds.map(marketAccFor))).map((a) => a.toLowerCase()))];
+      const infos = withEmpty ? await readMarketAccInfos(cached) : [];
+      const out: Array<{ marketAcc: string; ids: number[] }> = [];
+      for (const marketAcc of accs) {
+        const { results } = await readEnteredMarkets(marketAcc, cached);
+        const exits = new Set((results ?? []).filter((m) => m.isMatured === true).map((m) => m.marketId));
+        const positions = infos.find((r) => r.marketAcc?.toLowerCase() === marketAcc)?.positions ?? [];
+        for (const p of positions) {
+          if (BigInt(p.signedSize ?? '0') === 0n && (p.orders ?? []).length === 0) exits.add(p.marketId);
+        }
+        const ids = [...exits].filter((id) => !keep.has(id));
+        if (ids.length > 0) out.push({ marketAcc, ids });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  };
+
+  const exitCalldataFor = async (ids: number[]): Promise<Hex[]> => {
+    if (ids.length === 0) return [];
+    const built = await call<{ calls?: PlaceOrderCall[] }>('/v1/calldata-builder/agent/exit-markets', {
+      accountId: config.accountId,
+      isCross: true,
+      marketIds: ids,
+    });
+    return (built.calls ?? []).map((c) => c.calldata as Hex);
+  };
+
+  const exitCalldatas = async (marketIds: number[], withEmpty: boolean): Promise<Hex[]> => {
+    try {
+      const out: Hex[] = [];
+      for (const { ids } of await exitMarketIdsFor(marketIds, withEmpty)) out.push(...(await exitCalldataFor(ids)));
+      return out;
+    } catch {
+      return [];
+    }
+  };
+
+  /**
+   * The markets the first `closeCount` legs leave empty, to exit between
+   * those closes and the opens behind them. The head exits cannot take them:
+   * the markets are still live when the batch starts, so at the cap the
+   * opens' `enterMarket` breaks it (MMMarketLimitExceeded). Once its close
+   * has run, a market at size 0 with no order may go (MarketHubEntry.sol
+   * `exitMarket`).
+   *
+   * A leg counts only when the venue says it takes the WHOLE cross position:
+   * the opposite side, the held size to the wei, no order left on the market
+   * (none, or the batch cancels them at its head), and no other leg on it. A
+   * part close, a market another pair also holds, or a market with an order
+   * the batch keeps keeps its slot. Best effort, like the head exits: an
+   * unreadable account exits nothing.
+   */
+  const flatAfterCloses = async (reqs: BorosMarketOrderRequest[], closeCount: number, cancelled: number[] = [], cached = false): Promise<number[]> => {
+    if (closeCount <= 0) return [];
+    try {
+      const infos = await readMarketAccInfos(cached);
+      const out: number[] = [];
+      for (const req of reqs.slice(0, closeCount)) {
+        const marketAcc = (await marketAccFor(req.marketId)).toLowerCase();
+        const p = infos.find((r) => r.marketAcc?.toLowerCase() === marketAcc)?.positions?.find((x) => x.marketId === req.marketId);
+        const held = BigInt(p?.signedSize ?? '0');
+        const size = BigInt(req.sizeWei ?? parseUnits(decimalString(req.size), DECIMALS));
+        const flattens = held !== 0n && (held > 0n ? req.direction === 'short' : req.direction === 'long') && (held < 0n ? -held : held) === size;
+        const noOrders = (p?.orders ?? []).length === 0 || cancelled.includes(req.marketId);
+        if (flattens && noOrders && reqs.filter((r) => r.marketId === req.marketId).length === 1) out.push(req.marketId);
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  };
+
+  /**
+   * Run an OPENING batch with the matured exits at its head, and the markets
+   * its leading closes empty exited right behind them. In an opening batch
+   * the legs ahead of `topUpAfter` are the closes (the roll is the one such
+   * batch). When the venue still refuses it for the market cap, nothing
+   * traded (the batch is atomic), so it is rebuilt once with the empty
+   * markets exited too — the same slots the Boros app frees at the cap.
+   */
+  const executeOpening = async (
+    reqs: BorosMarketOrderRequest[],
+    legCalldatas: Hex[],
+    opts: PlaceOrdersOptions | undefined,
+    cancels: Hex[],
+    marketIds: number[],
+  ): Promise<BorosLegFill[]> => {
+    const [exits, between] = await Promise.all([
+      exitCalldatas(marketIds, false),
+      flatAfterCloses(reqs, opts?.topUpAfter ?? 0, opts?.cancelOrdersOn).then(exitCalldataFor).catch((): Hex[] => []),
+    ]);
+    const fills = await execute(reqs, legCalldatas, opts, [...cancels, ...exits], between);
+    if (!fills.every((f) => f.failure?.code === 'market-limit' && f.filledSize === 0)) return fills;
+    const more = await exitCalldatas(marketIds, true);
+    if (more.length === 0 || more.join() === exits.join()) return fills;
+    return execute(reqs, legCalldatas, opts, [...cancels, ...more], between);
+  };
+
   const placeMarketOrders = async (
     reqs: BorosMarketOrderRequest[],
     opts?: PlaceOrdersOptions,
   ): Promise<BorosLegFill[]> => {
     if (reqs.length === 0) return [];
+    const tif = opts?.timeInForce === 'fill-or-kill' ? TIF_FOK : TIF_IOC;
     let legs: Hex[];
+    let cancels: Hex[];
     try {
-      legs = await Promise.all(reqs.map(buildOrderCalldata));
+      [legs, cancels] = await Promise.all([Promise.all(reqs.map((req) => buildOrderCalldata(req, tif))), cancelCalldatas(opts?.cancelOrdersOn)]);
     } catch (err) {
       return reqs.map((req) => neverSentLeg(req, err));
     }
-    return execute(reqs, legs, opts);
+    // A close enters no market, so it needs no slot.
+    if (opts?.reducing === true) return execute(reqs, legs, opts, cancels);
+    return executeOpening(reqs, legs, opts, cancels, reqs.map((r) => r.marketId));
   };
 
-  /**
-   * The venue builds the whole roll — every close sized from the on-chain
-   * position and every open at that size, all FOK — and reports each call's
-   * market, side and size, which is what the fills are read against. The
-   * top-up goes between the closes and the opens: funded like an open, its
-   * strict margin check after the closes freed their margin.
-   */
-  /** The body both roll-over endpoints take: the legs in the venue's units. */
-  const rollOverBody = async (legs: BorosRollLeg[]) => ({
-    marketAcc: await marketAccFor(legs[0].fromMarketId),
-    legs: legs.map((l) => ({
-      fromMarketId: l.fromMarketId,
-      toMarketId: l.toMarketId,
-      size: parseUnits(decimalString(l.size), DECIMALS).toString(),
-      closeRate: l.closeRate,
-      openRate: l.openRate,
-      ammId: AMM_ORDERBOOK_ONLY,
-    })),
-  });
-
-  const simulateRollOver = async (legs: BorosRollLeg[]): Promise<BorosRollSimulation> => {
-    const res = await call<RollOverSimulationWire>('/v1/simulations/roll-over', await rollOverBody(legs));
+  const readRollSimulation = (res: RollOverSimulationWire): BorosRollSimulation => {
     const units = (raw: string | null | undefined): number | null =>
       raw === null || raw === undefined ? null : Number(formatUnits(BigInt(raw), DECIMALS));
     return {
@@ -640,30 +836,52 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
     };
   };
 
-  const rollOver = async (legs: BorosRollLeg[]): Promise<BorosLegFill[]> => {
-    if (legs.length === 0) return [];
-    let calls: RollOverCall[];
-    try {
-      const res = await call<{ calls: RollOverCall[] }>('/v1/calldata-builder/agent/roll-over', await rollOverBody(legs));
-      calls = res?.calls ?? [];
-      if (calls.length !== legs.length * 2) throw new CoreError('Boros returned an unexpected number of roll-over calls', 'venue-rejected');
-    } catch (err) {
-      // Closes then opens, the order the venue would have answered in.
-      const refused = (marketId: number, direction: BorosLegDirection, size: number) =>
-        neverSentLeg({ marketId, direction, size, limitApr: 0, clientOrderId: '' }, err);
-      return [
-        ...legs.map((l) => refused(l.fromMarketId, 'short', l.size)),
-        ...legs.map((l) => refused(l.toMarketId, 'long', l.size)),
-      ];
-    }
-    const reqs = calls.map((c) => ({
-      marketId: c.marketId,
-      direction: (c.resolved?.side === SIDE_SHORT ? 'short' : 'long') as BorosLegDirection,
-      size: Number(formatUnits(BigInt(c.size), DECIMALS)),
-      limitApr: c.resolved?.requestedRate ?? 0,
-      clientOrderId: '',
-    }));
-    return execute(reqs, calls.map((c) => c.calldata as Hex), { reducing: false, topUpAfter: legs.length });
+  /**
+   * A roll previewed as the batch `placeMarketOrders` sends: the cancels of
+   * `cancelOrdersOn` and the market exits at its head, every close, the
+   * exits of the markets those closes empty, then every open, FOK, on one
+   * simulated account state. The venue sizes
+   * each close from the position it holds, capped at the size asked, and
+   * judges each order with the rate guard `/place-order` gives it. Like
+   * `executeOpening`, a refusal for the market cap is asked again with the
+   * empty markets exited too.
+   */
+  const simulateRollOver = async (
+    closes: BorosMarketOrderRequest[],
+    opens: BorosMarketOrderRequest[],
+    opts?: Pick<PlaceOrdersOptions, 'cancelOrdersOn'> & { fresh?: boolean },
+  ): Promise<BorosRollSimulation> => {
+    const cancelMarketIds = opts?.cancelOrdersOn ?? [];
+    const cached = opts?.fresh !== true;
+    const wire = (req: BorosMarketOrderRequest) => ({
+      marketId: req.marketId,
+      size: req.sizeWei ?? parseUnits(decimalString(req.size), DECIMALS).toString(),
+      rate: req.limitApr,
+      ammId: AMM_ORDERBOOK_ONLY,
+    });
+    const marketAcc = await marketAccFor(closes[0].marketId);
+    const marketIds = [...closes, ...opens].map((o) => o.marketId);
+    const exitsFor = async (withEmpty: boolean): Promise<number[]> =>
+      (await exitMarketIdsFor(marketIds, withEmpty, cached)).find((e) => e.marketAcc === marketAcc.toLowerCase())?.ids ?? [];
+    const [exits, exitAfterCloseMarketIds] = await Promise.all([
+      exitsFor(false),
+      flatAfterCloses([...closes, ...opens], closes.length, cancelMarketIds, cached),
+    ]);
+    const run = async (exitMarketIds: number[]) =>
+      readRollSimulation(
+        await call<RollOverSimulationWire>('/v2/simulations/roll-over', {
+          marketAcc,
+          closes: closes.map(wire),
+          opens: opens.map((req) => ({ ...wire(req), side: req.direction === 'long' ? SIDE_LONG : SIDE_SHORT })),
+          ...(exitMarketIds.length > 0 ? { exitMarketIds } : {}),
+          ...(exitAfterCloseMarketIds.length > 0 ? { exitAfterCloseMarketIds } : {}),
+          ...(cancelMarketIds.length > 0 ? { cancelMarketIds } : {}),
+        }),
+      );
+    const first = await run(exits);
+    if (first.status !== 'Refused' || first.reason?.code !== 'MM_MARKET_LIMIT_EXCEEDED') return first;
+    const more = await exitsFor(true);
+    return more.length === 0 || more.join() === exits.join() ? first : run(more);
   };
 
   /**
@@ -680,18 +898,34 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
    * runs (MarginManager.sol) — a caller whose leading legs CLOSE positions
    * places it after them, so that check sees the margin they free.
    */
-  const execute = async (
+  const execute = async (...args: Parameters<typeof executeOnce>): ReturnType<typeof executeOnce> => {
+    // A send changes the account: no read from before or during it is reused.
+    previewReads.clear();
+    try {
+      return await executeOnce(...args);
+    } finally {
+      previewReads.clear();
+    }
+  };
+  const executeOnce = async (
     reqs: BorosMarketOrderRequest[],
     legCalldatas: Hex[],
     opts?: PlaceOrdersOptions,
+    /** Calls that run ahead of everything else (resting-order cancels). */
+    leading: Hex[] = [],
+    /** Calls that run after the first `at` legs, ahead of the top-up (the
+     * exits of the markets those closes empty). */
+    between: Hex[] = [],
   ): Promise<BorosLegFill[]> => {
     let signed: SignedCall[];
     let topUpCount: number;
     const at = Math.max(0, Math.min(reqs.length, opts?.topUpAfter ?? 0));
     try {
-      const topUp = await autoTopUpCalldata(opts?.reducing === true);
+      // Every leg of a batch shares one collateral (an eligible pair must, and
+      // a roll moves a position within its token), so the first leg names it.
+      const topUp = await autoTopUpCalldata(opts?.reducing === true, reqs[0]?.marketId, opts?.gasTopUpMarket);
       topUpCount = topUp.length;
-      signed = await signCalls([...legCalldatas.slice(0, at), ...topUp, ...legCalldatas.slice(at)]);
+      signed = await signCalls([...leading, ...legCalldatas.slice(0, at), ...between, ...topUp, ...legCalldatas.slice(at)]);
     } catch (err) {
       return reqs.map((req) => neverSentLeg(req, err));
     }
@@ -705,11 +939,14 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
       if (status !== undefined && status < 500) return reqs.map((req) => neverSentLeg(req, err));
       throw err;
     }
-    // Everything below indexes BY LEG, and the top-up occupies `topUpCount`
-    // slots of the submission starting at `at`. Read leg results off a view
-    // with those slots removed, or a leg reads the top-up's outcome as its own.
-    const legResponses = [...responses.slice(0, at), ...responses.slice(at + topUpCount)];
-    const submissionIndex = (i: number): number => (i < at ? i : i + topUpCount);
+    // Everything below indexes BY LEG: the leading cancels come first, and the
+    // `between` exits then the top-up occupy `inserted` slots starting at leg
+    // `at`. Read leg results off a view with those slots removed, or a leg
+    // reads another call's outcome as its own.
+    const afterLead = responses.slice(leading.length);
+    const inserted = between.length + topUpCount;
+    const legResponses = [...afterLead.slice(0, at), ...afterLead.slice(at + inserted)];
+    const submissionIndex = (i: number): number => leading.length + (i < at ? i : i + inserted);
 
     // With `requireSuccess` the legs stand or fall together, so one error is
     // the whole batch's — the top-up's included: it is in the same submission,
@@ -723,9 +960,17 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
     const failure =
       responses.find((r) => r?.error && !BATCH_ABORTED.test(r.error)) ?? responses.find((r) => r?.error);
     if (failure) {
-      return reqs.map((req, i) =>
-        failedLeg(req, failure.error as string, legResponses[i] === failure ? 'this-leg' : 'batch'),
-      );
+      // The top-up's own refusal (its strict margin check, usually) is named as
+      // the top-up's: reported bare it reads as the LEGS lacking margin.
+      // Appended, never prefixed — the classifier reads a leading "[SIMULATE]".
+      const topUpFailed = afterLead.slice(at + between.length, at + inserted).includes(failure);
+      const exitFailed = afterLead.slice(at, at + between.length).includes(failure);
+      const reason = topUpFailed
+        ? `${failure.error as string} (refused call: the automatic gas top-up, paid from Boros cross margin)`
+        : exitFailed
+          ? `${failure.error as string} (refused call: the exit of a market the closes leave empty)`
+          : (failure.error as string);
+      return reqs.map((req, i) => failedLeg(req, reason, legResponses[i] === failure ? 'this-leg' : 'batch'));
     }
 
     const txHash = responses.find((r) => r?.txHash)?.txHash;
@@ -799,17 +1044,13 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
 
   return {
     placeMarketOrders,
-    rollOver,
     simulateRollOver,
 
     async cancelOrders(marketId: number): Promise<void> {
-      const marketAcc = await marketAccFor(marketId);
-      const { calls } = await call<{ calls: PlaceOrderCall[] }>(
-        '/v1/calldata-builder/agent/cancel-orders',
-        { markets: [{ marketAcc, marketId, cancelAll: true, orderIds: [] }] },
-      );
-      if (!calls?.length) return;
-      const res = await submitCalls(await signCalls(calls.map((c) => c.calldata)));
+      const calls = await cancelCalldatas([marketId]);
+      if (!calls.length) return;
+      previewReads.clear();
+      const res = await submitCalls(await signCalls(calls)).finally(() => previewReads.clear());
       // An empty result is "we cannot tell",
       // and reporting a cancel that may never have been submitted as done is
       // the one answer a remediation path must not give.
@@ -826,21 +1067,6 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
     },
 
     getGasBalance: readGasBalance,
-
-    async payTreasury(amountUsd: number, marketId: number): Promise<void> {
-      const calldatas = await buildPayTreasuryCalldata(Math.round(amountUsd * 100), marketId);
-      const res = await submitCalls(await signCalls(calldatas));
-      if (!res.length) {
-        throw new CoreError(
-          `Boros returned no result for the $${amountUsd} gas top-up — cannot tell whether it landed.`,
-          'venue-rejected',
-        );
-      }
-      const refused = res.find((r) => r?.error);
-      if (refused) {
-        throw new CoreError(`Boros refused the gas top-up: ${refused.error}`, 'venue-rejected');
-      }
-    },
 
     /**
      * A close is an ordinary opposing market order — Boros has no close
@@ -873,7 +1099,7 @@ export function makeBorosApiOrderClient(config: BorosApiConfig): BorosOrderClien
           // this is a shape change on their side, not a routine case.
           ...(open === null ? {} : { sizeWei: (asked < open ? asked : open).toString() }),
         },
-      ], { reducing: true, topUpAfter: 1 });
+      ], { reducing: true, topUpAfter: 1, gasTopUpMarket: req.gasTopUpMarket });
       return fill;
     },
   };

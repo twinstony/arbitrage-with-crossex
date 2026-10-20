@@ -113,6 +113,36 @@ describe('GET /api/symbols', () => {
     expect(data.leverageMax).toBe(25); // max over the tiers' leverage_max (25 on tiers 1-4, 5 on 5-6)
   });
 
+  it('GET /api/symbols/:symbol returns leverageMax 0 on no tiers, and does not cache that 0', async () => {
+    app = makeTestApp();
+    mockGateGet('/rule/symbols', { fixture: 'rule-symbols.json' });
+    mockGateGet('/rule/risk_limits', { body: [] });
+
+    const first = await app.inject({ method: 'GET', url: '/api/symbols/GATE_FUTURE_ETH_USDT', headers: HOST });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json().data.leverageMax).toBe(0);
+
+    mockGateGet('/rule/risk_limits', { fixture: 'risk-limits.json' });
+    const second = await app.inject({ method: 'GET', url: '/api/symbols/GATE_FUTURE_ETH_USDT', headers: HOST });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(second.json().data.leverageMax).toBe(25);
+  });
+
+  it('GET /api/symbols/:symbol still errors when the risk-limit read itself fails', async () => {
+    app = makeTestApp();
+    mockGateGet('/rule/symbols', { fixture: 'rule-symbols.json' });
+    // This fork retries a Gate 5xx GET once (isRetryableGateError pins that), so
+    // the mock must answer BOTH attempts; a single-use interceptor would turn
+    // the retry into a nock "no match" (= network error, 502) instead of the
+    // Gate envelope this test is about.
+    mockGateGet('/rule/risk_limits', { status: 500, body: { label: 'SERVER_ERROR', message: 'down' }, times: 2 });
+
+    const res = await app.inject({ method: 'GET', url: '/api/symbols/GATE_FUTURE_ETH_USDT', headers: HOST });
+
+    expect(res.statusCode).toBe(500);
+    expect(res.json().ok).toBe(false);
+  });
+
   it('GET /api/symbols/:symbol unknown → 400 symbol-invalid envelope', async () => {
     app = makeTestApp();
     mockGateGet('/rule/symbols', { fixture: 'rule-symbols.json' });
