@@ -1,12 +1,12 @@
 /**
  * Boros agent provisioning: the browser connects a wallet, generates a
- * delegated agent key, approves it on-chain with the ROOT wallet's own
- * signature, and hands only the agent key here.
+ * delegated agent key, has the ROOT wallet sign its approval, and hands the
+ * agent key and the signed approval here. This server sends the approval to
+ * Boros.
  *
  *   GET    /api/boros/agent  — masked status
- *   PUT    /api/boros/agent  — install a generated agent key
+ *   PUT    /api/boros/agent  — install a generated agent key, and send its approval
  *   DELETE /api/boros/agent  — forget it locally
- *   POST   /api/boros/agent/rollback — put back the login a rejected prompt replaced
  *
  * WHY THE KEY COMES HERE AT ALL, rather than the browser signing every order:
  * this terminal runs as a background service and its whole safety story is that
@@ -25,18 +25,22 @@
  * anything that looks like one being passed as the root field.
  */
 import type { FastifyInstance } from 'fastify';
-import { privateKeyToAccount } from 'viem/accounts';
 import { CoreError } from '../../core/errors';
-import { BOROS_API_BASE, makeBorosApiOrderClient } from '../../core/boros/borosApi';
-import { fetchBorosMarkets, resolveBorosFetch, resolveCollateralPricesUsd } from '../../core/boros/client';
+import { makeBorosApiOrderClient } from '../../core/boros/borosApi';
+import {
+  fetchBorosMarkets,
+  relayAgentApproval,
+  resolveBorosFetch,
+  resolveCollateralPricesUsd,
+} from '../../core/boros/client';
 import type { AppDeps } from '../app';
 import { TTL } from '../cache';
 import { readAgentApproval, resetAgentApprovalCache } from '../borosAgentApproval';
-import { refuse } from '../errorReply';
 import { rewriteEnvFile } from './credentials';
 
 const PRIVATE_KEY_RE = /^0x[0-9a-fA-F]{64}$/;
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const HEX_RE = /^0x[0-9a-fA-F]+$/;
 
 /** Show enough of the agent key's OWNER to recognise, never the key itself. */
 export const maskAddress = (a: string): string => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -45,7 +49,7 @@ type AgentService = NonNullable<AppDeps['borosAgent']>;
 type AgentLogin = { root: string; accountId: number; agentPrivateKey: string; expiry?: number };
 
 /** The login a PUT replaced. Kept until the chain shows the new key approved,
- * so a rejected wallet prompt can put the working login back. */
+ * so a refused approval can put the working login back. */
 const PREV_KEYS = [
   'BOROS_PREV_ROOT_ADDRESS',
   'BOROS_PREV_ACCOUNT_ID',
@@ -71,6 +75,16 @@ const applyToProcess = (entries: Record<string, string>): void => {
 };
 
 const hasPrev = (): boolean => Boolean(process.env.BOROS_PREV_ROOT_ADDRESS && process.env.BOROS_PREV_AGENT_PRIVATE_KEY);
+
+const readPrev = (): AgentLogin => {
+  const rawExpiry = Number(process.env.BOROS_PREV_AGENT_EXPIRY);
+  return {
+    root: process.env.BOROS_PREV_ROOT_ADDRESS ?? '',
+    accountId: Number(process.env.BOROS_PREV_ACCOUNT_ID ?? 0) || 0,
+    agentPrivateKey: process.env.BOROS_PREV_AGENT_PRIVATE_KEY ?? '',
+    expiry: Number.isFinite(rawExpiry) && rawExpiry > 0 ? rawExpiry : undefined,
+  };
+};
 
 const clearPrev = (svc: AgentService | undefined): void => {
   if (!PREV_KEYS.some((k) => process.env[k])) return;
@@ -129,7 +143,9 @@ export function borosAgentRoutes(deps: AppDeps) {
               {
                 fresh: (req.query as { fresh?: string } | undefined)?.fresh === '1',
                 onApproved: () => {
-                  clearPrev(deps.borosAgent);
+                  // A PUT may have replaced this key while Boros answered. Its
+                  // stash is then the login to put back: keep it.
+                  if (process.env.BOROS_AGENT_PRIVATE_KEY === agentPrivateKey) clearPrev(deps.borosAgent);
                   deps.borosAgent?.onApproved?.();
                 },
               },
@@ -165,6 +181,7 @@ export function borosAgentRoutes(deps: AppDeps) {
             accountId?: number;
             agentPrivateKey?: string;
             expiry?: number;
+            approveAgentCalldata?: string;
           }
         | undefined;
       const root = body?.root?.trim();
@@ -206,6 +223,13 @@ export function borosAgentRoutes(deps: AppDeps) {
         throw new CoreError('accountId must be a non-negative integer');
       }
 
+      // Optional: without it the PUT only installs the key, as it did before
+      // the server sent approvals. Scripts that approve elsewhere rely on that.
+      const approveAgentCalldata = body?.approveAgentCalldata;
+      if (approveAgentCalldata !== undefined && (typeof approveAgentCalldata !== 'string' || !HEX_RE.test(approveAgentCalldata))) {
+        throw new CoreError('approveAgentCalldata must be 0x hex');
+      }
+
       // Keep the login this replaces until the new key is approved. When a
       // stash already exists, the current key was never seen approved, so
       // the stash is still the last working login: keep it.
@@ -222,25 +246,36 @@ export function borosAgentRoutes(deps: AppDeps) {
         };
       }
 
-      return reply.ok(install(svc, { root, accountId, agentPrivateKey, expiry }, stash));
-    });
-
-    app.post('/boros/agent/rollback', async (_req, reply) => {
-      const svc = deps.borosAgent;
-      if (!svc) throw new CoreError('Boros agent service not configured on this server');
-      const root = process.env.BOROS_PREV_ROOT_ADDRESS;
-      const agentPrivateKey = process.env.BOROS_PREV_AGENT_PRIVATE_KEY;
-      if (!root || !agentPrivateKey) {
-        return refuse(reply, { code: 409, category: 'validation', message: 'Nothing to restore.', retryable: false });
+      // The key is saved BEFORE the approval is sent. Approving first and then
+      // failing to save would leave a live, year-long approval for a key
+      // nobody holds. A saved key with no approval is inert: the status reads
+      // the chain and shows it as not approved.
+      let installed: ReturnType<typeof install>;
+      try {
+        installed = install(svc, { root, accountId, agentPrivateKey, expiry }, stash);
+      } catch (err) {
+        // A plain refusal, so the browser shows it instead of waiting on Boros.
+        throw new CoreError(`Could not save the login on this machine: ${(err as Error)?.message ?? String(err)}`);
       }
-      const rawExpiry = Number(process.env.BOROS_PREV_AGENT_EXPIRY);
-      const login: AgentLogin = {
-        root,
-        accountId: Number(process.env.BOROS_PREV_ACCOUNT_ID ?? 0) || 0,
-        agentPrivateKey,
-        expiry: Number.isFinite(rawExpiry) && rawExpiry > 0 ? rawExpiry : undefined,
-      };
-      return reply.ok(install(svc, login, PREV_CLEARED));
+      if (approveAgentCalldata === undefined) return reply.ok(installed);
+
+      const outcome = await relayAgentApproval(resolveBorosFetch(deps.borosFetch), approveAgentCalldata);
+      if (outcome.ok) return reply.ok(installed);
+
+      // Keep the new key only when Boros approved it. Otherwise put the
+      // replaced login back: if the approval still lands, it only leaves an
+      // agent nobody holds, while a key that never lands leaves no way to
+      // trade. Skipped when another login replaced this one meanwhile. A
+      // first login has nothing to put back: its key stays and the status
+      // shows whether it landed.
+      let message = outcome.message.replace(/\.?$/, '.');
+      if (process.env.BOROS_AGENT_PRIVATE_KEY === agentPrivateKey && hasPrev()) {
+        const prev = readPrev();
+        install(svc, prev, PREV_CLEARED);
+        const back = await readAgentApproval(resolveBorosFetch(deps.borosFetch), prev, { fresh: true });
+        if (back.state === 'approved') message += ` ${maskAddress(prev.root)} is still logged in.`;
+      }
+      throw new CoreError(message, outcome.rateLimited ? 'rate-limited' : 'venue-rejected');
     });
 
     app.delete('/boros/agent', async (_req, reply) => {
@@ -279,91 +314,6 @@ export function borosAgentRoutes(deps: AppDeps) {
         configured: false,
         note: 'The key is gone from this machine. The on-chain approval is still live until you revoke it in the Boros app or it expires.',
       });
-    });
-
-    /**
-     * Relay an agent approval to Boros from the SERVER side.
-     *
-     * The browser cannot call api-boros directly: that API answers no CORS
-     * headers on any response, so a cross-origin script request dies in the
-     * preflight before it ever leaves. Every other Boros path in this app
-     * rides the server's own fetch (undici, HTTPS_PROXY-aware); this route
-     * makes the approval the same channel — the browser signs the EIP-712
-     * message locally, then hands the calldata here to be relayed.
-     *
-     * `skipReceipt` is deliberately OFF-side: the bot broadcasts and answers
-     * immediately with the txHash, and the CALLER polls the on-chain agent
-     * expiry (`/boros/agent/chain-expiry`) for the outcome. Waiting for the
-     * receipt server-side would marry this route to Arbitrum's confirmation
-     * latency (often >60s) and turn a slow-but-valid approval into a timeout.
-     */
-    app.post('/boros/agent/approve', async (req, reply) => {
-      const body = req.body as { approveAgentCalldata?: string } | undefined;
-      const calldata = body?.approveAgentCalldata?.trim();
-      if (!calldata || !/^0x[0-9a-fA-F]+$/.test(calldata)) {
-        throw new CoreError('approveAgentCalldata must be 0x-prefixed hex calldata', 'validation');
-      }
-
-      let resp: Awaited<ReturnType<typeof fetch>>;
-      try {
-        resp = await fetch(`${BOROS_API_BASE}/v1/send-txs/approve`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ approveAgentCalldata: calldata, skipReceipt: true }),
-          signal: AbortSignal.timeout(30_000),
-        });
-      } catch (err) {
-        throw new CoreError(
-          `Boros approve relay unreachable: ${(err as Error)?.message ?? err}`,
-          'network',
-        );
-      }
-      const json = (await resp.json().catch(() => null)) as {
-        approveAgentResult?: { txHash?: string; status?: string; error?: string };
-      } | null;
-      const result = json?.approveAgentResult;
-      if (!resp.ok || !result) {
-        const detail = result?.error ?? (json as { message?: string } | null)?.message;
-        throw new CoreError(
-          `Boros refused the approval relay (HTTP ${resp.status})${detail ? `: ${detail}` : ''}`,
-          'venue-rejected',
-        );
-      }
-      return reply.ok({ txHash: result.txHash, status: result.status, error: result.error });
-    });
-
-    /**
-     * The CHAIN's answer for the currently configured agent — `expiryTime` is
-     * 0 while the approval has not landed (never approved / revoked), and a
-     * future unix timestamp once it has. The panel polls this after an
-     * approve relay, using the chain rather than the .env mirror as truth.
-     */
-    app.get('/boros/agent/chain-expiry', async (_req, reply) => {
-      const root = process.env.BOROS_ROOT_ADDRESS?.trim();
-      const key = process.env.BOROS_AGENT_PRIVATE_KEY?.trim();
-      if (!root || !key) {
-        throw new CoreError('Boros agent is not configured on this server', 'validation');
-      }
-      const agentAddress = privateKeyToAccount(key as `0x${string}`).address;
-      const accountId = Number(process.env.BOROS_ACCOUNT_ID ?? 0);
-
-      let resp: Awaited<ReturnType<typeof fetch>>;
-      try {
-        resp = await fetch(
-          `${BOROS_API_BASE}/v1/agents/expiry-time?root=${root}&accountId=${accountId}&agentAddress=${agentAddress}`,
-          { signal: AbortSignal.timeout(10_000) },
-        );
-      } catch (err) {
-        throw new CoreError(
-          `Boros chain-expiry unreachable: ${(err as Error)?.message ?? err}`,
-          'network',
-        );
-      }
-      const json = (await resp.json().catch(() => null)) as { expiryTime?: number } | null;
-      if (!resp.ok || typeof json?.expiryTime !== 'number') {
-        throw new CoreError(`Boros refused the expiry lookup (HTTP ${resp.status})`, 'venue-rejected');
-      }
-      return reply.ok({ expiryTime: json.expiryTime });
     });
   };
 }
