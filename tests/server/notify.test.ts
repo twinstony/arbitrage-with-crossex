@@ -60,6 +60,8 @@ function makePair(over: Partial<OpportunityPair> = {}): OpportunityPair {
   });
   return {
     base: 'BTC',
+    // 1.7.8：OpportunityPair 带上按资金定价后的每腿名义值（必填）。
+    notionalUsd: 100_000,
     shortLeg: perpLeg('BINANCE'),
     longLeg: perpLeg('BYBIT'),
     borosLegs: [

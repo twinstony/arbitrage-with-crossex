@@ -17,7 +17,7 @@ describe('host/origin guard', () => {
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({
       ok: false,
-      error: { category: 'auth', message: 'forbidden host/origin' },
+      error: { category: 'auth', message: 'Requests from this address are refused. Open the terminal on this computer.' },
     });
   });
 
@@ -57,9 +57,10 @@ describe('host/origin guard', () => {
   // HOST opts the bind address into the trust set (LAN exposure, see
   // server/index.ts): the address joins Host AND Origin literally, while
   // foreign names stay rejected — and it must not leak into a default build.
-  describe('HOST opt-in', () => {
+  describe('HOST / HOSTS opt-in', () => {
     afterEach(async () => {
       delete process.env.HOST;
+      delete process.env.HOSTS;
       await app?.close();
       app = undefined as unknown as FastifyInstance;
     });
@@ -75,6 +76,22 @@ describe('host/origin guard', () => {
       expect(res.statusCode).toBe(200);
     });
 
+    it('trusts every address named in a comma-separated HOSTS list', async () => {
+      delete process.env.HOST;
+      process.env.HOSTS = '100.118.248.92, 10.0.0.138';
+      app = makeTestApp();
+      for (const addr of ['100.118.248.92:6688', '10.0.0.138:6688']) {
+        const res = await app.inject({
+          method: 'GET',
+          url: URL,
+          headers: { ...HOST, host: addr, origin: `http://${addr}` },
+        });
+        expect(res.statusCode, addr).toBe(200);
+      }
+      const other = await app.inject({ method: 'GET', url: URL, headers: { host: 'evil.com' } });
+      expect(other.statusCode).toBe(403);
+    });
+
     it('still rejects a foreign Host when HOST is set', async () => {
       process.env.HOST = '10.0.0.138';
       app = makeTestApp();
@@ -82,8 +99,9 @@ describe('host/origin guard', () => {
       expect(res.statusCode).toBe(403);
     });
 
-    it('stays localhost-only when HOST is unset', async () => {
+    it('stays localhost-only when HOST and HOSTS are unset', async () => {
       delete process.env.HOST;
+      delete process.env.HOSTS;
       app = makeTestApp();
       const res = await app.inject({
         method: 'GET',

@@ -34,6 +34,7 @@ import { rebalanceRoutes } from './routes/rebalance';
 import { symbolsRoutes } from './routes/symbols';
 import { shareLinkRoutes } from './routes/shareLink';
 import { telegramRoutes } from './routes/telegram';
+import { assetPrefsRoutes } from './routes/assetPrefs';
 import { transferRoutes } from './routes/transfer';
 import { versionRoutes } from './routes/version';
 import { tradesRoutes } from './routes/trades';
@@ -139,16 +140,32 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   //
   // HOST (the bind address the entry point opts into, e.g. 10.0.0.138) joins the
   // trust set LITERALLY and exact-escaped — never a wildcard — so the API only
-  // answers a Host header naming the one address the server actually binds. A
-  // browser on the LAN visiting http://10.0.0.138:6688 sends exactly that Host,
-  // and its same-origin fetches carry exactly that Origin; a rebinding attack
-  // can still only ride localhost. Binding 0.0.0.0 deliberately does NOT widen
-  // this: the guard then fails closed to localhost-only, and the operator must
-  // name the real address.
-  const lanHost = (process.env.HOST ?? '').trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const lanHostAlt = lanHost ? `|${lanHost}` : '';
-  const LOCAL_HOST_RE = new RegExp(`^(localhost|127\\.0\\.0\\.1${lanHostAlt})(:\\d+)?$`);
-  const LOCAL_ORIGIN_RE = new RegExp(`^https?://(localhost|127\\.0\\.0\\.1${lanHostAlt})(:\\d+)?$`);
+  // answers a Host header naming one of the addresses the operator trusts. A
+  // browser on the LAN or Tailscale visiting http://10.0.0.138:6688 or
+  // http://100.118.248.92:6688 sends exactly that Host, and its same-origin
+  // fetches carry exactly that Origin; a rebinding attack can still only ride
+  // localhost. Binding 0.0.0.0 deliberately does NOT widen this: the guard then
+  // fails closed to localhost-only, and the operator must name the real
+  // addresses. HOSTS is a comma-separated override; absent it, HOST is used.
+  const lanHost = (process.env.HOST ?? '').trim();
+  const lanHostsRaw = (process.env.HOSTS ?? lanHost).trim();
+  // Trust set: localhost + 127.0.0.1 plus every address named in HOSTS
+  // (comma-separated) or HOST. Plain string comparison — never a regex built
+  // from operator input, so an address can't accidentally act as a pattern.
+  // Binding 0.0.0.0 does NOT widen this: the guard fails closed to the named
+  // addresses only.
+  const trustedHosts = new Set(['localhost', '127.0.0.1']);
+  for (const entry of lanHostsRaw.split(',')) {
+    const trimmed = entry.trim();
+    if (trimmed) trustedHosts.add(trimmed);
+  }
+  // Reduce a Host or Origin header to its bare host: drop an optional scheme
+  // and an optional port. IPv4 / localhost only, so the first colon wins.
+  const bareHost = (value: string): string => {
+    const noScheme = value.includes('://') ? value.slice(value.indexOf('://') + 3) : value;
+    const colon = noScheme.indexOf(':');
+    return colon === -1 ? noScheme : noScheme.slice(0, colon);
+  };
 
   // Fail closed on a missing wire-up: an optional field that silently
   // disables authentication is exactly the regression this catches.
@@ -171,12 +188,12 @@ export function buildApp(deps: AppDeps): FastifyInstance {
 
     const host = req.headers.host;
     const origin = req.headers.origin;
-    const hostOk = host !== undefined && LOCAL_HOST_RE.test(host);
-    const originOk = origin === undefined || LOCAL_ORIGIN_RE.test(origin);
+    const hostOk = host !== undefined && trustedHosts.has(bareHost(host));
+    const originOk = origin === undefined || trustedHosts.has(bareHost(origin));
     if (!hostOk || !originOk) {
       return reply
         .code(403)
-        .send({ ok: false, error: { category: 'auth', message: 'forbidden host/origin' } });
+        .send({ ok: false, error: { category: 'auth', message: 'Requests from this address are refused. Open the terminal on this computer.' } });
     }
 
     // The token gate. Scoped to /api DELIBERATELY: this hook runs before the
@@ -204,9 +221,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
           ok: false,
           error: {
             category: 'auth',
-            message: 'missing or invalid API token',
+            message: 'This page is out of date. Reload it.',
             retryable: false,
-            hint: 'Reload the page. Scripting the API? Send the x-arb-token header — see the README.',
           },
         });
       }
@@ -234,6 +250,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     opportunitiesRoutes,
     borosPairRoutes,
     assetViewRoutes,
+    assetPrefsRoutes,
     borosAgentRoutes,
     rebateRoutes,
     booksRoutes,
