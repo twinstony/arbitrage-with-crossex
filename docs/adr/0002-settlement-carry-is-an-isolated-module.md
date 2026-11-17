@@ -36,13 +36,33 @@ CrossEx 账本读取（约 30 行）在模块内**自带一份**，不从 `asset
 - 金额符号以 `BorosSettlementEvent.settlementToken` 的定义为准：**带符号净额**
   （+ = 账户收到，一笔收益；− = 付出），且已扣当期手续费。所以 Boros 腿
   USD = `settlementToken × tokenPrice`，不再二次减 fee，也不取反。
+- 「实际价差」**是浮动腿的实现率，不是结算净额**（审阅第 2 轮阻塞项）：结算净额
+  `settlement` = 锁定 − 浮动（空头），拿它当「实际」会把「少赚/多赚」判反。每期口径：
+
+  ```
+  fixed = |entryApr| × paymentPeriod / YEAR_SEC        // 锁定腿折成每期
+  net   = Σsettlement / Σ|仓位|                        // 每期净额（带符号）
+  fee   = Σfee / Σ|仓位|                               // 每期费率的成本
+  float = fixed − net − fee（空头） / fixed + net + fee（多头）
+  actualApr = float × YEAR_SEC / paymentPeriod × sideSign
+  ```
+
+  实测（2026-11-17 00:00–08:00 UTC）：BTC entryApr 4.0967%、净额 −2.0555%（年化）、
+  浮动实现率 **5.95%/年**（锁定 4.10% → 少赚 1.86pp）；ETH **6.58%/年**（锁定 3.66% → 少赚 2.92pp）。
+- **归期按期终，不按落账时刻**（审阅第 2 轮阻塞项）：三源落账都比期终晚——Boros 结算
+  晚约 118s（每 8h 一次，00:01:58 落的是 [16:00, 00:00) 那期），CrossEx 账本行晚约 2 分钟
+  （8h 所的 `businessId` 尾缀就是期终 epoch，如 `…_1794873600`；HL 的每小时行尾缀是整点）。
+  统一规则：`期终 = floor(t / paymentPeriod) × paymentPeriod`，取 `期终 ∈ (from, to]` 的记录。
+  账本行的期终取 `businessId` 尾缀（须像样 epoch，否则退回 `createTime`——利息行是纯 id）。
+  调度宽限因此必须 ≥ 实测落账延迟：`BOUNDARY_GRACE_SEC = 180`（原 60s 结构上永远拿不到
+  本窗口自己的结算）。
 - 「实际价差」的两件易错事（审阅第 1 轮打回的两个阻塞项，长期有效）：
   1. **每期 vs 年化**：`BorosSettlementEvent.settlementRate` 是**每期**收益率
      （实测逐位等于 `|settlement| / |positionSize|`；8h 市场就是 8h 的收益率），
      而锁定价差 `entryApr` 是年化 APR。两者相减前必须按该市场的 `paymentPeriod`
      年化（`× 365d / paymentPeriod`），否则 8h 市场的实际价差被低估约 1000 倍。
-  2. **该字段不带符号**（付出窗口也是正数）：实际价差的符号一律取自现金流
-     `settlementToken / |position|`，不用 venue 回报的 `settlementRate` 的符号。
+  2. **该字段不带符号**（付出窗口也是正数）：每期净额一律由现金流
+     `settlementToken / |position|` 推出，不用 venue 回报的 `settlementRate` 的符号。
   这两条只在 `settlementCarry.ts` 内处理——`core/boros/client.ts` 的字段注释仍是
   上游的写法（写明「年化」），本模块以实测行为为准，不改上游文件。
 - 播报与审计一律**不做累计统计**：单腿大额获利的窗口会污染累计口径，干扰

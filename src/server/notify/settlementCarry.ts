@@ -33,6 +33,14 @@
  *    `paymentPeriod` 年化：`× 365d / paymentPeriod`。
  *  - **符号取自现金流，不信 `settlementRate`**：该字段不带符号（付出窗口也是正数），
  *    所以每期费率由 `settlementToken / |positionAbs|` 推出——符号即结算方向。
+ *  - **实际价差 = 浮动腿的实现率，不是结算净额**：净额 = 锁定 − 浮动（空头），
+ *    直接拿净额当「实际」会把「少赚/多赚」判反。空头 `fixed − 净额 − 费率`、
+ *    多头 `净额 + fixed + 费率`（`fixed` = `|entryApr|` 折成每期值，净额/费率
+ *    按 |仓位| 归一），再按 `side` 取号与 `lockedApr` 相减。
+ *  - **归期按期终，不按落账时刻**：期终 = `floor(t / paymentPeriod) × paymentPeriod`。
+ *    Boros 结算落账比期终晚约 2 分钟（实测 118s），CrossEx 账本行同样晚约 2 分钟，
+ *    两源都按 `期终 ∈ (from, to]` 归窗——否则配对的两侧各差一期/一小时。
+ *    账本行的期终取 `businessId` 尾缀的 epoch（venue 自己记的期终）。
  *  - **不做累计统计**：一个窗口就是一段时间里的现金流，累计口径会被单腿大额
  *    获利污染，干扰判断。
  *
@@ -103,8 +111,11 @@ export function carryWindow(nowSec: number): { fromSec: number; toSec: number } 
   return { fromSec: toSec - WINDOW_SEC, toSec };
 }
 
-/** 边界后的宽限：结算事件可能晚几秒才进 feed。 */
-const BOUNDARY_GRACE_SEC = 60;
+/**
+ * 边界后的宽限：期终到落账有延迟，实测 Boros 结算晚 118s、CrossEx 账本约 2 分钟。
+ * 取 180s（≥ 实测值 + 余量）：早于它跑，本窗口自己的结算还没进 feed。
+ */
+export const BOUNDARY_GRACE_SEC = 180;
 
 /**
  * 下一次运行的延迟：踩在 **UTC 0/8/16 边界**（窗口一结束就播，而不是「启动时刻
@@ -114,7 +125,11 @@ export function nextRunDelayMs(nowMs: number, intervalSec: number): number {
   const nowSec = Math.floor(nowMs / 1000);
   const nextBoundarySec = (Math.floor(nowSec / WINDOW_SEC) + 1) * WINDOW_SEC + BOUNDARY_GRACE_SEC;
   const toBoundaryMs = (nextBoundarySec - nowSec) * 1000;
-  return Math.max(1_000, Math.min(intervalSec * 1000, toBoundaryMs));
+  // 失败重试节奏：`intervalSec` 比「到下一个边界 + 宽限」短时按它走（同一窗口内重试），
+  // 否则踩边界。上限必须含宽限，否则最后一次重试落在边界整点——那时本窗口的结算还没进 feed。
+  const intervalMs = intervalSec * 1000;
+  const cadenceMs = intervalMs < WINDOW_SEC * 1000 ? intervalMs : (WINDOW_SEC + BOUNDARY_GRACE_SEC) * 1000;
+  return Math.max(1_000, Math.min(cadenceMs, toBoundaryMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +153,14 @@ export interface SettlementCarryLeg {
   settlementToken: number;
   /** 窗口内结算手续费，币计，正数成本（仅记录：settlementToken 已扣过它）。 */
   feeToken: number;
+  /**
+   * 结算净额的**每期**率（带符号，`Σsettlement / Σ|仓位|`）：同一窗口多条结算
+   * （小时市场 8 条）时是每期平均值，不是总和——年化用每期值，USD 合计用
+   * `settlementToken`。刻意不用 venue 的 `settlementRate`（它不带符号）。
+   */
+  netPeriodRate: number;
+  /** 手续费的**每期**率（正数成本，`Σfee / Σ|仓位|`）。 */
+  feePeriodRate: number;
   /** 结算代币 → USD；null = 该代币没有可靠币价（不猜、不当 1）。 */
   tokenPriceUsd: number | null;
   /** 开仓锁定的固定年化（APR 小数）；仓位已平掉时为 null。 */
@@ -145,11 +168,9 @@ export interface SettlementCarryLeg {
   /** 窗口内最近一次结算时的 |仓位|（币），实际价差的权重。 */
   positionAbs: number;
   /**
-   * 本窗口**每期**结算率（规模加权，带符号）：由 `settlementToken / |positionAbs|`
-   * 推出，+ = 收到、− = 付出。刻意不用 venue 的 `settlementRate`——它不带符号。
+   * 该市场的结算周期（秒）：每期率按它年化，固定腿 APR 也按它折成每期值；
+   * 0 = 无法判定（不猜）。
    */
-  periodRate: number;
-  /** 该市场的结算周期（秒），每期率按它年化；0 = 无法年化（不猜）。 */
   paymentPeriodSec: number;
 }
 
@@ -192,10 +213,19 @@ export interface SettlementCarryLegOut {
   positionAbs: number;
   subtotalUsd: number | null;
   lockedApr: number | null;
-  /** 实际价差（年化）：`periodRate × 365d / paymentPeriod`，带符号。 */
+  /** 实际价差（年化）：浮动腿实现率的每期值 × `365d / paymentPeriod`，按 side 取号。 */
   actualApr: number | null;
-  /** 每期结算率（带符号），实际价差年化前的读数，便于独立复核。 */
-  periodRate: number;
+  /** 锁定腿的**每期**率：`|entryApr| × paymentPeriod / YEAR_SEC`（无持仓时 NaN）。 */
+  fixedPeriodRate: number;
+  /** 结算净额的每期率（带符号，`Σsettlement / Σ|仓位|`）：实际价差的推导中间量。 */
+  netPeriodRate: number;
+  /** 手续费的每期率（正数成本，`Σfee / Σ|仓位|`）。 */
+  feePeriodRate: number;
+  /**
+   * 浮动腿的**实现率**（每期，正向收入）：空头 `fixed − 净额 − 费率`、
+   * 多头 `净额 + fixed + 费率`——这才是「实际价差」的本体，净额不是。
+   */
+  floatPeriodRate: number;
   /** 该市场的结算周期（秒）；审计里的年化因子就是 `YEAR_SEC / paymentPeriodSec`。 */
   paymentPeriodSec: number;
 }
@@ -244,6 +274,38 @@ export const YEAR_SEC = 365 * 24 * 3600;
 export function annualizePeriodRate(periodRate: number, paymentPeriodSec: number): number {
   if (!Number.isFinite(periodRate) || !(paymentPeriodSec > 0)) return Number.NaN;
   return (periodRate * YEAR_SEC) / paymentPeriodSec;
+}
+
+/**
+ * 纯函数：年化 APR → **每期**值。锁定腿的 `entryApr` 是年化 APR，而结算现金流
+ * 是每期发生的（净额、手续费都是每期数）——「实际价差」的推导要在每期口径上做，
+ * 最后再年化回来。周期缺失/非正 → NaN（不猜）。
+ */
+export function periodRateOfAnnual(apr: number, paymentPeriodSec: number): number {
+  if (!Number.isFinite(apr) || !(paymentPeriodSec > 0)) return Number.NaN;
+  return (apr * paymentPeriodSec) / YEAR_SEC;
+}
+
+/**
+ * 纯函数：期终（period end）——含 `timeSec` 的那一期的结束时刻。
+ *
+ * 三源（Boros 结算 / CrossEx 8h 账本行 / CrossEx 小时行）统一用它判「这笔钱买的是
+ * 哪一期」，而不是用落账时刻：Boros 结算在期终后约 118s 才进 feed，账本行也晚约
+ * 2 分钟，按落账时刻归窗会把整条播报错位一期。周期未知（≤ 0）→ 退化为 `timeSec`
+ * 本身（不猜）。
+ */
+export function periodEndSec(timeSec: number, paymentPeriodSec: number): number {
+  if (!Number.isFinite(timeSec)) return Number.NaN;
+  if (!(paymentPeriodSec > 0)) return timeSec;
+  return Math.floor(timeSec / paymentPeriodSec) * paymentPeriodSec;
+}
+
+/**
+ * 纯函数：一份现金流是否属于窗口 `(fromSec, toSec]`——判据是它的**期终**落在里面。
+ * 播报标题的窗口与「期终 ∈ 窗口」严格一致（左边开：上一期的期终等于 from，不算本期）。
+ */
+export function inSettlementWindow(periodEnd: number, fromSec: number, toSec: number): boolean {
+  return Number.isFinite(periodEnd) && periodEnd > fromSec && periodEnd <= toSec;
 }
 
 /**
@@ -299,7 +361,21 @@ export function buildSettlementCarry(input: {
       const borosUsd = leg.tokenPriceUsd === null ? null : leg.settlementToken * leg.tokenPriceUsd;
       const perpUsd = perps.reduce((s, p) => s + p.usd, 0);
       const w = weightOf(leg);
-      const annualized = annualizePeriodRate(leg.periodRate, leg.paymentPeriodSec);
+      const sign = leg.side === null ? Number.NaN : sideSign(leg.side);
+      // 三个每期读数：锁定腿的固定率、结算净额、手续费成本（都按 |仓位| 归一）。
+      const fixedPeriodRate =
+        leg.entryApr !== null && Number.isFinite(leg.entryApr)
+          ? periodRateOfAnnual(Math.abs(leg.entryApr), leg.paymentPeriodSec)
+          : Number.NaN;
+      const netPeriodRate = leg.netPeriodRate;
+      const feePeriodRate = leg.feePeriodRate;
+      // 浮动腿的实现率（每期）：空头 `fixed − 净额 − 费率`、多头 `净额 + fixed + 费率`。
+      // 直接拿净额当「实际」正是第 2 轮打回的阻塞项：净额 = 锁定 − 浮动，方向是反的。
+      const floatPeriodRate = Number.isFinite(fixedPeriodRate) && Number.isFinite(sign)
+        ? fixedPeriodRate - sign * (netPeriodRate + feePeriodRate)
+        : Number.NaN;
+      // 实际价差 = 浮动腿实现率年化后按 side 取号（与 lockedApr 同一约定）。
+      const annualizedFloat = annualizePeriodRate(floatPeriodRate, leg.paymentPeriodSec);
       return {
         marketId: leg.marketId,
         base,
@@ -313,11 +389,14 @@ export function buildSettlementCarry(input: {
         perps,
         subtotalUsd: borosUsd === null ? null : borosUsd + perpUsd,
         lockedApr:
-          leg.entryApr !== null && Number.isFinite(leg.entryApr) && w > 0
-            ? Math.abs(leg.entryApr) * sideSign(leg.side)
+          leg.entryApr !== null && Number.isFinite(leg.entryApr) && w > 0 && Number.isFinite(sign)
+            ? Math.abs(leg.entryApr) * sign
             : null,
-        actualApr: Number.isFinite(annualized) && w > 0 ? annualized : null,
-        periodRate: leg.periodRate,
+        actualApr: Number.isFinite(annualizedFloat) && w > 0 ? sign * annualizedFloat : null,
+        fixedPeriodRate,
+        netPeriodRate,
+        feePeriodRate,
+        floatPeriodRate,
         paymentPeriodSec: leg.paymentPeriodSec,
         positionAbs: leg.positionAbs,
       };
@@ -327,13 +406,13 @@ export function buildSettlementCarry(input: {
     const pricedLegs = outLegs.filter((l) => l.subtotalUsd !== null);
     const totalUsd = pricedLegs.length === 0 ? null : pricedLegs.reduce((s, l) => s + (l.subtotalUsd ?? 0), 0);
     const lockedWeight = legs.reduce(
-      (s, l) => s + (l.entryApr !== null && Number.isFinite(l.entryApr) ? weightOf(l) : 0),
+      (s, l) => s + (l.entryApr !== null && Number.isFinite(l.entryApr) && l.side !== null ? weightOf(l) : 0),
       0,
     );
     const lockedNumer = legs.reduce(
       (s, l) =>
         s +
-        (l.entryApr !== null && Number.isFinite(l.entryApr) && weightOf(l) > 0
+        (l.entryApr !== null && Number.isFinite(l.entryApr) && l.side !== null && weightOf(l) > 0
           ? Math.abs(l.entryApr) * weightOf(l) * sideSign(l.side)
           : 0),
       0,
@@ -555,8 +634,32 @@ const fin = (v: string | number | undefined | null): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
+/**
+ * 账本查询的尾部余量：本窗口的账本行在期终后约 2 分钟才落账，查询上界要多读
+ * 这一段。归窗由行的期终决定（见 `bookRowPeriodEndSec`），与这个余量无关。
+ */
+const BOOK_QUERY_LAG_SEC = 900;
+
 /** createTime 可能是秒或毫秒。 */
 const epochToSec = (n: number): number => (n < 1e12 ? Math.floor(n) : Math.floor(n / 1000));
+
+/**
+ * 一条账本行的**期终**：`businessId` 尾缀是 venue 自己记的期终 epoch
+ * （8h 所 = `…_1794873600` 这样的整点批次，HL 小时行 = 每小时整点），比
+ * `createTime`（落账时刻，期终后约 2 分钟）更接近「这笔钱买的是哪一期」。
+ * 尾缀解析不出 epoch 时才退回 `createTime`（不猜）。
+ */
+export function bookRowPeriodEndSec(row: Pick<CarryBookRow, 'businessId' | 'createTime'>): number {
+  const tail = String(row.businessId ?? '').split('_').pop() ?? '';
+  const n = Number(tail);
+  // 尾缀必须是**像样的** epoch：真实账本里也有不带期终的业务键（如利息行的
+  // `businessId=2233970825805568`，纯 id 而非时间），不能把 id 当期终。
+  if (Number.isFinite(n) && n > 0) {
+    const sec = epochToSec(n);
+    if (sec >= 1e9 && sec < 4e9) return sec;
+  }
+  return epochToSec(fin(row.createTime));
+}
 
 /** 账本行的仓位 id：`businessId` 形如 `<positionId>_...`（assetView 同款解析）。 */
 const positionIdOf = (businessId: string): string => businessId.split('_')[0] ?? '';
@@ -590,10 +693,12 @@ function crossPositionMap(
 /**
  * 一个窗口的原料归集。纯读：不写文件、不发消息。
  *
- * Boros 侧：`settlementWindow` 给出每腿每期的结算，窗口内按 marketId 合并；
- * entryApr / |仓位| 来自当前持仓（仓位已在窗口内平掉时为 null——不猜）。
- * CrossEx 侧：账本按 `businessId → positionId → 仓位 → venue` 归到所，
- * Spread 腿会被展开到两所（见 buildSettlementCarry）。
+ * Boros 侧：每条结算按其**期终**（`floor(timeSec / paymentPeriod) × paymentPeriod`）
+ * 归窗，而不是按 `timeSec`：结算在期终后约 118s 才进 feed，按落账时刻归窗会把整个
+ * 窗口错位一期。entryApr / |仓位| 来自当前持仓（仓位已在窗口内平掉时为 null——不猜）。
+ * CrossEx 侧：账本行同样按**期终**归窗（期终取 `businessId` 尾缀，见
+ * `bookRowPeriodEndSec`），再按 `businessId → positionId → 仓位 → venue` 归到所，
+ * Spread 腿会被展开到两所（见 `buildSettlementCarry`）。
  */
 export async function readSettlementCarryWindow(
   readers: SettlementCarryReaders,
@@ -601,18 +706,27 @@ export async function readSettlementCarryWindow(
   toSec: number,
 ): Promise<SettlementCarryWindow> {
   const live = await readers.markets();
+  // 期终落在 (from, to] 的结算，落账时刻一定 ≥ from（期终后才有事件），
+  // 所以账本从 `fromSec` 起读就够。
   const ledger = await readers.settlementLedger(fromSec);
   const win = settlementWindow(ledger, fromSec);
-  const events = win.events.filter((e) => e.timeSec < toSec);
 
   // 已到期市场会从 live 列表消失，但它在本窗口的结算仍需元数据。
   const marketById = new Map<number, BorosMarket>(live.map((m) => [m.marketId, m]));
-  const missing = [...new Set(events.map((e) => e.marketId))].filter((id) => !marketById.has(id));
+  const missing = [...new Set(win.events.map((e) => e.marketId))].filter((id) => !marketById.has(id));
   if (missing.length > 0) {
     for (const [id, m] of await readers.marketsByIds(missing)) marketById.set(id, m);
   }
   const markets = [...marketById.values()];
   const prices = resolveCollateralPricesUsd(markets);
+  // 归期：元数据缺失时周期未知 → 期终退化为 timeSec（不猜，总数里如实计 unresolved）。
+  const events = win.events.filter((e) =>
+    inSettlementWindow(
+      periodEndSec(e.timeSec, marketById.get(e.marketId)?.paymentPeriod ?? 0),
+      fromSec,
+      toSec,
+    ),
+  );
 
   // 当前持仓：锁定价差要的是「这条腿开仓时锁的率」与仓位规模。
   let zones: BorosCollateralZone[] = [];
@@ -640,14 +754,23 @@ export async function readSettlementCarryWindow(
   // 窗口内按 marketId 合并：Σ结算、Σ费用、规模加权每期率、最近一次 |仓位|。
   const agg = new Map<
     number,
-    { settlementToken: number; feeToken: number; rateWeight: number; rateNumer: number; lastSec: number; lastAbs: number }
+    {
+      settlementToken: number;
+      feeToken: number;
+      rateWeight: number;
+      settlementWeighted: number;
+      feeWeighted: number;
+      lastSec: number;
+      lastAbs: number;
+    }
   >();
   for (const ev of events) {
     const a = agg.get(ev.marketId) ?? {
       settlementToken: 0,
       feeToken: 0,
       rateWeight: 0,
-      rateNumer: 0,
+      settlementWeighted: 0,
+      feeWeighted: 0,
       lastSec: 0,
       lastAbs: 0,
     };
@@ -655,9 +778,11 @@ export async function readSettlementCarryWindow(
     a.feeToken += ev.feeToken;
     // 每期率由现金流推出：(settlementToken / |position|) × |position| = settlementToken。
     // 不用 `ev.settlementRate`：它不带符号（付出窗口也是正数），也不保证是年化值。
+    // 同一窗口多条结算（小时市场 8 条）时是**每期平均率**（不是总和）——年化用它。
     if (ev.positionAbs > 0) {
       a.rateWeight += ev.positionAbs;
-      a.rateNumer += ev.settlementToken;
+      a.settlementWeighted += ev.settlementToken;
+      a.feeWeighted += ev.feeToken;
     }
     if (ev.timeSec >= a.lastSec) {
       a.lastSec = ev.timeSec;
@@ -676,6 +801,7 @@ export async function readSettlementCarryWindow(
       continue;
     }
     const open = openLegs.get(marketId);
+    const hasWeight = a.rateWeight > 0;
     legs.push({
       marketId,
       base: market.base,
@@ -686,10 +812,11 @@ export async function readSettlementCarryWindow(
       coin: BOROS_TOKEN_SYMBOLS[market.tokenId] ?? `token${market.tokenId}`,
       settlementToken: a.settlementToken,
       feeToken: a.feeToken,
+      netPeriodRate: hasWeight ? a.settlementWeighted / a.rateWeight : Number.NaN,
+      feePeriodRate: hasWeight ? a.feeWeighted / a.rateWeight : Number.NaN,
       tokenPriceUsd: prices.get(market.tokenId) ?? null,
       entryApr: open?.entryApr ?? null,
       positionAbs: a.lastAbs > 0 ? a.lastAbs : (open?.sizeToken ?? 0),
-      periodRate: a.rateWeight > 0 ? a.rateNumer / a.rateWeight : Number.NaN,
       // 年化因子：8h 市场 = 1095×；缺周期就是 NaN，展示层不给对照而非猜一个。
       paymentPeriodSec: market.paymentPeriod,
     });
@@ -711,7 +838,9 @@ export async function readSettlementCarryWindow(
   }
 
   const fromMs = fromSec * 1000;
-  const toMs = toSec * 1000;
+  // 查询上界要越过窗口终点：本窗口的账本行在期终后约 2 分钟才落账，而归属仍由
+  // 行的**期终**（businessId 尾缀）决定，与落账时刻无关。15 分钟是查询余量。
+  const toMs = (toSec + BOOK_QUERY_LAG_SEC) * 1000;
   const funding = await readers.accountBook('FUNDING_FEE', fromMs, toMs);
   const fees = await readers.accountBook('FEE', fromMs, toMs);
 
@@ -720,8 +849,8 @@ export async function readSettlementCarryWindow(
   const addRow = (row: CarryBookRow, statementType: 'FUNDING_FEE' | 'FEE'): void => {
     const usd = fin(row.change);
     if (usd === 0) return;
-    const t = epochToSec(fin(row.createTime));
-    if (t > 0 && (t < fromSec || t >= toSec)) return;
+    // 归窗判据：期终 ∈ (from, to]，与 Boros 侧同一把尺（不按落账时刻）。
+    if (!inSettlementWindow(bookRowPeriodEndSec(row), fromSec, toSec)) return;
     const pid = positionIdOf(String(row.businessId ?? ''));
     const info = pid ? posInfo.get(pid) : undefined;
     const venue = info?.venue ?? normalizeVenue(String(row.exchangeType ?? ''));
@@ -913,7 +1042,10 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
       perpUsd: l.perps.reduce((s, p) => s + p.usd, 0),
       subtotalUsd: l.subtotalUsd,
       hasPerp: l.perps.length > 0,
-      periodRate: Number.isFinite(l.periodRate) ? l.periodRate : null,
+      netPeriodRate: Number.isFinite(l.netPeriodRate) ? l.netPeriodRate : null,
+      floatPeriodRate: Number.isFinite(l.floatPeriodRate) ? l.floatPeriodRate : null,
+      fixedPeriodRate: Number.isFinite(l.fixedPeriodRate) ? l.fixedPeriodRate : null,
+      feePeriodRate: Number.isFinite(l.feePeriodRate) ? l.feePeriodRate : null,
       paymentPeriodSec: l.paymentPeriodSec,
       actualApr: l.actualApr,
       lockedApr: l.lockedApr,

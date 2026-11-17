@@ -71,27 +71,37 @@ afterEach(() => {
   delete process.env.BOROS_ROOT_ADDRESS;
 });
 
-/** 一条已配好的窗口 fixture：一条 Boros 腿 + 一个 perp 资金费行。 */
+/**
+ * 一条已配好的窗口 fixture：真实窗口 2026-11-17 00:00–08:00 UTC 的 BTC 腿
+ * （审阅意见引用的原始 API 读数，常量手算，不复用生产公式）。
+ *
+ *  - settlement = −5.0636496593742e-05 BTC（=−$3.288 @ 64935）、fee = 4.926940639269e-6
+ *  - positionAbs = 2.6975、entryApr = 0.040966846136、paymentPeriod = 28800（年化 ×1095）
+ *  - 浮动腿实现率 = fixed − 净额 − 费率 = 3.7412644873e-5 + 1.8772e-5 − 1.8265e-6
+ *    = 5.4358e-5/期 → ×1095 = **+5.95%/年**（锁定 +4.10%/年，差额 +1.86pp → 少赚）
+ *  - perp 同期资金费 9.447 + 手续费 0.05 → 本期合计 = −3.288 + 9.497 = **+6.21**
+ */
 const windowFixture: SettlementCarryWindow = {
   legs: [
     {
-      marketId: 155,
+      marketId: 233,
       base: 'BTC',
       venue: 'HYPERLIQUID',
       spreadVenues: null,
       side: 'SHORT',
       coin: 'BTC',
-      settlementToken: -0.000032,
-      feeToken: 0,
-      tokenPriceUsd: 100_000,
-      entryApr: 0.05,
-      positionAbs: 0.1,
-      // 每期率由现金流推出：8h 市场 → 年化因子 1095；播报里的「实际」就是 -0.00004×1095 = -4.38%/年
-      periodRate: -0.00004,
+      settlementToken: -5.0636496593742e-05,
+      feeToken: 4.926940639269e-6,
+      // 每期率 = 现金流 / |仓位|（单条结算，窗口内只有一期）
+      netPeriodRate: -5.0636496593742e-05 / 2.6975,
+      feePeriodRate: 4.926940639269e-6 / 2.6975,
+      tokenPriceUsd: 64_935,
+      entryApr: 0.040966846136,
+      positionAbs: 2.6975,
       paymentPeriodSec: 28_800,
     },
   ],
-  perps: [{ base: 'BTC', venue: 'HYPERLIQUID', side: 'SHORT', fundingUsd: 4.05, feesUsd: -0.05 }],
+  perps: [{ base: 'BTC', venue: 'HYPERLIQUID', side: 'SHORT', fundingUsd: 9.447, feesUsd: 0.05 }],
   unattributedUsd: 0,
   incompleteLedger: false,
 };
@@ -124,10 +134,12 @@ describe('结算播报 · 隔离运行', () => {
     expect(capture[0]!.event).toBe('Boros_APR_Alert');
     expect(capture[0]!.coin).toBe('BTC');
     expect(capture[0]!.details).toContain('💰 结算播报');
-    expect(capture[0]!.details).toContain('Boros HL 空 -$3.20（-0.0000320 BTC）');
-    expect(capture[0]!.details).toContain('perp  HL 空 +$4.00');
-    // 锁定（年化）vs 实际（按 8h 周期年化、带符号）：-0.00004 × 1095 = -4.38%/年
-    expect(capture[0]!.details).toContain('锁定 +5.00%/年 vs 实际 -4.38%/年');
+    expect(capture[0]!.details).toContain('Boros HL 空 -$3.29（-0.0000506 BTC）');
+    expect(capture[0]!.details).toContain('perp  HL 空 +$9.50');
+    // 锁定（年化 APR）vs 实际（浮动腿实现率按 8h 周期年化）：真实常量 +4.10% vs +5.95%
+    expect(capture[0]!.details).toContain('锁定 +4.10%/年 vs 实际 +5.95%/年');
+    expect(capture[0]!.details).toContain('→ 「少赚」');
+    expect(capture[0]!.details).toContain('本期合计 +$6.21');
 
     // 审计记录了「确实发出、且 HTTP 成功」
     const audit = fs
