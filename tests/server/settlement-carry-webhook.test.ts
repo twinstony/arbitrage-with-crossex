@@ -86,7 +86,9 @@ const windowFixture: SettlementCarryWindow = {
       tokenPriceUsd: 100_000,
       entryApr: 0.05,
       positionAbs: 0.1,
-      settlementRate: 0.05,
+      // 每期率由现金流推出：8h 市场 → 年化因子 1095；播报里的「实际」就是 -0.00004×1095 = -4.38%/年
+      periodRate: -0.00004,
+      paymentPeriodSec: 28_800,
     },
   ],
   perps: [{ base: 'BTC', venue: 'HYPERLIQUID', side: 'SHORT', fundingUsd: 4.05, feesUsd: -0.05 }],
@@ -124,6 +126,8 @@ describe('结算播报 · 隔离运行', () => {
     expect(capture[0]!.details).toContain('💰 结算播报');
     expect(capture[0]!.details).toContain('Boros HL 空 -$3.20（-0.0000320 BTC）');
     expect(capture[0]!.details).toContain('perp  HL 空 +$4.00');
+    // 锁定（年化）vs 实际（按 8h 周期年化、带符号）：-0.00004 × 1095 = -4.38%/年
+    expect(capture[0]!.details).toContain('锁定 +5.00%/年 vs 实际 -4.38%/年');
 
     // 审计记录了「确实发出、且 HTTP 成功」
     const audit = fs

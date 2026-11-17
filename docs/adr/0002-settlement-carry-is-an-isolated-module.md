@@ -36,5 +36,14 @@ CrossEx 账本读取（约 30 行）在模块内**自带一份**，不从 `asset
 - 金额符号以 `BorosSettlementEvent.settlementToken` 的定义为准：**带符号净额**
   （+ = 账户收到，一笔收益；− = 付出），且已扣当期手续费。所以 Boros 腿
   USD = `settlementToken × tokenPrice`，不再二次减 fee，也不取反。
+- 「实际价差」的两件易错事（审阅第 1 轮打回的两个阻塞项，长期有效）：
+  1. **每期 vs 年化**：`BorosSettlementEvent.settlementRate` 是**每期**收益率
+     （实测逐位等于 `|settlement| / |positionSize|`；8h 市场就是 8h 的收益率），
+     而锁定价差 `entryApr` 是年化 APR。两者相减前必须按该市场的 `paymentPeriod`
+     年化（`× 365d / paymentPeriod`），否则 8h 市场的实际价差被低估约 1000 倍。
+  2. **该字段不带符号**（付出窗口也是正数）：实际价差的符号一律取自现金流
+     `settlementToken / |position|`，不用 venue 回报的 `settlementRate` 的符号。
+  这两条只在 `settlementCarry.ts` 内处理——`core/boros/client.ts` 的字段注释仍是
+  上游的写法（写明「年化」），本模块以实测行为为准，不改上游文件。
 - 播报与审计一律**不做累计统计**：单腿大额获利的窗口会污染累计口径，干扰
   「本窗口是少赚还是多赚」的判断。审计每行只记本窗口事实。

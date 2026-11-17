@@ -21,11 +21,18 @@
  *
  * 口径（与 `docs/DOMAIN-MODEL.md` §8 一致）：
  *  - 内部以**币**计，USD 只是展示层换算（`settlementToken × tokenPrice`）。
- *  - `BorosSettlementEvent.settlementToken` 是**带符号的净额**（+ = 账户收到，
- *    一笔收益；− = 付出），且已扣掉当期手续费（见 core/boros/client.ts 的定义），
- *    因此 USD = `settlementToken × tokenPrice`，不再二次减 fee。
+ *  - `BorosSettlementEvent.settlementToken` 是**带符号的净额**，实测定义就是
+ *    `yieldReceived − yieldPaid − fee`（已扣当期手续费，+ = 账户收到、− = 付出），
+ *    因此 USD = `settlementToken × tokenPrice`，**不再二次减 fee、也不乘 (−1)**。
+ *    （issue #4 §4 里那个 `× (−1)` 是笔误：字段本身已带符号。）
  *  - perp 侧 `fundingUsd + feesUsd` 同样带符号（Gate 账本 `change` 字段原样求和，
  *    付出为负）。
+ *  - **每期 vs 年化**：Boros 的 `settlementRate` 是**每期**收益率（8h 市场就是
+ *    8h 的收益率，实测逐位等于 `|settlement| / |positionSize|`），而 `entryApr`
+ *    是**年化** APR。两者必须同口径才能相减，所以「实际价差」一律按该市场的
+ *    `paymentPeriod` 年化：`× 365d / paymentPeriod`。
+ *  - **符号取自现金流，不信 `settlementRate`**：该字段不带符号（付出窗口也是正数），
+ *    所以每期费率由 `settlementToken / |positionAbs|` 推出——符号即结算方向。
  *  - **不做累计统计**：一个窗口就是一段时间里的现金流，累计口径会被单腿大额
  *    获利污染，干扰判断。
  *
@@ -96,6 +103,20 @@ export function carryWindow(nowSec: number): { fromSec: number; toSec: number } 
   return { fromSec: toSec - WINDOW_SEC, toSec };
 }
 
+/** 边界后的宽限：结算事件可能晚几秒才进 feed。 */
+const BOUNDARY_GRACE_SEC = 60;
+
+/**
+ * 下一次运行的延迟：踩在 **UTC 0/8/16 边界**（窗口一结束就播，而不是「启动时刻
+ * + 8h」那种相位漂移的落点），但不晚于 `intervalSec`——发送失败时的重试节奏靠它。
+ */
+export function nextRunDelayMs(nowMs: number, intervalSec: number): number {
+  const nowSec = Math.floor(nowMs / 1000);
+  const nextBoundarySec = (Math.floor(nowSec / WINDOW_SEC) + 1) * WINDOW_SEC + BOUNDARY_GRACE_SEC;
+  const toBoundaryMs = (nextBoundarySec - nowSec) * 1000;
+  return Math.max(1_000, Math.min(intervalSec * 1000, toBoundaryMs));
+}
+
 // ---------------------------------------------------------------------------
 // 纯函数：数据归集结果 → 逐腿金额（V4 契约：可独立调用、无副作用）
 // ---------------------------------------------------------------------------
@@ -123,8 +144,13 @@ export interface SettlementCarryLeg {
   entryApr: number | null;
   /** 窗口内最近一次结算时的 |仓位|（币），实际价差的权重。 */
   positionAbs: number;
-  /** 窗口内规模加权的结算年化率（按 venue 回报原样使用）。 */
-  settlementRate: number;
+  /**
+   * 本窗口**每期**结算率（规模加权，带符号）：由 `settlementToken / |positionAbs|`
+   * 推出，+ = 收到、− = 付出。刻意不用 venue 的 `settlementRate`——它不带符号。
+   */
+  periodRate: number;
+  /** 该市场的结算周期（秒），每期率按它年化；0 = 无法年化（不猜）。 */
+  paymentPeriodSec: number;
 }
 
 /** 一条与某 (base, venue) 对应的 perp 同期现金流。 */
@@ -162,9 +188,16 @@ export interface SettlementCarryLegOut {
   feeToken: number;
   perps: SettlementCarryPerpRow[];
   /** borosUsd + Σ perp；Boros 侧无币价时 null。 */
+  /** 本窗口最近一次结算时的 |仓位|——实际价差的权重。 */
+  positionAbs: number;
   subtotalUsd: number | null;
   lockedApr: number | null;
+  /** 实际价差（年化）：`periodRate × 365d / paymentPeriod`，带符号。 */
   actualApr: number | null;
+  /** 每期结算率（带符号），实际价差年化前的读数，便于独立复核。 */
+  periodRate: number;
+  /** 该市场的结算周期（秒）；审计里的年化因子就是 `YEAR_SEC / paymentPeriodSec`。 */
+  paymentPeriodSec: number;
 }
 
 export interface SettlementCarryCoinOut {
@@ -199,6 +232,19 @@ const sideSign = (side: 'SHORT' | 'LONG' | null): number => (side === 'SHORT' ? 
 
 const weightOf = (leg: Pick<SettlementCarryLeg, 'positionAbs'>): number =>
   Number.isFinite(leg.positionAbs) && leg.positionAbs > 0 ? leg.positionAbs : 0;
+
+/** 一年多少秒——年化因子 `YEAR_SEC / paymentPeriod` 的分子。 */
+export const YEAR_SEC = 365 * 24 * 3600;
+
+/**
+ * 纯函数：每期结算率 → 年化。Boros 的结算率是**每期**值（8h 市场 = 8h 收益率），
+ * 而锁定价差（`entryApr`）是年化 APR；不同口径直接相减会把实际价差低估
+ * `paymentPeriod / 1 年`（8h 市场约 1000 倍）。周期缺失/非正 → NaN（不猜）。
+ */
+export function annualizePeriodRate(periodRate: number, paymentPeriodSec: number): number {
+  if (!Number.isFinite(periodRate) || !(paymentPeriodSec > 0)) return Number.NaN;
+  return (periodRate * YEAR_SEC) / paymentPeriodSec;
+}
 
 /**
  * 纯函数：把「本窗口的 Boros 结算腿」与「同期 perp 现金流」配成播报口径的
@@ -253,6 +299,7 @@ export function buildSettlementCarry(input: {
       const borosUsd = leg.tokenPriceUsd === null ? null : leg.settlementToken * leg.tokenPriceUsd;
       const perpUsd = perps.reduce((s, p) => s + p.usd, 0);
       const w = weightOf(leg);
+      const annualized = annualizePeriodRate(leg.periodRate, leg.paymentPeriodSec);
       return {
         marketId: leg.marketId,
         base,
@@ -269,8 +316,10 @@ export function buildSettlementCarry(input: {
           leg.entryApr !== null && Number.isFinite(leg.entryApr) && w > 0
             ? Math.abs(leg.entryApr) * sideSign(leg.side)
             : null,
-        actualApr:
-          Number.isFinite(leg.settlementRate) && w > 0 ? leg.settlementRate : null,
+        actualApr: Number.isFinite(annualized) && w > 0 ? annualized : null,
+        periodRate: leg.periodRate,
+        paymentPeriodSec: leg.paymentPeriodSec,
+        positionAbs: leg.positionAbs,
       };
     });
     // 单腿市场的 lockedApr/actualApr 是「一条腿自己的率」，不是价差——
@@ -289,14 +338,11 @@ export function buildSettlementCarry(input: {
           : 0),
       0,
     );
-    const actualWeight = legs.reduce(
-      (s, l) => s + (Number.isFinite(l.settlementRate) ? weightOf(l) : 0),
-      0,
-    );
-    const actualNumer = legs.reduce(
-      (s, l) => s + (Number.isFinite(l.settlementRate) ? l.settlementRate * weightOf(l) : 0),
-      0,
-    );
+    // 实际价差同样是「逐腿年化后按 |仓位| 加权」：各市场的 paymentPeriod 可能不同，
+    // 先各自年化再平均，否则短周期市场会被系统性低估。
+    const actualLegs = outLegs.filter((l) => l.actualApr !== null);
+    const actualWeight = actualLegs.reduce((s, l) => s + weightOf(l), 0);
+    const actualNumer = actualLegs.reduce((s, l) => s + (l.actualApr ?? 0) * weightOf(l), 0);
     const lockedApr = lockedWeight > 0 ? lockedNumer / lockedWeight : null;
     const actualApr = actualWeight > 0 ? actualNumer / actualWeight : null;
     const deltaApr = lockedApr === null || actualApr === null ? null : actualApr - lockedApr;
@@ -385,7 +431,16 @@ const utcClock = (sec: number): string => {
   const d = new Date(sec * 1000);
   return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
 };
-const aprYear = (apr: number): string => `${(apr * 100).toFixed(2)}%/年`;
+const signedAprYear = (apr: number): string => `${apr > 0 ? '+' : ''}${(apr * 100).toFixed(2)}%/年`;
+
+/**
+ * 一条腿在播报里的名字：Spread 市场一腿对应**两所** perp，只写前一个 venue
+ * 会让用户以为缺腿，所以写「Spread（HL+Gate）」。
+ */
+const borosLegName = (leg: SettlementCarryLegOut): string =>
+  leg.spreadVenues
+    ? `Spread（${leg.spreadVenues.map(venueLabel).join('+')}）`
+    : venueLabel(leg.venue);
 
 /** 一条腿在播报里的 venue 标签（Spread 腿给两所）。 */
 const legLabel = (leg: SettlementCarryLegOut): string =>
@@ -397,6 +452,9 @@ const legLabel = (leg: SettlementCarryLegOut): string =>
  * 格式硬性要求（issue #4）：凡是 Boros 腿的行，必须同时给出 USD 金额与币的
  * 数量增减，写法固定为 `±$X.XX（±N.COIN）`；该 venue 没有 perp 腿时写
  * 「perp 无（该所无持仓）」，不补 0、不隐藏、不影响其他腿。
+ *
+ * 归降级（结算代币没有币价）在行尾显式标注「该腿无币价，USD 未计」：这类腿
+ * 本就没有 USD 可写，但不能让它静默破坏上面的硬格式。
  */
 export function formatSettlementCarry(report: SettlementCarryReport): string {
   const lines: string[] = [
@@ -409,8 +467,9 @@ export function formatSettlementCarry(report: SettlementCarryReport): string {
     coin.legs.forEach((leg, i) => {
       if (i > 0) lines.push('');
       const usd = leg.borosUsd === null ? '—' : signedUsd(leg.borosUsd);
+      const unpriced = leg.borosUsd === null ? ' · 该腿无币价，USD 未计' : '';
       lines.push(
-        `  Boros ${venueLabel(leg.venue)} ${sideLabel(leg.side)} ${usd}（${signedCoin(leg.settlementToken, leg.coin)}）`,
+        `  Boros ${borosLegName(leg)} ${sideLabel(leg.side)} ${usd}（${signedCoin(leg.settlementToken, leg.coin)}）${unpriced}`,
       );
       if (leg.perps.length === 0) {
         lines.push('  perp  无（该所无持仓）');
@@ -427,10 +486,12 @@ export function formatSettlementCarry(report: SettlementCarryReport): string {
     });
     const total = coin.totalUsd === null ? '—' : signedUsd(coin.totalUsd);
     // 对照只在结构说得通时给：本窗口该币没有任何 perp 腿时，「锁定 vs 实际」
-    // 比较的是一个孤立的 Boros 率，不是价差——不如不给。
+    // 比较的是一个孤立的 Boros 率，不是价差——不如不给。两边一律带符号（年化 APR），
+    // 因为实际价差真的会为负（付出窗口）；差额也明写，让「多赚/少赚」可复核。
     const compare =
       coin.hasPerp && coin.lockedApr !== null && coin.actualApr !== null && coin.verdict !== null
-        ? ` ｜锁定 ${aprYear(coin.lockedApr)} vs 实际 ${aprYear(coin.actualApr)} → 「${coin.verdict}」`
+        ? ` ｜锁定 ${signedAprYear(coin.lockedApr)} vs 实际 ${signedAprYear(coin.actualApr)}` +
+          `（差额 ${signedAprYear(coin.deltaApr ?? 0)}）→ 「${coin.verdict}」`
         : '';
     const gap = coin.incomplete ? '（部分腿无币价，未计入）' : '';
     lines.push('', `  本期合计 ${total}${gap}${compare}`);
@@ -576,7 +637,7 @@ export async function readSettlementCarryWindow(
     }
   }
 
-  // 窗口内按 marketId 合并：Σ结算、Σ费用、规模加权率、最近一次 |仓位|。
+  // 窗口内按 marketId 合并：Σ结算、Σ费用、规模加权每期率、最近一次 |仓位|。
   const agg = new Map<
     number,
     { settlementToken: number; feeToken: number; rateWeight: number; rateNumer: number; lastSec: number; lastAbs: number }
@@ -592,9 +653,11 @@ export async function readSettlementCarryWindow(
     };
     a.settlementToken += ev.settlementToken;
     a.feeToken += ev.feeToken;
-    if (Number.isFinite(ev.settlementRate) && ev.positionAbs > 0) {
+    // 每期率由现金流推出：(settlementToken / |position|) × |position| = settlementToken。
+    // 不用 `ev.settlementRate`：它不带符号（付出窗口也是正数），也不保证是年化值。
+    if (ev.positionAbs > 0) {
       a.rateWeight += ev.positionAbs;
-      a.rateNumer += ev.settlementRate * ev.positionAbs;
+      a.rateNumer += ev.settlementToken;
     }
     if (ev.timeSec >= a.lastSec) {
       a.lastSec = ev.timeSec;
@@ -626,7 +689,9 @@ export async function readSettlementCarryWindow(
       tokenPriceUsd: prices.get(market.tokenId) ?? null,
       entryApr: open?.entryApr ?? null,
       positionAbs: a.lastAbs > 0 ? a.lastAbs : (open?.sizeToken ?? 0),
-      settlementRate: a.rateWeight > 0 ? a.rateNumer / a.rateWeight : Number.NaN,
+      periodRate: a.rateWeight > 0 ? a.rateNumer / a.rateWeight : Number.NaN,
+      // 年化因子：8h 市场 = 1095×；缺周期就是 NaN，展示层不给对照而非猜一个。
+      paymentPeriodSec: market.paymentPeriod,
     });
   }
 
@@ -844,9 +909,14 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
       coin: l.coin,
       settlementToken: l.settlementToken,
       borosUsd: l.borosUsd,
+      ...(l.borosUsd === null ? { unpriced: true } : {}),
       perpUsd: l.perps.reduce((s, p) => s + p.usd, 0),
       subtotalUsd: l.subtotalUsd,
       hasPerp: l.perps.length > 0,
+      periodRate: Number.isFinite(l.periodRate) ? l.periodRate : null,
+      paymentPeriodSec: l.paymentPeriodSec,
+      actualApr: l.actualApr,
+      lockedApr: l.lockedApr,
     })),
   );
 
@@ -937,15 +1007,16 @@ export function startSettlementCarry(
       void runSettlementCarryPass(runtime)
         .catch((err: unknown) => runtime.error('[settlement-carry] pass crashed', err))
         .finally(() => {
-          if (!stopped) schedule(runtime.config.intervalSec * 1000);
+          if (!stopped) schedule(nextRunDelayMs(runtime.now(), runtime.config.intervalSec));
         });
     }, ms);
   };
   // 首次延迟 30s（同 scanner 的 boot grace）：它只做「游标对齐到刚跨过的边界」，
   // 不读网络。越早对齐，启动后第一个**完整观测**的窗口就越早播报。
+  // 之后的落点踩在 UTC 0/8/16 边界（见 `nextRunDelayMs`），不再是「启动时刻 + 8h」。
   schedule(opts.firstDelayMs ?? BOOT_ALIGN_DELAY_MS);
   runtime.log(
-    `[settlement-carry] enabled — every ${runtime.config.intervalSec}s, 8h windows at UTC 00/08/16`,
+    `[settlement-carry] enabled — posting at UTC 00/08/16, retry cadence ${runtime.config.intervalSec}s`,
   );
   return {
     stop: () => {

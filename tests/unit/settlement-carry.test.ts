@@ -26,6 +26,9 @@ import {
   runSettlementCarryPass,
   signedCoin,
   signedUsd,
+  YEAR_SEC,
+  annualizePeriodRate,
+  nextRunDelayMs,
   type SettlementCarryDeps,
   type SettlementCarryReaders,
   type SettlementCarryWindow,
@@ -83,7 +86,11 @@ const row = (
   marketId: number,
   timeSec: number,
   settlementToken: number,
-  settlementRate: number,
+  /**
+   * venue 自己回报的 `settlementRate`：**不带符号**、且是**每期**值。
+   * fixture 里刻意把它填成与现金流符号/量级都不一致的值——实现不得使用它。
+   */
+  venueReportedRate: number,
   positionAbs = 0.1,
 ): BorosSettlementRow => ({
   id: `${marketId}:${timeSec}`,
@@ -94,7 +101,7 @@ const row = (
   positionAbs,
   settlementToken,
   feeToken: 0,
-  settlementRate,
+  settlementRate: venueReportedRate,
 });
 
 /** 窗口起点后每小时的 8 条 HL 结算（-0.0000040 BTC 各一条）+ 其它腿各 1 条。 */
@@ -212,8 +219,11 @@ describe('buildSettlementCarry · 金额', () => {
 
     // 锁定价差 = Σ(|entryApr| × w × side) / Σw = (0.05×0.1 − 0.029×0.1)/0.2
     expect(btc.lockedApr!).toBeCloseTo(0.0105, 9);
-    // 实际价差 = (0.05×0.1 + 0.03×0.1)/0.2
-    expect(btc.actualApr!).toBeCloseTo(0.04, 9);
+    // 实际价差：每期率由现金流推出（符号取自结算方向），再按 3600s 周期年化（×8760）：
+    //   HL:   8 × (−0.000004) / (8 × 0.1) = −0.00004/期 → −0.3504/年
+    //   Gate: (+0.000011) / 0.1          = +0.00011/期 → +0.9636/年
+    //   加权：(−0.3504 × 0.1 + 0.9636 × 0.1) / 0.2 = +0.3066/年
+    expect(btc.actualApr!).toBeCloseTo(0.3066, 9);
     expect(btc.verdict).toBe('少赚');
 
     // LTC 用 USDT 结算：币种取结算代币，不是 base。
@@ -324,6 +334,151 @@ describe('8h 窗口', () => {
     expect(carryWindow(TO + 1)).toEqual({ fromSec: FROM, toSec: TO });
     expect(carryWindow(TO - 1)).toEqual({ fromSec: FROM - 28_800, toSec: FROM });
   });
+
+  it('下一次运行踩在 UTC 0/8/16 边界（窗口一结束就播，而不是启动时刻 +8h）', () => {
+    // 启动于 12:00、间隔 8h：下一步是边界 16:00（+60s 宽限），不是 20:00
+    const noon = (TO - 14_400) * 1000;
+    expect(nextRunDelayMs(noon, 28_800)).toBe(14_460 * 1000);
+    // 间隔更短（失败重试）→ 不被边界拉到更远
+    expect(nextRunDelayMs(noon, 3_600)).toBe(3_600 * 1000);
+    // 刚好处在边界上 → 下一次是下一个边界
+    expect(nextRunDelayMs(TO * 1000, 28_800)).toBe(28_800 * 1000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3.5 年化与符号（审阅第 1 轮的两个阻塞项 —— 真实窗口数字）
+// ---------------------------------------------------------------------------
+
+/**
+ * 真实账户 2026-11-17 00:00–08:00 UTC 的原始结算字段（审阅意见引用的原始 API 读数）：
+ *  - BTC market 233：settlement=-3.2424325343742e-05、positionSize=2.6975、paymentPeriod=28800
+ *  - ETH market 232：settlement=-1.990507251637798e-03、positionSize=30、paymentPeriod=28800
+ * 两个市场回报的 `settlementRate` 都是**正数**（+1.202e-05 / +6.635e-05），且是**每期**值
+ * （= |settlement| / |position|，与 API 逐位相同）。
+ *
+ * 手算（常量，不 import 生产公式），年化因子 = 365×24×3600 / 28800 = 1095：
+ *  - BTC：3.2424325343742e-05 / 2.6975 = 1.202013914504e-05 → ×1095 = 1.3162052364e-02
+ *  - ETH：1.990507251637798e-03 / 30   = 6.635024172126e-05 → ×1095 = 7.2653514685e-02
+ * 两笔 settlement 皆为负（账户付出）⇒ 带符号年化率必须为负，否则方向性判断反向。
+ */
+const REAL_MARKETS: BorosMarket[] = [
+  market({
+    marketId: 233,
+    base: 'BTC',
+    venue: 'Hyperliquid',
+    tokenId: 1,
+    paymentPeriod: 28_800,
+    assetMarkPriceUsd: 100_000,
+  }),
+  market({
+    marketId: 232,
+    base: 'ETH',
+    venue: 'Hyperliquid',
+    tokenId: 2,
+    paymentPeriod: 28_800,
+    assetMarkPriceUsd: 3_000,
+  }),
+];
+
+const REAL_LEDGER: BorosSettlementLedger = {
+  rows: [
+    row(233, FROM + 28_790, -3.2424325343742e-05, 1.2020139145038e-05, 2.6975),
+    row(232, FROM + 28_780, -1.990507251637798e-03, 6.6350241721259e-05, 30),
+  ],
+  coversFromSec: FROM,
+};
+
+const realWindow = (): Promise<SettlementCarryWindow> =>
+  readSettlementCarryWindow(
+    readers({
+      markets: async () => REAL_MARKETS,
+      marketsByIds: async () => new Map(),
+      settlementLedger: async () => REAL_LEDGER,
+      // 真实账户的 entryApr：BTC 0.040966846136、ETH 0.036551255815，两条都是空头。
+      collateralZones: async () => [
+        zone([
+          { marketId: 233, side: 1, size: -2.6975, fixedApr: 0.040966846136 },
+          { marketId: 232, side: 1, size: -30, fixedApr: 0.036551255815 },
+        ]),
+      ],
+      positions: async () => [
+        { positionId: 'btcHl', symbol: 'HYPERLIQUID_PERP_BTC_USDT', positionSide: 'SHORT', positionQty: '-2.6975' },
+        { positionId: 'ethHl', symbol: 'HYPERLIQUID_PERP_ETH_USDT', positionSide: 'SHORT', positionQty: '-30' },
+      ],
+      accountBook: async (statementType) => ({
+        rows:
+          statementType === 'FUNDING_FEE'
+            ? [
+                { statementType, businessId: 'btcHl_1', change: '4.7924325343742', createTime: String(FROM + 100) },
+                { statementType, businessId: 'ethHl_2', change: '6.800507251637798', createTime: String(FROM + 200) },
+              ]
+            : [],
+        capped: false,
+      }),
+    }),
+    FROM,
+    TO,
+  );
+
+describe('年化与符号（真实窗口数字）', () => {
+  it('年化因子按 market 的 paymentPeriod：8h 市场 ×1095', () => {
+    expect(YEAR_SEC / 28_800).toBe(1095);
+    expect(annualizePeriodRate(-2e-5, 28_800)).toBeCloseTo(-0.0219, 12);
+    // 周期不同年化就不同（没年化时两者会相等）
+    expect(annualizePeriodRate(1e-5, 3_600) / annualizePeriodRate(1e-5, 28_800)).toBeCloseTo(8, 12);
+    // 周期缺失 → NaN（不猜）
+    expect(annualizePeriodRate(1e-5, 0)).toBeNaN();
+  });
+
+  it('实际价差按 paymentPeriod 年化，且符号取自现金流（BTC −1.32%/年、ETH −7.27%/年）', async () => {
+    const report = buildSettlementCarry({ windowFromSec: FROM, windowToSec: TO, ...(await realWindow()) });
+    const btc = report.coins.find((c) => c.base === 'BTC')!.legs[0]!;
+    // 每期率 = settlement / |position|，venue 回报的 settlementRate 是 +1.202e-05（不带符号）
+    expect(btc.periodRate).toBeCloseTo(-1.202013914504e-05, 15);
+    expect(btc.actualApr!).toBeCloseTo(-1.3162052364e-02, 9);
+    expect(btc.lockedApr!).toBeCloseTo(0.040966846136, 12);
+
+    const eth = report.coins.find((c) => c.base === 'ETH')!.legs[0]!;
+    expect(eth.periodRate).toBeCloseTo(-6.635024172126e-05, 15);
+    expect(eth.actualApr!).toBeCloseTo(-7.2653514685e-02, 9);
+  });
+
+  it('播报里「实际」不再是 0.00%/年', async () => {
+    const report = buildSettlementCarry({ windowFromSec: FROM, windowToSec: TO, ...(await realWindow()) });
+    const out = formatSettlementCarry(report);
+    expect(out).toContain('实际 -1.32%/年');
+    expect(out).toContain('实际 -7.27%/年');
+    expect(out).not.toContain('实际 0.00%/年');
+  });
+
+  it('结算代币无币价：行尾显式标注「该腿无币价，USD 未计」', () => {
+    const report = buildSettlementCarry({
+      windowFromSec: FROM,
+      windowToSec: TO,
+      legs: [
+        {
+          marketId: 999,
+          base: 'BTC',
+          venue: 'HYPERLIQUID',
+          spreadVenues: null,
+          side: 'SHORT',
+          coin: 'token99',
+          settlementToken: 100,
+          feeToken: 0,
+          tokenPriceUsd: null,
+          entryApr: 0.05,
+          positionAbs: 1,
+          periodRate: 1e-5,
+          paymentPeriodSec: 28_800,
+        },
+      ],
+      perps: [{ base: 'BTC', venue: 'HYPERLIQUID', side: 'SHORT', fundingUsd: 1, feesUsd: 0 }],
+    });
+    const out = formatSettlementCarry(report);
+    expect(out).toContain('  Boros HL 空 —（+100.0000 token99） · 该腿无币价，USD 未计');
+    expect(out).toContain('（部分腿无币价，未计入）');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -353,8 +508,10 @@ describe('formatSettlementCarry', () => {
     expect(out).toContain('  → HL 小计 +$0.80');
     expect(out).toContain('  Boros Gate 多 +$1.10（+0.0000110 BTC）');
     expect(out).toContain('  → Gate 小计 +$0.31');
-    expect(out).toContain('  本期合计 +$1.11 ｜锁定 1.05%/年 vs 实际 4.00%/年 → 「少赚」');
+    expect(out).toContain('  本期合计 +$1.11 ｜锁定 +1.05%/年 vs 实际 +30.66%/年（差额 +29.61%/年）→ 「少赚」');
     expect(out).toContain('ETH（Spread：HL-Gate）');
+    // Spread 腿一腿对两所：只写一所会让人以为缺腿（审阅意见）。
+    expect(out).toContain('  Boros Spread（HL+Gate） 空 ');
     expect(out).toContain('LTC');
     expect(out).toContain('  perp  无（该所无持仓）');
     expect(out).toContain('  本期合计 -$0.42'); // 无 perp → 不给「锁定 vs 实际」对照
