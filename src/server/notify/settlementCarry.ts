@@ -802,7 +802,7 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
     const attempts = target.attempts + 1;
     const giveUp = attempts >= MAX_ATTEMPTS;
     writeCursor(deps.dataDir, {
-      lastPostedWindowSec: giveUp ? target.toSec : cursor.lastPostedWindowSec,
+      lastPostedWindowSec: giveUp ? target.fromSec : cursor.lastPostedWindowSec,
       pending: giveUp ? null : { ...target, attempts },
     });
     appendAudit(deps.dataDir, {
@@ -882,7 +882,7 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
   // 发送失败：游标不动，下个周期重试同一窗口；3 个周期后放弃并留失败标记。
   const giveUp = attempts >= MAX_ATTEMPTS;
   writeCursor(deps.dataDir, {
-    lastPostedWindowSec: giveUp ? target.toSec : cursor.lastPostedWindowSec,
+    lastPostedWindowSec: giveUp ? target.fromSec : cursor.lastPostedWindowSec,
     pending: giveUp ? null : { ...target, attempts },
   });
   if (giveUp) {
