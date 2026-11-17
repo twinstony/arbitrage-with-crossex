@@ -468,6 +468,8 @@ export interface SettlementCarryWindow {
   perps: SettlementCarryPerpFlow[];
   unattributedUsd: number;
   incompleteLedger: boolean;
+  /** 有结算事件、但市场元数据读不到的腿数（如实计数，不静默丢弃）。 */
+  unresolvedLegs?: number;
 }
 
 /** 读数的注入口（测试用它替换掉全部网络访问）。 */
@@ -601,9 +603,14 @@ export async function readSettlementCarryWindow(
   }
 
   const legs: SettlementCarryLeg[] = [];
+  let unresolvedLegs = 0;
   for (const [marketId, a] of agg) {
     const market = marketById.get(marketId);
-    if (!market) continue; // 元数据都读不到的腿无法定位 venue/币，交给审计断言
+    if (!market) {
+      // 连市场元数据都读不到，就无法定位 venue/币——计数并在审计里说出来。
+      unresolvedLegs += 1;
+      continue;
+    }
     const open = openLegs.get(marketId);
     legs.push({
       marketId,
@@ -671,6 +678,7 @@ export async function readSettlementCarryWindow(
     perps: [...perpAgg.values()],
     unattributedUsd,
     incompleteLedger: funding.capped || fees.capped,
+    unresolvedLegs,
   };
 }
 
@@ -725,12 +733,6 @@ const parseCursor = (raw: unknown): CarryCursor | null => {
       ? { fromSec: p.fromSec, toSec: p.toSec, attempts: typeof p.attempts === 'number' ? p.attempts : 0 }
       : null;
   return { lastPostedWindowSec: last, pending };
-};
-
-const parseState = (raw: unknown): { lastRunSec: number } | null => {
-  if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-  return typeof r.lastRunSec === 'number' ? { lastRunSec: r.lastRunSec } : null;
 };
 
 function readCursor(dataDir: string): CarryCursor {
@@ -818,6 +820,11 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
     return { status: 'failed', windowFromSec: target.fromSec, windowToSec: target.toSec };
   }
 
+  if ((window.unresolvedLegs ?? 0) > 0) {
+    deps.error(
+      `[settlement-carry] ${window.unresolvedLegs} settled leg(s) have no market metadata — excluded from the broadcast`,
+    );
+  }
   const report = buildSettlementCarry({
     windowFromSec: target.fromSec,
     windowToSec: target.toSec,
@@ -873,6 +880,7 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
     ...(report.unattachedPerpUsd !== 0 ? { unattachedPerpUsd: report.unattachedPerpUsd } : {}),
     ...(report.unattributedUsd !== 0 ? { unattributedUsd: report.unattributedUsd } : {}),
     ...(report.incompleteLedger ? { incompleteLedger: true } : {}),
+    ...((window.unresolvedLegs ?? 0) > 0 ? { unresolvedLegs: window.unresolvedLegs } : {}),
   });
   if (ok) {
     writeCursor(deps.dataDir, { lastPostedWindowSec: target.fromSec, pending: null });
@@ -904,6 +912,9 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
   return { status: 'failed', windowFromSec: target.fromSec, windowToSec: target.toSec, details };
 }
 
+/** 启动后多久做第一次（仅对齐游标的）运行。 */
+const BOOT_ALIGN_DELAY_MS = 30_000;
+
 /** setTimeout 链（同 notify/scanner.ts）：不用 setInterval，重叠不可能发生。 */
 export function startSettlementCarry(
   deps?: SettlementCarryDeps,
@@ -928,8 +939,9 @@ export function startSettlementCarry(
         });
     }, ms);
   };
-  // 首次延迟：靠近下一个 8h 边界；链本身按 intervalSec 走，窗口由游标去重。
-  schedule(opts.firstDelayMs ?? Math.min(runtime.config.intervalSec * 1000, WINDOW_SEC * 1000));
+  // 首次延迟 30s（同 scanner 的 boot grace）：它只做「游标对齐到刚跨过的边界」，
+  // 不读网络。越早对齐，启动后第一个**完整观测**的窗口就越早播报。
+  schedule(opts.firstDelayMs ?? BOOT_ALIGN_DELAY_MS);
   runtime.log(
     `[settlement-carry] enabled — every ${runtime.config.intervalSec}s, 8h windows at UTC 00/08/16`,
   );
@@ -947,6 +959,8 @@ export function startSettlementCarry(
 
 const PAGE_LIMIT = 1000;
 const MAX_PAGES = 25;
+/** 已平仓位只读最近 3 页（3000 条）——它们只用于 join 窗口内的账本行。 */
+const CLOSED_POSITION_PAGES = 3;
 
 /** `data/` 目录：`ARB_DATA_DIR` 覆盖，默认仓库根 `data/`（与 index.ts 同规则）。 */
 export function defaultDataDir(): string {
@@ -991,9 +1005,10 @@ export function createSettlementCarryDeps(
 
   const paged = async <T>(
     fetchPage: (page: number) => Promise<T[]>,
+    maxPages = MAX_PAGES,
   ): Promise<{ rows: T[]; capped: boolean }> => {
     const rows: T[] = [];
-    for (let page = 1; page <= MAX_PAGES; page += 1) {
+    for (let page = 1; page <= maxPages; page += 1) {
       const batch = await fetchPage(page);
       rows.push(...batch);
       if (batch.length < PAGE_LIMIT) return { rows, capped: false };
@@ -1030,10 +1045,15 @@ export function createSettlementCarryDeps(
     },
     historyPositions: async () => {
       const clients = requireClients();
-      const { rows } = await paged<PerpPositionLike>(async (page) => {
-        const { body } = await clients.crossEx.listCrossexHistoryPositions({ page, limit: PAGE_LIMIT });
-        return body as unknown as PerpPositionLike[];
-      });
+      // 这里的唯一用途是「窗口内平掉的仓位」的 join；最近几页足够（venue 接口
+      // 按平仓时间倒序，且窗口只有 8 小时）。全量扫描留给持仓页。
+      const { rows } = await paged<PerpPositionLike>(
+        async (page) => {
+          const { body } = await clients.crossEx.listCrossexHistoryPositions({ page, limit: PAGE_LIMIT });
+          return body as unknown as PerpPositionLike[];
+        },
+        CLOSED_POSITION_PAGES,
+      );
       return rows;
     },
   };

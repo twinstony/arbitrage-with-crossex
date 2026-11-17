@@ -17,6 +17,7 @@ import {
   readSettlementCarryConfig,
   runSettlementCarryPass,
   type SettlementCarryDeps,
+  type SettlementCarryWindow,
 } from '../../src/server/notify/settlementCarry';
 
 const TO = 1_700_006_400;
@@ -71,7 +72,7 @@ afterEach(() => {
 });
 
 /** 一条已配好的窗口 fixture：一条 Boros 腿 + 一个 perp 资金费行。 */
-const windowFixture = {
+const windowFixture: SettlementCarryWindow = {
   legs: [
     {
       marketId: 155,
