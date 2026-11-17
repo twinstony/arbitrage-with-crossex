@@ -109,7 +109,8 @@ export interface SettlementCarryLeg {
   venue: string;
   /** Spread 市场：一腿等价两所 perp，两所资金费都列在这条腿下。 */
   spreadVenues: [string, string] | null;
-  side: 'SHORT' | 'LONG';
+  /** 仓位方向；窗口内平掉且无当前持仓时为 null（不猜）。 */
+  side: 'SHORT' | 'LONG' | null;
   /** 结算代币符号（抵押品，可能是 USDT——与 base 不一定相同）。 */
   coin: string;
   /** 窗口内净结算，币计，带符号（+ = 收到）。 */
@@ -152,7 +153,7 @@ export interface SettlementCarryLegOut {
   base: string;
   venue: string;
   spreadVenues: [string, string] | null;
-  side: 'SHORT' | 'LONG';
+  side: 'SHORT' | 'LONG' | null;
   coin: string;
   /** Boros 本期结算 USD；null = 结算代币无币价。 */
   borosUsd: number | null;
@@ -194,7 +195,7 @@ export interface SettlementCarryReport {
   incompleteLedger: boolean;
 }
 
-const sideSign = (side: 'SHORT' | 'LONG'): number => (side === 'SHORT' ? 1 : -1);
+const sideSign = (side: 'SHORT' | 'LONG' | null): number => (side === 'SHORT' ? 1 : -1);
 
 const weightOf = (leg: Pick<SettlementCarryLeg, 'positionAbs'>): number =>
   Number.isFinite(leg.positionAbs) && leg.positionAbs > 0 ? leg.positionAbs : 0;
@@ -617,7 +618,8 @@ export async function readSettlementCarryWindow(
       base: market.base,
       venue: normalizeVenue(market.spreadVenues?.[0] ?? market.venue),
       spreadVenues: market.spreadVenues,
-      side: open?.side ?? (a.settlementToken >= 0 ? 'SHORT' : 'LONG'),
+      // 方向只来自当前持仓：平掉且无持仓的腿无法判断多空，交给展示层留白。
+      side: open?.side ?? null,
       coin: BOROS_TOKEN_SYMBOLS[market.tokenId] ?? `token${market.tokenId}`,
       settlementToken: a.settlementToken,
       feeToken: a.feeToken,
