@@ -774,35 +774,89 @@ describe('runSettlementCarryPass', () => {
     const res = await runSettlementCarryPass(makeDeps({}, send));
     expect(res.status).toBe('idle');
     expect(send).not.toHaveBeenCalled();
-    expect(cursor().lastPostedWindowSec).toBe(TO);
+    // 游标 = 刚结束窗口的【起点】，与闸门比较口径一致（issue #6 缺陷 1）
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
     expect(auditLines()[0]!.note).toBe('first-run-align');
   });
 
   it('同一窗口只发一次（幂等）', async () => {
     const send = vi.fn(async () => true);
     const at = (offsetSec: number) => makeDeps({ now: () => (TO + offsetSec) * 1000 }, send);
-    await runSettlementCarryPass(at(0)); // first-run align：游标停在刚跨过的边界
-    expect(cursor().lastPostedWindowSec).toBe(TO);
-    // 下一个边界：这个窗口只被观测过一部分 → 跳过
-    expect((await runSettlementCarryPass(at(28_800))).status).toBe('idle');
-    expect(send).not.toHaveBeenCalled();
-    // 再下一个边界：完整观测的窗口 → 播报
-    expect((await runSettlementCarryPass(at(57_600))).status).toBe('posted');
+    await runSettlementCarryPass(at(0)); // first-run align：游标停在刚结束窗口的起点
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
+    // 紧接的边界：这一窗口完整可读（readWindow 按时间区间读 API）→ 播报
+    expect((await runSettlementCarryPass(at(28_800))).status).toBe('posted');
     expect(send).toHaveBeenCalledTimes(1);
-    expect(cursor().lastPostedWindowSec).toBe(TO + 28_800);
+    expect(cursor().lastPostedWindowSec).toBe(TO);
     // 同一窗口再跑一次：不再发
-    expect((await runSettlementCarryPass(at(0))).status).toBe('idle');
+    expect((await runSettlementCarryPass(at(28_800))).status).toBe('idle');
     expect(send).toHaveBeenCalledTimes(1);
   });
 
-  it('发送失败不前进游标，下个周期重试同一窗口，3 次后放弃', async () => {
+  it('跳过分支落审计 + 打日志（note=skipped-already-handled）', async () => {
+    const logs: string[] = [];
+    const send = vi.fn(async () => true);
+    const at = (offsetSec: number) =>
+      makeDeps({ now: () => (TO + offsetSec) * 1000, log: (m) => logs.push(m) }, send);
+    await runSettlementCarryPass(at(0)); // align
+    expect((await runSettlementCarryPass(at(28_800))).status).toBe('posted');
+    const skipped = await runSettlementCarryPass(at(28_800)); // 同窗重跑
+    expect(skipped.status).toBe('idle');
+    const line = auditLines().at(-1)!;
+    expect(line.note).toBe('skipped-already-handled');
+    expect(line.windowFromSec).toBe(TO);
+    expect(line.windowToSec).toBe(TO + 28_800);
+    expect(line.posted).toBe(false);
+    expect(line.httpOk).toBeNull();
+    // 日志能直接看出「跑过但跳过」以及游标当时的取值
+    expect(logs.join('\n')).toContain(
+      `[settlement-carry] skip window ${TO}–${TO + 28_800} — already handled (cursor=${TO})`,
+    );
+  });
+
+  it('pending 重试不受幂等闸门约束（同窗口重试成功）', async () => {
+    // 生产缺陷现场：游标已等于待重试窗口的起点（首启对齐写窗口终点时必然如此）
+    fs.writeFileSync(
+      path.join(dataDir, 'settlement-carry-cursor.json'),
+      JSON.stringify({ lastPostedWindowSec: TO, pending: { fromSec: TO, toSec: TO + 28_800, attempts: 1 } }),
+    );
+    const send = vi.fn(async () => true);
+    const res = await runSettlementCarryPass(makeDeps({ now: () => (TO + 28_800) * 1000 }, send));
+    expect(res.status).toBe('posted');
+    expect(res.windowFromSec).toBe(TO);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(cursor().pending).toBeNull();
+    expect(cursor().lastPostedWindowSec).toBe(TO);
+  });
+
+  it('发送失败不前进游标，下个周期重试同一窗口成功（不被闸门吞）', async () => {
+    const send = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const at = (offsetSec: number) => makeDeps({ now: () => (TO + offsetSec) * 1000 }, send);
+    await runSettlementCarryPass(at(0)); // align → FROM
+
+    expect((await runSettlementCarryPass(at(28_800))).status).toBe('failed');
+    expect(cursor().pending?.fromSec).toBe(TO);
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
+    const failedLine = auditLines().at(-1)!;
+    expect(failedLine.httpOk).toBe(false);
+    expect(failedLine.posted).toBe(false);
+
+    // 下一周期：待重试窗口是 TO（早于当前窗口）→ 必须先重试它，且不被幂等闸门拦下
+    expect((await runSettlementCarryPass(at(57_600))).status).toBe('posted');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(cursor().pending).toBeNull();
+    expect(cursor().lastPostedWindowSec).toBe(TO);
+    expect(auditLines().at(-1)!.httpOk).toBe(true);
+  });
+
+  it('3 次发送失败后放弃（give-up），游标前进、不卡死', async () => {
     const fail = vi.fn(async () => false);
     const at = (offsetSec: number) => makeDeps({ now: () => (TO + offsetSec) * 1000 }, fail);
-    await runSettlementCarryPass(at(0)); // align at TO
+    await runSettlementCarryPass(at(0)); // align → FROM
 
     expect((await runSettlementCarryPass(at(57_600))).status).toBe('failed');
     expect(cursor().pending?.fromSec).toBe(TO + 28_800);
-    expect(cursor().lastPostedWindowSec).toBe(TO);
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
     expect((await runSettlementCarryPass(at(86_400))).status).toBe('failed');
     expect(cursor().pending?.attempts).toBe(2);
     // 第 3 次失败 → 放弃该窗口并留下失败标记（游标前进到该窗口起点，不重复卡死）
@@ -810,6 +864,11 @@ describe('runSettlementCarryPass', () => {
     expect(cursor().pending).toBeNull();
     expect(cursor().lastPostedWindowSec).toBe(TO + 28_800);
     expect(auditLines().some((l) => l.note === 'give-up')).toBe(true);
+    // 放弃后不卡死：下一周期能处理新窗口
+    const ok = vi.fn(async () => true);
+    const next = makeDeps({ now: () => (TO + 144_000) * 1000 }, ok);
+    expect((await runSettlementCarryPass(next)).status).toBe('posted');
+    expect(cursor().lastPostedWindowSec).toBe(TO + 115_200);
   });
 
   it('本窗口没有 Boros 结算 → 不发播报，但审计照写', async () => {
