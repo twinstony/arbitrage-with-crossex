@@ -814,6 +814,56 @@ describe('runSettlementCarryPass', () => {
     );
   });
 
+  it('审计不可写 → 本周期不发送、游标不动，恢复后该窗口只播报一次', async () => {
+    // 第 2 轮审阅阻塞项：审计是幂等闸门的**证据源**，所以「写不进去」不能伴随
+    // 「发送成功 + 游标推进」——那会让同一窗口在下个周期被当成没处理过而重复播报。
+    fs.mkdirSync(path.join(dataDir, 'audit'), { recursive: true });
+    const auditFile = path.join(dataDir, 'audit', 'settlement-carry.jsonl');
+    fs.writeFileSync(auditFile, '');
+    // 游标 = 待处理窗口起点（生产现场口径），审计文件 EACCES（目录本身可写）。
+    fs.writeFileSync(
+      path.join(dataDir, 'settlement-carry-cursor.json'),
+      JSON.stringify({ lastPostedWindowSec: FROM, pending: null }),
+    );
+    fs.chmodSync(auditFile, 0o400);
+    const errors: string[] = [];
+    const send = vi.fn(async () => true);
+    try {
+      const blocked = makeDeps({ error: (m) => errors.push(m) }, send);
+      expect((await runSettlementCarryPass(blocked)).status).toBe('failed');
+      // 同一窗口内再跑一次（重启 / intervalSec 重试节奏）：仍不发送，也就不可能重复播报
+      const atRerun = makeDeps({ now: () => (TO + 600) * 1000, error: (m) => errors.push(m) }, send);
+      expect((await runSettlementCarryPass(atRerun)).status).toBe('failed');
+      expect(send).not.toHaveBeenCalled();
+      expect(cursor()).toEqual({ lastPostedWindowSec: FROM, pending: null });
+      expect(fs.readFileSync(auditFile, 'utf8')).toBe('');
+      expect(errors.join('\n')).toContain('audit is not writable');
+    } finally {
+      fs.chmodSync(auditFile, 0o600);
+    }
+    // 审计恢复可写 → 被压住的那个窗口正常播报，且只播报一次
+    const ok = vi.fn(async () => true);
+    expect((await runSettlementCarryPass(makeDeps({}, ok))).status).toBe('posted');
+    expect(ok).toHaveBeenCalledTimes(1);
+    expect(auditLines().at(-1)!.posted).toBe(true);
+  });
+
+  it('首启对齐窗口算已处理：同窗口内二次运行不补发历史', async () => {
+    // 第 2 轮审阅次要项：对齐窗口是历史窗口，契约是「不补发历史」；
+    // `first-run-align` 进证据集后，重启 / 双启也不会把它补发出去。
+    const send = vi.fn(async () => true);
+    const at = (offsetSec: number) => makeDeps({ now: () => (TO + offsetSec) * 1000 }, send);
+    expect((await runSettlementCarryPass(at(0))).status).toBe('idle'); // 首启只对齐
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
+    expect((await runSettlementCarryPass(at(0))).status).toBe('idle'); // 同窗口二次运行
+    expect(send).not.toHaveBeenCalled();
+    expect(cursor().lastPostedWindowSec).toBe(FROM);
+    expect(auditLines().at(-1)!.note).toBe('skipped-already-handled');
+    // 下一个窗口照常播报（证明闸门没有把后续窗口一起铉住）
+    expect((await runSettlementCarryPass(at(28_800))).status).toBe('posted');
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('pending 重试不受幂等闸门约束（同窗口重试成功）', async () => {
     // 生产缺陷现场：游标已等于待重试窗口的起点（首启对齐写窗口终点时必然如此）
     fs.writeFileSync(
