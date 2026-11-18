@@ -21,7 +21,7 @@ import {
 } from '../../src/server/notify/settlementCarry';
 
 const TO = 1_700_006_400;
-const WINDOW = { windowFromSec: TO + 28_800, windowToSec: TO + 57_600 };
+const WINDOW = { windowFromSec: TO, windowToSec: TO + 28_800 };
 
 interface Captured {
   event?: string;
@@ -124,11 +124,12 @@ const advance = (offsetSec: number) => ({ now: () => (TO + offsetSec) * 1000 });
 
 describe('结算播报 · 隔离运行', () => {
   it('webhook 指向本地 mock 时能完整跑通（首次对齐 → 下一个完整窗口播报）', async () => {
-    // 首次运行只对齐游标，不发消息
+    // 首次运行只对齐游标（写到刚结束窗口的起点），不发消息
     expect((await runSettlementCarryPass(deps())).status).toBe('idle');
     expect(capture).toHaveLength(0);
 
-    const posted = await runSettlementCarryPass(deps(advance(57_600)));
+    // 紧接的下一个边界：这一窗口完整可读 → 播报（issue #6：曾被闸门静默吞掉）
+    const posted = await runSettlementCarryPass(deps(advance(28_800)));
     expect(posted.status).toBe('posted');
     expect(capture).toHaveLength(1);
     expect(capture[0]!.event).toBe('Boros_APR_Alert');
@@ -155,18 +156,18 @@ describe('结算播报 · 隔离运行', () => {
 
     // 心跳推进
     const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'settlement-carry-state.json'), 'utf8'));
-    expect(state.lastRunSec).toBe(TO + 57_600);
+    expect(state.lastRunSec).toBe(TO + 28_800);
   });
 
   it('webhook 返回 5xx 时记为未发出（httpOk=false），游标不前进', async () => {
     await runSettlementCarryPass(deps());
     webhookOk = false;
-    const failed = await runSettlementCarryPass(deps(advance(57_600)));
+    const failed = await runSettlementCarryPass(deps(advance(28_800)));
     expect(failed.status).toBe('failed');
     expect(capture).toHaveLength(1); // 请求确实发出去了
     const cursor = JSON.parse(fs.readFileSync(path.join(dataDir, 'settlement-carry-cursor.json'), 'utf8'));
-    expect(cursor.lastPostedWindowSec).toBe(TO);
-    expect(cursor.pending.fromSec).toBe(TO + 28_800);
+    expect(cursor.lastPostedWindowSec).toBe(TO - 28_800); // 首启对齐写窗口起点
+    expect(cursor.pending.fromSec).toBe(TO);
     const audit = fs
       .readFileSync(path.join(dataDir, 'audit', 'settlement-carry.jsonl'), 'utf8')
       .trim()
