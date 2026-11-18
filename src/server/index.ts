@@ -24,6 +24,7 @@ import { TtlCache, TTL } from './cache';
 import { readOrCreateApiToken } from './authToken';
 import { panelExitMode, readNotifyConfig, startOpportunityScanner } from './notify/scanner';
 import { makePositionsReader } from './notify/positions';
+import { startSettlementCarry } from './notify/settlementCarry';
 import { scanOpportunities } from './routes/opportunities';
 import { InterestFile } from './interestLedger';
 import { JobFile, TransferFile } from './rebalanceJob';
@@ -340,6 +341,9 @@ app
           `every ${Math.round(notifyConfig.intervalMs / 1000)}s`,
       );
     }
+    // 💰 结算播报：每 8h 把 Boros 结算与 CrossEx 同期资金费/手续费合并成一条
+    // fwalert 推送。模块自己读 env（SETTLEMENT_CARRY_ENABLED，默认 off）。
+    startSettlementCarry();
     void telegramLink.settled().then(() => telegramSync.start());
 
     const shown = host === '127.0.0.1' ? 'localhost' : host;
