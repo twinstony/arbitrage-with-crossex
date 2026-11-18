@@ -751,6 +751,24 @@ describe('runSettlementCarryPass', () => {
       .split('\n')
       .map((l) => JSON.parse(l) as Record<string, unknown>);
 
+  it('issue #6 复现：生产游标副本（首启对齐值）不得吞掉下一个窗口', async () => {
+    // 2026-11-18 生产现场：09:04 CST 首启对齐后的游标，16:03 CST 的那一轮被静默跳过。
+    const prodNowSec = 1_794_988_980; // 2026-11-18T08:03:00Z = 16:03 CST
+    const windowFromSec = 1_794_960_000; // 目标窗口 [1794960000, 1794988800)
+    fs.writeFileSync(
+      path.join(dataDir, 'settlement-carry-cursor.json'),
+      JSON.stringify({ lastPostedWindowSec: windowFromSec, pending: null }),
+    );
+    const send = vi.fn(async () => true);
+    const res = await runSettlementCarryPass(makeDeps({ now: () => prodNowSec * 1000 }, send));
+    expect(res.status).not.toBe('idle');
+    expect(res.status).toBe('posted');
+    expect(res.windowFromSec).toBe(windowFromSec);
+    expect(send).toHaveBeenCalledTimes(1);
+    // 该窗口必须落审计（事后可判定「跑过」）
+    expect(auditLines().at(-1)!.windowFromSec).toBe(windowFromSec);
+  });
+
   it('首次运行只对齐游标，不补发历史', async () => {
     const send = vi.fn(async () => true);
     const res = await runSettlementCarryPass(makeDeps({}, send));
