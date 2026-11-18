@@ -105,7 +105,14 @@ export function readSettlementCarryConfig(
   return { webhook: readFwAlertConfig(env), intervalSec };
 }
 
-/** 刚结束的那个 8h 窗口：UTC 的 0/8/16 点对齐，返回 `[fromSec, toSec)`。 */
+/**
+ * 刚结束的那个 8h 窗口：UTC 的 0/8/16 点对齐，返回 `[fromSec, toSec)`。
+ *
+ * 游标契约（与 `runSettlementCarryPass` 的幂等闸门共用一套口径）：
+ * `lastPostedWindowSec` 记的是「已处理的最后一个窗口的**起点**」，即 `carryWindow().fromSec`，
+ * 闸门比较的也是 `fromSec`。历史上这里曾写成窗口终点（= 下一个窗口的起点），
+ * 结果下一个窗口被误判为已处理而静默跳过（issue #6）。
+ */
 export function carryWindow(nowSec: number): { fromSec: number; toSec: number } {
   const toSec = Math.floor(nowSec / WINDOW_SEC) * WINDOW_SEC;
   return { fromSec: toSec - WINDOW_SEC, toSec };
@@ -908,7 +915,10 @@ interface CarryPending {
 }
 
 interface CarryCursor {
-  /** 已处理（播报过或明确放弃）的最大窗口起点；null = 从未运行。 */
+  /**
+   * 已处理（播报过或明确放弃）的最后一个窗口的**起点**，即 `carryWindow().fromSec`；
+   * null = 从未运行。幂等闸门拿 `target.fromSec` 与它比较，两者必须同口径（issue #6）。
+   */
   lastPostedWindowSec: number | null;
   /** 发送失败待重试的窗口（游标不前进）。 */
   pending: CarryPending | null;
@@ -958,10 +968,44 @@ function appendAudit(dataDir: string, line: Record<string, unknown>): void {
   }
 }
 
+/** 审计里能证明「本窗口处理过」的 note 值（`posted: true` 同样算）。 */
+const HANDLED_NOTES = new Set(['no-settlement', 'give-up', 'skipped-already-handled']);
+
 /**
- * 跑一个周期。**不补发历史窗口**：首次运行只把游标对齐到刚跨过的边界；
- * 之后每个周期处理「刚结束的那个 8h 窗口」，同一窗口只发一次（游标断言）。
- * 发送失败时游标不前进，下个周期重试同一窗口，最多 3 个周期后放弃并写失败标记。
+ * 本窗口是否真的处理过 —— 只认审计里的记录，不认游标数字本身。
+ *
+ * 理由（issue #6 缺陷 1）：旧版首启对齐把窗口**终点**写进 `lastPostedWindowSec`，
+ * 而终点恰好等于紧邻的下一个窗口的**起点**；单拿数字比大小，那个窗口就被误判为
+ * 「已处理」而永久丢失。窗口是否处理过是审计记录的事实（V2），不以水位线推断。
+ */
+function isWindowHandled(dataDir: string, fromSec: number, toSec: number): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(dataDir, AUDIT_DIR, AUDIT_FILE), 'utf8');
+  } catch {
+    return false;
+  }
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (row.windowFromSec !== fromSec || row.windowToSec !== toSec) continue;
+    if (row.posted === true) return true;
+    if (typeof row.note === 'string' && HANDLED_NOTES.has(row.note)) return true;
+  }
+  return false;
+}
+
+/**
+ * 跑一个周期。**不补发历史窗口**：首次运行只把游标对齐到刚结束窗口的起点；
+ * 之后每个周期处理「刚结束的那个 8h 窗口」，同一窗口只发一次（游标断言，
+ * 跳过也落审计 + 打日志）。发送失败时游标不前进，下个周期重试同一窗口，最多 3 个周期后放弃并写失败标记。
  */
 export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise<CarryPassResult> {
   if (!deps.config.webhook) return { status: 'disabled' };
@@ -970,9 +1014,11 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
   const { fromSec, toSec } = carryWindow(nowSec);
   const cursor = readCursor(deps.dataDir);
 
-  // 首次运行：不补发历史，只对齐到下一个边界。
+  // 首次运行：不补发历史，游标对齐到**刚结束窗口的起点**（不是终点）。
+  // 依据：`readWindow` 按时间区间从 API 读，窗口跨进程启动也完整可读，
+  // 而且写作起点才能与闸门的 `target.fromSec` 比较口径一致。
   if (cursor.lastPostedWindowSec === null && cursor.pending === null) {
-    writeCursor(deps.dataDir, { lastPostedWindowSec: toSec, pending: null });
+    writeCursor(deps.dataDir, { lastPostedWindowSec: fromSec, pending: null });
     appendAudit(deps.dataDir, {
       windowFromSec: fromSec,
       windowToSec: toSec,
@@ -982,12 +1028,39 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
       httpOk: null,
       note: 'first-run-align',
     });
-    deps.log('[settlement-carry] first run — cursor aligned, no historical window posted');
+    deps.log(
+      `[settlement-carry] first run — cursor aligned to ${fromSec} (window ${fromSec}–${toSec}), no historical window posted`,
+    );
     return { status: 'idle', windowFromSec: fromSec, windowToSec: toSec };
   }
 
   const target = cursor.pending ?? { fromSec, toSec, attempts: 0 };
-  if (cursor.lastPostedWindowSec !== null && target.fromSec <= cursor.lastPostedWindowSec) {
+  // 幂等闸门：两道条件同时成立才算「这个窗口已经处理过」。
+  //   1. 游标认为它处理过 —— 游标记的是【窗口起点】，与 `carryWindow().fromSec` 同口径；
+  //   2. 审计里真有这个窗口的记录 —— 数字本身不足为凭（旧版把窗口终点写进游标时，
+  //      终点恰好等于下一个窗口的起点，单看数字会把那个窗口误判成已处理：issue #6 缺陷 1）。
+  // 只约束「由当前时刻推出的窗口」；`pending` 是上一周期没发完的重试，它能否再试由
+  // attempts 预算决定，被闸门抦住就永远重试不了（issue #6 缺陷 3）。
+  if (
+    cursor.pending === null &&
+    cursor.lastPostedWindowSec !== null &&
+    target.fromSec <= cursor.lastPostedWindowSec &&
+    isWindowHandled(deps.dataDir, target.fromSec, target.toSec)
+  ) {
+    // 跳过也要留痕：事后必须能区分「没跑」「跑了被跳过」「跑了发送失败」（issue #6 缺陷 2）。
+    appendAudit(deps.dataDir, {
+      windowFromSec: target.fromSec,
+      windowToSec: target.toSec,
+      ranAtSec: nowSec,
+      legs: [],
+      posted: false,
+      httpOk: null,
+      note: 'skipped-already-handled',
+      lastPostedWindowSec: cursor.lastPostedWindowSec,
+    });
+    deps.log(
+      `[settlement-carry] skip window ${target.fromSec}–${target.toSec} — already handled (cursor=${cursor.lastPostedWindowSec})`,
+    );
     return { status: 'idle', windowFromSec: target.fromSec, windowToSec: target.toSec };
   }
 
@@ -1143,9 +1216,8 @@ export function startSettlementCarry(
         });
     }, ms);
   };
-  // 首次延迟 30s（同 scanner 的 boot grace）：它只做「游标对齐到刚跨过的边界」，
-  // 不读网络。越早对齐，启动后第一个**完整观测**的窗口就越早播报。
-  // 之后的落点踩在 UTC 0/8/16 边界（见 `nextRunDelayMs`），不再是「启动时刻 + 8h」。
+  // 首次延迟 30s（同 scanner 的 boot grace）：它只做「游标对齐到刚结束窗口的起点」，
+  // 不读网络。之后的落点踩在 UTC 0/8/16 边界（见 `nextRunDelayMs`），不再是「启动时刻 + 8h」。
   schedule(opts.firstDelayMs ?? BOOT_ALIGN_DELAY_MS);
   runtime.log(
     `[settlement-carry] enabled — posting at UTC 00/08/16, retry cadence ${runtime.config.intervalSec}s`,
