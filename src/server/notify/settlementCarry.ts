@@ -84,13 +84,27 @@ export const WINDOW_SEC = 8 * 3600;
 /** 下限 1 小时：更密的节奏不会产生新窗口（同一窗口只发一次）。 */
 const MIN_INTERVAL_SEC = 3600;
 const DEFAULT_INTERVAL_SEC = WINDOW_SEC;
-/** 一个窗口最多重试几个周期（issue #4 §6）。 */
+/** 一个窗口最多重试几个周期（issue #4 §6）。按「周期」计，不按 HTTP 请求计。 */
 const MAX_ATTEMPTS = 3;
+/** 失败后的短退避（issue #8）：下一次尝试不再等到下一个 8h 边界。 */
+const DEFAULT_RETRY_BACKOFF_SEC = 300;
+/** 退避下限：更密的节奏只会白敲已挂的接口。 */
+const MIN_RETRY_BACKOFF_SEC = 30;
+
+/**
+ * 边界取数的有限重试（issue #8 缺陷 2）：本机约 1/3 新建 HTTPS 连接会在 TLS
+ * 握手阶段失败（ninja-tun 透明代理），单次取数就会周期性丢掉一整期播报。
+ * 只重试「没有拿到判决」的网络类错误，3 次、间隔 2s。
+ */
+const READ_ATTEMPTS = 3;
+const READ_RETRY_DELAY_MS = 2_000;
 
 export interface SettlementCarryConfig {
   /** 未配置 `APR_ALERT_WEBHOOK_URL` 时为 null——此时不启动。 */
   webhook: FwAlertConfig | null;
   intervalSec: number;
+  /** 失败后多久重试同一窗口（`SETTLEMENT_CARRY_RETRY_BACKOFF_SEC`，默认 300s）。 */
+  retryBackoffSec: number;
 }
 
 /** 开关关闭 / 未设置 → null（安装即无成本）。 */
@@ -102,7 +116,12 @@ export function readSettlementCarryConfig(
   const raw = Number(env.SETTLEMENT_CARRY_INTERVAL_SECONDS);
   const intervalSec =
     Number.isFinite(raw) && raw > 0 ? Math.max(MIN_INTERVAL_SEC, raw) : DEFAULT_INTERVAL_SEC;
-  return { webhook: readFwAlertConfig(env), intervalSec };
+  const rawBackoff = Number(env.SETTLEMENT_CARRY_RETRY_BACKOFF_SEC);
+  const retryBackoffSec =
+    Number.isFinite(rawBackoff) && rawBackoff > 0
+      ? Math.max(MIN_RETRY_BACKOFF_SEC, rawBackoff)
+      : DEFAULT_RETRY_BACKOFF_SEC;
+  return { webhook: readFwAlertConfig(env), intervalSec, retryBackoffSec };
 }
 
 /**
@@ -125,8 +144,11 @@ export function carryWindow(nowSec: number): { fromSec: number; toSec: number } 
 export const BOUNDARY_GRACE_SEC = 180;
 
 /**
- * 下一次运行的延迟：踩在 **UTC 0/8/16 边界**（窗口一结束就播，而不是「启动时刻
- * + 8h」那种相位漂移的落点），但不晚于 `intervalSec`——发送失败时的重试节奏靠它。
+ * 成功路径的下一次运行延迟：踩在 **UTC 0/8/16 边界**（窗口一结束就播，而不是
+ * 「启动时刻 + 8h」那种相位漂移的落点），但不晚于 `intervalSec`。
+ *
+ * 失败路径**不**走它——`intervalSec` 默认 8h 时，`min` 的结果必然是下一个边界，
+ * 一次 TLS 抖动就要等 8h（issue #8）。失败走 `nextDelayAfterPass` 的短退避。
  */
 export function nextRunDelayMs(nowMs: number, intervalSec: number): number {
   const nowSec = Math.floor(nowMs / 1000);
@@ -137,6 +159,58 @@ export function nextRunDelayMs(nowMs: number, intervalSec: number): number {
   const intervalMs = intervalSec * 1000;
   const cadenceMs = intervalMs < WINDOW_SEC * 1000 ? intervalMs : (WINDOW_SEC + BOUNDARY_GRACE_SEC) * 1000;
   return Math.max(1_000, Math.min(cadenceMs, toBoundaryMs));
+}
+
+/**
+ * 一个周期跑完后，下一次尝试的延迟（`schedule()` 的唯一决定点）。
+ *
+ * 失败（读失败 / 发送失败 / 审计不可写 / 周期崩溃）→ 短退避：同一窗口内几分钟后
+ * 再试，而不是等到下一个 8h 边界（issue #8 缺陷 1）。成功（含 idle/empty，窗口
+ * 已处理）→ 踩下一个 UTC 边界，与历史行为逐位一致。
+ */
+export function nextDelayAfterPass(
+  nowMs: number,
+  config: SettlementCarryConfig,
+  result: Pick<CarryPassResult, 'status'>,
+): number {
+  if (result.status === 'failed') return Math.max(1_000, config.retryBackoffSec * 1000);
+  return nextRunDelayMs(nowMs, config.intervalSec);
+}
+
+/**
+ * 只有「没有拿到判决」的错误才重试：网络类（TLS 抖动、连接重置、超时）以及不带
+ * category 的未知错误。429 与 4xx 是判决（再敲一遍也一样），不重试。
+ */
+const isTransientReadError = (err: unknown): boolean => {
+  const category = (err as { category?: unknown } | null)?.category;
+  return category === undefined || category === 'network';
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 边界取数：对瞬时网络失败做有限重试（issue #8 缺陷 2）。
+ *
+ * 计次语义不变：`attempts` 数的是失败**周期**，重试发生在同一周期内。
+ */
+async function readWindowWithRetry(
+  deps: SettlementCarryDeps,
+  fromSec: number,
+  toSec: number,
+): Promise<SettlementCarryWindow> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await deps.readWindow(fromSec, toSec);
+    } catch (err) {
+      if (attempt >= READ_ATTEMPTS || !isTransientReadError(err)) throw err;
+      deps.log(
+        `[settlement-carry] window read failed (attempt ${attempt}/${READ_ATTEMPTS}),` +
+          ` retrying in ${(deps.readRetryDelayMs ?? READ_RETRY_DELAY_MS) / 1000}s:` +
+          ` ${(err as Error).message}`,
+      );
+      await sleep(deps.readRetryDelayMs ?? READ_RETRY_DELAY_MS);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +977,8 @@ export interface SettlementCarryDeps {
   dataDir: string;
   now: () => number;
   readWindow: (fromSec: number, toSec: number) => Promise<SettlementCarryWindow>;
+  /** 读重试的间隔（默认 2s）；测试传 0，避免真等待。 */
+  readRetryDelayMs?: number;
   sendWebhook: (details: string, coin: string) => Promise<boolean>;
   log: (msg: string) => void;
   error: (msg: string, err?: unknown) => void;
@@ -1120,7 +1196,7 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
 
   let window: SettlementCarryWindow;
   try {
-    window = await deps.readWindow(target.fromSec, target.toSec);
+    window = await readWindowWithRetry(deps, target.fromSec, target.toSec);
   } catch (err) {
     deps.error('[settlement-carry] window read failed', err);
     // 读不到就不算「发不出去」：游标不动，下个周期再试同一窗口（同样计次）。
@@ -1136,9 +1212,23 @@ export async function runSettlementCarryPass(deps: SettlementCarryDeps): Promise
       attempts,
       note: 'read-failed',
     });
-    // 放弃要留痕才推进游标（否则「放弃」这个事实没有记录）。
+    // 放弃要留痕才推进游标（否则「放弃」这个事实没有记录）。`give-up` 进证据集，
+    // 短退避下下一轮才能凭它认出「本窗口已放弃」而跳过——否则同一窗口会在 300s
+    // 后重新计次，把 8h 里剩下的时间全部花在重试一个已放弃的窗口上。
+    const giveUpRecorded = giveUp
+      ? appendAudit(deps.dataDir, {
+          windowFromSec: target.fromSec,
+          windowToSec: target.toSec,
+          ranAtSec: nowSec,
+          legs: [],
+          posted: false,
+          httpOk: null,
+          attempts,
+          note: 'give-up',
+        })
+      : false;
     writeCursor(deps.dataDir, {
-      lastPostedWindowSec: giveUp && audited ? target.fromSec : cursor.lastPostedWindowSec,
+      lastPostedWindowSec: giveUp && audited && giveUpRecorded ? target.fromSec : cursor.lastPostedWindowSec,
       pending: giveUp ? null : { ...target, attempts },
     });
     return { status: 'failed', windowFromSec: target.fromSec, windowToSec: target.toSec };
@@ -1282,9 +1372,18 @@ export function startSettlementCarry(
   const schedule = (ms: number): void => {
     timer = setTimeout(() => {
       void runSettlementCarryPass(runtime)
-        .catch((err: unknown) => runtime.error('[settlement-carry] pass crashed', err))
-        .finally(() => {
-          if (!stopped) schedule(nextRunDelayMs(runtime.now(), runtime.config.intervalSec));
+        .catch((err: unknown) => {
+          runtime.error('[settlement-carry] pass crashed', err);
+          return { status: 'failed' } as CarryPassResult;
+        })
+        .then((result) => {
+          if (stopped) return;
+          const nextMs = nextDelayAfterPass(runtime.now(), runtime.config, result);
+          // 失败走短退避（issue #8）：日志里能直接看出「几分钟后再试」，不是 8h。
+          if (result.status === 'failed') {
+            runtime.log(`[settlement-carry] retrying in ${Math.round(nextMs / 1000)}s`);
+          }
+          schedule(nextMs);
         });
     }, ms);
   };
@@ -1292,7 +1391,7 @@ export function startSettlementCarry(
   // 不读网络。之后的落点踩在 UTC 0/8/16 边界（见 `nextRunDelayMs`），不再是「启动时刻 + 8h」。
   schedule(opts.firstDelayMs ?? BOOT_ALIGN_DELAY_MS);
   runtime.log(
-    `[settlement-carry] enabled — posting at UTC 00/08/16, retry cadence ${runtime.config.intervalSec}s`,
+    `[settlement-carry] enabled — posting at UTC 00/08/16, retry cadence ${runtime.config.retryBackoffSec}s`,
   );
   return {
     stop: () => {
