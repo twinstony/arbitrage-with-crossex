@@ -971,6 +971,76 @@ describe('runSettlementCarryPass', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 5.5 失败重试节奏（issue #8：2026-11-19 生产事故）
+// ---------------------------------------------------------------------------
+
+/**
+ * 事故现场（issue #8）：2026-11-19T08:03Z 读窗口 [1795046400, 1795075200) 时
+ * Boros API 报 `fetch failed`（本机约 1/3 新 HTTPS 连接 TLS 握手失败）。
+ * 游标停在上一期，pending 为空——正是那次事故的原始游标。
+ */
+const INCIDENT_NOW_SEC = 1_795_075_380; // 2026-11-19T08:03:00Z = 16:03 CST
+const INCIDENT_FROM = 1_795_046_400;
+const INCIDENT_TO = 1_795_075_200;
+const INCIDENT_PREV_FROM = 1_795_017_600;
+
+/** 瞬时网络失败：`CoreError` 的 category = network（TLS 抖动、连接被重置）。 */
+const networkError = (msg = 'Boros API unreachable (/apis/v1/markets): fetch failed'): Error =>
+  Object.assign(new Error(msg), { category: 'network' });
+
+describe('issue #8 · 失败后的重试节奏', () => {
+  let dataDir = '';
+
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settlement-carry-retry-'));
+    fs.writeFileSync(
+      path.join(dataDir, 'settlement-carry-cursor.json'),
+      JSON.stringify({ lastPostedWindowSec: INCIDENT_PREV_FROM, pending: null }),
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const depsAt = (nowSec: number, over: Partial<SettlementCarryDeps> = {}): SettlementCarryDeps => ({
+    config: { webhook: { url: 'http://127.0.0.1:9/unused' }, intervalSec: 28_800, retryBackoffSec: 300 },
+    dataDir,
+    now: () => nowSec * 1000,
+    readWindow: async () => ({ legs: [], perps: [], unattributedUsd: 0, incompleteLedger: false }),
+    sendWebhook: async () => true,
+    log: () => {},
+    error: () => {},
+    ...over,
+  });
+
+  const auditLines = (): Array<Record<string, unknown>> =>
+    fs
+      .readFileSync(path.join(dataDir, 'audit', 'settlement-carry.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  const cursor = (): { lastPostedWindowSec: number | null; pending: Record<string, unknown> | null } =>
+    JSON.parse(fs.readFileSync(path.join(dataDir, 'settlement-carry-cursor.json'), 'utf8'));
+
+  it('复现：边界读失败后天亮前只等短退避，不是下一个 8h 边界', async () => {
+    const res = await runSettlementCarryPass(
+      depsAt(INCIDENT_NOW_SEC, { readWindow: async () => { throw networkError(); } }),
+    );
+    expect(res.status).toBe('failed');
+    const line = auditLines().at(-1)!;
+    expect(line.note).toBe('read-failed');
+    expect(line.windowFromSec).toBe(INCIDENT_FROM);
+    expect(line.attempts).toBe(1);
+    expect(cursor().pending).toEqual({ fromSec: INCIDENT_FROM, toSec: INCIDENT_TO, attempts: 1 });
+
+    // 生产的 `schedule()` 在失败后唯一能算出的延迟（旧实现：min(8h5m, 到边界) = 8h）。
+    const delay = nextRunDelayMs(INCIDENT_NOW_SEC * 1000, 28_800);
+    expect(delay).toBeLessThanOrEqual(360_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 6. 配置
 // ---------------------------------------------------------------------------
 
