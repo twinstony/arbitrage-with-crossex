@@ -10,7 +10,7 @@ import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sendFwAlert } from '../../src/server/notify/fwalert';
 import {
   createSettlementCarryDeps,
@@ -69,6 +69,8 @@ afterEach(() => {
   delete process.env.SETTLEMENT_CARRY_ENABLED;
   delete process.env.APR_ALERT_WEBHOOK_URL;
   delete process.env.BOROS_ROOT_ADDRESS;
+  delete process.env.SETTLEMENT_CARRY_RETRY_BACKOFF_SEC;
+  vi.unstubAllGlobals();
 });
 
 /**
@@ -108,7 +110,7 @@ const windowFixture: SettlementCarryWindow = {
 
 function deps(over: Partial<SettlementCarryDeps> = {}): SettlementCarryDeps {
   return {
-    config: { webhook: { url }, intervalSec: 28_800 },
+    config: { webhook: { url }, intervalSec: 28_800, retryBackoffSec: 300 },
     dataDir,
     now: () => TO * 1000,
     readWindow: async () => windowFixture,
@@ -175,6 +177,52 @@ describe('结算播报 · 隔离运行', () => {
       .map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(audit.at(-1)!.httpOk).toBe(false);
     expect(audit.at(-1)!.posted).toBe(false);
+  });
+});
+
+describe('fwalert · 超时/网络失败重试一次（issue #8 缺陷 3）', () => {
+  const cfg = { url: 'http://127.0.0.1:9/unused' };
+  const tlsReset = (): Error => Object.assign(new Error('fetch failed: SSL connect error'), { name: 'TypeError' });
+  const timedOut = (): Error => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+
+  it('TLS 抖动一次后第二次成功 → 返回 true，一共 2 次请求', async () => {
+    const attempts: string[] = [];
+    const fetchMock = vi.fn(async () => {
+      attempts.push('call');
+      if (attempts.length === 1) throw tlsReset();
+      return { ok: true } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(sendFwAlert(cfg, 'details', 'BTC')).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('超时被切断后重试一次（生产事故里的 `aborted due to timeout`）', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw timedOut();
+      return { ok: true } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(sendFwAlert(cfg, 'details', 'BTC')).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('两次都失败 → false（不再第三次），交给周期级短退避', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw tlsReset();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(sendFwAlert(cfg, 'details', 'BTC')).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('收到非 2xx 判决时不重试（判决已到，重复发送有重复播报风险）', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 500 }) as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(sendFwAlert(cfg, 'details', 'BTC')).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -33,6 +33,7 @@ import {
   inSettlementWindow,
   bookRowPeriodEndSec,
   nextRunDelayMs,
+  nextDelayAfterPass,
   BOUNDARY_GRACE_SEC,
   type SettlementCarryDeps,
   type SettlementCarryReaders,
@@ -731,7 +732,7 @@ describe('runSettlementCarryPass', () => {
     over: Partial<SettlementCarryDeps> = {},
     send: (details: string, coin: string) => Promise<boolean> = async () => true,
   ): SettlementCarryDeps => ({
-    config: { webhook: { url: 'http://127.0.0.1:9/unused' }, intervalSec: 28_800 },
+    config: { webhook: { url: 'http://127.0.0.1:9/unused' }, intervalSec: 28_800, retryBackoffSec: 300 },
     dataDir,
     now: () => NOW_MS,
     readWindow: async () => readWindow(),
@@ -964,9 +965,190 @@ describe('runSettlementCarryPass', () => {
   it('未配置 webhook → 不运行', async () => {
     const res = await runSettlementCarryPass({
       ...makeDeps(),
-      config: { webhook: null, intervalSec: 28_800 },
+      config: { webhook: null, intervalSec: 28_800, retryBackoffSec: 300 },
     });
     expect(res.status).toBe('disabled');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5.5 失败重试节奏（issue #8：2026-11-19 生产事故）
+// ---------------------------------------------------------------------------
+
+/**
+ * 事故现场（issue #8）：2026-11-19T08:03Z 读窗口 [1795046400, 1795075200) 时
+ * Boros API 报 `fetch failed`（本机约 1/3 新 HTTPS 连接 TLS 握手失败）。
+ * 游标停在上一期，pending 为空——正是那次事故的原始游标。
+ */
+const INCIDENT_NOW_SEC = 1_795_075_380; // 2026-11-19T08:03:00Z = 16:03 CST
+const INCIDENT_FROM = 1_795_046_400;
+const INCIDENT_TO = 1_795_075_200;
+const INCIDENT_PREV_FROM = 1_795_017_600;
+
+/** 瞬时网络失败：`CoreError` 的 category = network（TLS 抖动、连接被重置）。 */
+const networkError = (msg = 'Boros API unreachable (/apis/v1/markets): fetch failed'): Error =>
+  Object.assign(new Error(msg), { category: 'network' });
+
+describe('issue #8 · 失败后的重试节奏', () => {
+  let dataDir = '';
+
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'settlement-carry-retry-'));
+    fs.writeFileSync(
+      path.join(dataDir, 'settlement-carry-cursor.json'),
+      JSON.stringify({ lastPostedWindowSec: INCIDENT_PREV_FROM, pending: null }),
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const depsAt = (nowSec: number, over: Partial<SettlementCarryDeps> = {}): SettlementCarryDeps => ({
+    config: { webhook: { url: 'http://127.0.0.1:9/unused' }, intervalSec: 28_800, retryBackoffSec: 300 },
+    dataDir,
+    now: () => nowSec * 1000,
+    readWindow: async () => ({ legs: [], perps: [], unattributedUsd: 0, incompleteLedger: false }),
+    sendWebhook: async () => true,
+    log: () => {},
+    error: () => {},
+    ...over,
+  });
+
+  const auditLines = (): Array<Record<string, unknown>> =>
+    fs
+      .readFileSync(path.join(dataDir, 'audit', 'settlement-carry.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  const cursor = (): { lastPostedWindowSec: number | null; pending: Record<string, unknown> | null } =>
+    JSON.parse(fs.readFileSync(path.join(dataDir, 'settlement-carry-cursor.json'), 'utf8'));
+
+  it('复现：边界读失败后只等短退避，不是下一个 8h 边界', async () => {
+    const res = await runSettlementCarryPass(
+      depsAt(INCIDENT_NOW_SEC, {
+        // 3 次取数全失败（持续挂），退回周期失败路径
+        readWindow: async () => {
+          throw networkError();
+        },
+        readRetryDelayMs: 0,
+      }),
+    );
+    expect(res.status).toBe('failed');
+    const line = auditLines().at(-1)!;
+    expect(line.note).toBe('read-failed');
+    expect(line.windowFromSec).toBe(INCIDENT_FROM);
+    expect(line.attempts).toBe(1);
+    expect(cursor().pending).toEqual({ fromSec: INCIDENT_FROM, toSec: INCIDENT_TO, attempts: 1 });
+
+    // 失败 → 短退避（300s，≤ 360s）；旧实现这里是 min(8h5m, 到边界) = 28_800_000ms。
+    const cfg = depsAt(INCIDENT_NOW_SEC).config;
+    const delay = nextDelayAfterPass(INCIDENT_NOW_SEC * 1000, cfg, res);
+    expect(delay).toBe(300_000);
+    expect(delay).toBeLessThanOrEqual(360_000);
+  });
+
+  it('成功路径仍踩 UTC 边界（行为不变）', async () => {
+    const cfg = depsAt(INCIDENT_NOW_SEC).config;
+    // 边界后 3 分钟失败过、但这一轮成功 → 下一次仍是下一个边界，不是 300s
+    expect(nextDelayAfterPass(INCIDENT_NOW_SEC * 1000, cfg, { status: 'posted' })).toBe(28_800_000);
+    expect(nextDelayAfterPass(INCIDENT_NOW_SEC * 1000, cfg, { status: 'idle' })).toBe(28_800 * 1000);
+    expect(nextDelayAfterPass(INCIDENT_NOW_SEC * 1000, cfg, { status: 'empty' })).toBe(28_800 * 1000);
+  });
+
+  it('边界取数对瞬时网络失败做有限重试（3 次、间隔可注入）：同一周期内补上，不计新的周期', async () => {
+    let calls = 0;
+    const read = vi.fn(async () => {
+      calls += 1;
+      if (calls <= 2) throw networkError();
+      return { legs: [], perps: [], unattributedUsd: 0, incompleteLedger: false };
+    });
+    const logs: string[] = [];
+    const res = await runSettlementCarryPass(
+      depsAt(INCIDENT_NOW_SEC, { readWindow: read, readRetryDelayMs: 0, log: (m) => logs.push(m) }),
+    );
+    // 读的第 3 次成功 → 正常认定本窗口「无结算」，不留 read-failed
+    expect(res.status).toBe('empty');
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(auditLines().at(-1)!.note).toBe('no-settlement');
+    expect(logs.join('\n')).toContain('window read failed (attempt 1/3), retrying');
+    expect(logs.join('\n')).toContain('window read failed (attempt 2/3), retrying');
+    expect(cursor()).toEqual({ lastPostedWindowSec: INCIDENT_FROM, pending: null });
+  });
+
+  it('非网络类错误（429 / 4xx 判决）不重试', async () => {
+    const read = vi.fn(async () => {
+      throw Object.assign(new Error('Boros API returned HTTP 429'), { category: 'rate-limited' });
+    });
+    const res = await runSettlementCarryPass(
+      depsAt(INCIDENT_NOW_SEC, { readWindow: read, readRetryDelayMs: 0 }),
+    );
+    expect(res.status).toBe('failed');
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(auditLines().at(-1)!.note).toBe('read-failed');
+  });
+
+  it('短退避后的下一轮成功：同窗口 posted、游标前进，总 attempt ≤ 3', async () => {
+    const send = vi.fn(async () => true);
+    const failing = depsAt(INCIDENT_NOW_SEC, {
+      readWindow: async () => {
+        throw networkError();
+      },
+      readRetryDelayMs: 0,
+      sendWebhook: send,
+    });
+    expect((await runSettlementCarryPass(failing)).status).toBe('failed');
+    expect(cursor().pending).toMatchObject({ attempts: 1 });
+
+    // 300s 后（仍在同一 8h 窗口内）重试：读成功 → 播报本窗口
+    const retryAt = INCIDENT_NOW_SEC + 300;
+    const ok = await runSettlementCarryPass(
+      depsAt(retryAt, {
+        sendWebhook: send,
+        readWindow: async () => readWindow(),
+        readRetryDelayMs: 0,
+      }),
+    );
+    expect(ok.status).toBe('posted');
+    expect(ok.windowFromSec).toBe(INCIDENT_FROM);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(cursor()).toEqual({ lastPostedWindowSec: INCIDENT_FROM, pending: null });
+    const attempts = auditLines().flatMap((l) => (typeof l.attempts === 'number' ? [l.attempts] : []));
+    expect(Math.max(...attempts)).toBeLessThanOrEqual(3);
+  });
+
+  it('读持续失败 3 个周期 → give-up、游标前进、不卡死（#6 行为保持）', async () => {
+    const failRead = {
+      readWindow: async () => {
+        throw networkError();
+      },
+      readRetryDelayMs: 0,
+    };
+    // 周期 1/2/3：每隔 retryBackoffSec（300s）试一次
+    for (const k of [0, 1, 2]) {
+      expect((await runSettlementCarryPass(depsAt(INCIDENT_NOW_SEC + k * 300, failRead))).status).toBe(
+        'failed',
+      );
+    }
+    expect(cursor().pending).toBeNull();
+    expect(cursor().lastPostedWindowSec).toBe(INCIDENT_FROM);
+    expect(auditLines().filter((l) => l.note === 'read-failed')).toHaveLength(3);
+    expect(auditLines().some((l) => l.note === 'give-up')).toBe(true);
+    // 放弃后不卡死：同窗口下一轮被闸门跳过（idle），不再当成待办
+    const after = await runSettlementCarryPass(depsAt(INCIDENT_NOW_SEC + 900, failRead));
+    expect(after.status).toBe('idle');
+    expect(auditLines().at(-1)!.note).toBe('skipped-already-handled');
+  });
+
+  it('webhook 发送失败也走短退避（不是 8h）', async () => {
+    const res = await runSettlementCarryPass(
+      depsAt(INCIDENT_NOW_SEC, { sendWebhook: async () => false, readWindow: async () => readWindow() }),
+    );
+    expect(res.status).toBe('failed');
+    expect(nextDelayAfterPass(INCIDENT_NOW_SEC * 1000, depsAt(INCIDENT_NOW_SEC).config, res)).toBe(
+      300_000,
+    );
+    expect(auditLines().at(-1)!.httpOk).toBe(false);
   });
 });
 
@@ -984,6 +1166,30 @@ describe('readSettlementCarryConfig', () => {
     })!;
     expect(on.webhook?.url).toBe('http://127.0.0.1:1/hook');
     expect(on.intervalSec).toBe(28_800);
+    // 失败重试退避：默认 300s（issue #8），env 可覆盖，下限 30s
+    expect(on.retryBackoffSec).toBe(300);
+    expect(
+      readSettlementCarryConfig({
+        SETTLEMENT_CARRY_ENABLED: 'on',
+        SETTLEMENT_CARRY_RETRY_BACKOFF_SEC: '600',
+        APR_ALERT_WEBHOOK_URL: 'http://127.0.0.1:1/hook',
+      })!.retryBackoffSec,
+    ).toBe(600);
+    expect(
+      readSettlementCarryConfig({
+        SETTLEMENT_CARRY_ENABLED: 'on',
+        SETTLEMENT_CARRY_RETRY_BACKOFF_SEC: '5',
+        APR_ALERT_WEBHOOK_URL: 'http://127.0.0.1:1/hook',
+      })!.retryBackoffSec,
+    ).toBe(30);
+    // 非法值 → 回默认，不把调度器卡在 0s（热重试）或 NaN
+    expect(
+      readSettlementCarryConfig({
+        SETTLEMENT_CARRY_ENABLED: 'on',
+        SETTLEMENT_CARRY_RETRY_BACKOFF_SEC: 'abc',
+        APR_ALERT_WEBHOOK_URL: 'http://127.0.0.1:1/hook',
+      })!.retryBackoffSec,
+    ).toBe(300);
     const tiny = readSettlementCarryConfig({
       SETTLEMENT_CARRY_ENABLED: 'on',
       SETTLEMENT_CARRY_INTERVAL_SECONDS: '60',
